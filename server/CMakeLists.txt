@@ -91,7 +91,8 @@ set(XRT_OXR_RUNTIME_SUFFIX        "wivrn"          CACHE STRING "OpenXR client l
 FetchContent_MakeAvailable(monado)
 
 if (WIVRN_BUILD_SERVER)
-	add_executable(wivrn-server
+	# Shared between both target types below.
+	set(_wivrn_server_sources
 			accept_connection.cpp
 			hostname.cpp
 			ipc_server_cb.cpp
@@ -135,12 +136,26 @@ if (WIVRN_BUILD_SERVER)
 			utils/gpu_timestamp_pool.cpp
 		)
 
+	# ANDROID: build wivrn-server as a plain executable by default (matches
+	# every fix/verification so far -- push it with adb and run it directly).
+	# Set WIVRN_ANDROID_JNI=ON to build it as a shared library instead, for
+	# loading via System.loadLibrary() from the Android Service wrapper (see
+	# android/wivrn_server_jni.cpp) -- JNI can only load a .so, not an
+	# executable. Both variants share the exact same _wivrn_server_sources;
+	# only the target type and the entry-point file (stub main vs JNI) differ.
+	if(ANDROID AND WIVRN_ANDROID_JNI)
+		add_library(wivrn-server SHARED ${_wivrn_server_sources})
+	else()
+		add_executable(wivrn-server ${_wivrn_server_sources})
+	endif()
+
 	# main.cpp is the desktop entry point: it drives the D-Bus dashboard IPC
 	# (GDBus/glib/libnotify) directly, and start_systemd_unit.cpp,
 	# avahi_publisher.cpp and sleep_inhibitor.cpp exist solely to support it
 	# (each of the three has no includer anywhere else in this tree). None of
 	# that has an Android equivalent, so the whole cluster is swapped for a
-	# placeholder entry point on Android rather than #ifdef'd piecemeal.
+	# placeholder entry point (or the real JNI entry point, with
+	# WIVRN_ANDROID_JNI=ON) on Android rather than #ifdef'd piecemeal.
 	# start_application.cpp (fork+exec of a desktop app, glib-based) is only
 	# used by main.cpp and start_systemd_unit.cpp, so it goes in the same
 	# bucket. wivrn_uinput.cpp opens /dev/uinput directly, which an
@@ -149,9 +164,14 @@ if (WIVRN_BUILD_SERVER)
 	# std::optional<wivrn_uinput> member, so it can't simply be dropped.
 	if(ANDROID)
 		target_sources(wivrn-server PRIVATE
-				android/wivrn_server_android_stub_main.cpp
 				driver/wivrn_uinput_android.cpp
+				android/wivrn_ipc_socket_monado_stub.cpp
 			)
+		if(WIVRN_ANDROID_JNI)
+			target_sources(wivrn-server PRIVATE android/wivrn_server_jni.cpp)
+		else()
+			target_sources(wivrn-server PRIVATE android/wivrn_server_android_stub_main.cpp)
+		endif()
 		# std::jthread/std::stop_token are used unconditionally throughout
 		# this codebase. The Android NDK's libc++ implements them, but only
 		# behind -fexperimental-library (checked against NDK r28b/Clang 19).

@@ -26,49 +26,17 @@
 // point and everything else (compositor, driver, encoder, Monado itself)
 // can be proven to compile and link for Android.
 //
-// TODO(wivrn-android): replace with a real JNI entry point that calls the
-// actual server startup sequence (equivalent of main.cpp's start_server()),
-// once main.cpp's startup logic is factored out into something callable
-// from both the desktop main() and here.
-
-#include "wivrn_ipc.h"
-
-#include <sys/socket.h>
-
-// wivrn_ipc_socket_monado (declared extern in wivrn_ipc.h, defined in
-// main.cpp on desktop) is how wivrn-server talks to a separate,
-// system-installed Monado OpenXR service process -- send_to_main(),
-// receive_from_main(), and several direct .send()/.get_fd() call sites in
-// driver/wivrn_session.cpp and driver/wivrn_connection.* all use it
-// unconditionally. On Android, Monado is linked directly into this same
-// process, so there is no separate process to talk to, but leaving the
-// optional permanently empty would make every one of those call sites
-// undefined behavior the first time any of them ran (operator-> on a
-// disengaged optional). Instead, give it a real connected loopback
-// datagram socket pair: sends succeed harmlessly (buffered, never read),
-// and get_fd() returns a valid pollable fd that just never signals
-// readable. The peer end is deliberately kept open (not closed) so writes
-// never fail with ECONNREFUSED.
-std::optional<wivrn::typed_socket<wivrn::UnixDatagram, to_monado::packets, from_monado::packets>> wivrn_ipc_socket_monado;
-
-namespace
-{
-struct wivrn_ipc_socket_monado_stub_init
-{
-	wivrn::fd_base peer;
-
-	wivrn_ipc_socket_monado_stub_init()
-	{
-		int fds[2];
-		if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) == 0)
-		{
-			wivrn_ipc_socket_monado.emplace(fds[0]);
-			peer = wivrn::fd_base(fds[1]);
-		}
-	}
-} wivrn_ipc_socket_monado_stub_init_instance;
-} // namespace
-
+// This is used when WIVRN_ANDROID_JNI=OFF (the default) -- for the real JNI
+// entry point used by the Android Service wrapper, see
+// android/wivrn_server_jni.cpp. Either way, wivrn_ipc_socket_monado (used
+// throughout driver/wivrn_session.cpp and driver/wivrn_connection.*) still
+// needs a definition; that part is shared in
+// android/wivrn_ipc_socket_monado_stub.cpp.
+//
+// TODO(wivrn-android): now that android/wivrn_server_jni.cpp exists, this
+// plain-executable variant is mainly useful for adb-based iteration outside
+// an APK; consider whether it's still worth keeping once the Service
+// wrapper is proven out.
 int main()
 {
 	return 0;
