@@ -46,12 +46,29 @@ class video_encoder;
 class compositor : public comp_base
 {
 public:
-	struct image
+	// Each stream gets its OWN dedicated single-array-layer multi-planar
+	// image, instead of one 3-array-layer image shared across streams.
+	// Real GPU driver bug, confirmed via a minimal standalone reproduction
+	// outside this codebase (see docs/ANDROID_PORT.md's Milestone 4.5): on
+	// this hardware (PowerVR DXT-48-1536 / Tensor G5), a compute shader
+	// write to array layer >=1 of a VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
+	// image is corrupted -- neither a multi-planar image alone (1 layer)
+	// nor a non-multi-planar array image triggers it, only the combination.
+	// Confirmed clean on two independent desktop Vulkan implementations
+	// (NVIDIA, Mesa llvmpipe) with the exact same shader and data, and
+	// confirmed corrupted ONLY with arrayLayers>=2 when run directly on
+	// this device -- so single-layer images sidestep it entirely.
+	struct stream_image
 	{
-		std::atomic<bool> busy = false;
 		image_allocation image;
 		vk::raii::ImageView view_y;
 		vk::raii::ImageView view_cbcr;
+	};
+	struct image
+	{
+		std::atomic<bool> busy = false;
+		std::array<stream_image, 2> content; // left, right
+		stream_image alpha;                   // shared, both eyes packed by x-offset (unchanged from before)
 		to_headset::video_stream_data_shard::view_info_t view_info{};
 		uint64_t frame_index;
 	};

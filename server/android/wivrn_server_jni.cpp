@@ -56,7 +56,6 @@
 #include "wivrn_sockets.h"
 
 #include <atomic>
-#include <cstdlib>
 #include <iostream>
 #include <thread>
 #include <unistd.h>
@@ -341,15 +340,6 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv * env, jobjec
 	// OpenXR client connect at all.
 	android_globals_store_vm_and_context(g_vm, g_service);
 
-	// TEMPORARY debug: dump every stream's exact encoded bitstream, in
-	// order, to a continuous file -- WIVRN_DUMP_VIDEO is an existing WiVRn
-	// mechanism (video_encoder.cpp's video_encoder::create()), just never
-	// wired up here before since Android apps don't inherit shell
-	// environment variables. Pull <path>-0.h264 (left) / -1.h264 (right)
-	// via `adb shell run-as org.meumeu.wivrn.server cat ...` and decode
-	// with ffmpeg to compare exactly what the server sent against what the
-	// client decodes. Remove once diagnosed.
-	setenv("WIVRN_DUMP_VIDEO", "/data/data/org.meumeu.wivrn.server/dump_sent", 1);
 
 	server_thread.emplace([](std::stop_token stop) {
 		run_server(stop);

@@ -57,7 +57,23 @@ class foveation
 	vk::raii::PipelineLayout layout;
 	std::array<vk::raii::Pipeline, 2> pipeline;
 	vk::raii::DescriptorPool descriptor_pool;
-	vk::DescriptorSet descriptor_set;
+	std::array<vk::DescriptorSet, 2> descriptor_sets; // one per eye -- see foveation.cpp's make_ds_pool comment
+
+	// The compositor double-buffers 2 image slots and calls foveate() with
+	// whichever slot is active this frame, so the (y,cbcr,alpha_y,alpha_cbcr)
+	// view handles only actually change every OTHER frame (when the slot
+	// flips) -- but every one of foveation's own 2 descriptor sets used to
+	// get rewritten every single frame regardless. That's real, measurable
+	// per-frame CPU cost (vkUpdateDescriptorSets, twice, every frame) that
+	// didn't exist before splitting into 2 eye-dispatches/descriptor sets,
+	// and shows up as added latency. Skip the write when nothing actually
+	// changed since the last call.
+	struct bound_views
+	{
+		vk::ImageView y, cbcr, alpha_y, alpha_cbcr;
+		bool operator==(const bound_views &) const = default;
+	};
+	std::array<bound_views, 2> last_bound{}; // one per eye
 
 	// parameters used for last computation
 	struct P
@@ -88,11 +104,16 @@ public:
 	void update_tracking(const from_headset::tracking &);
 	void update_foveation_center_override(const from_headset::override_foveation_center &);
 
+	// y/cbcr: per-eye dedicated destination views (left/right). alpha_y/
+	// alpha_cbcr: the single shared alpha destination (both eyes packed by
+	// x-offset, as before -- see foveation.comp's comment).
 	std::array<to_headset::foveation_parameter, 2> foveate(
 	        vk::raii::Device &,
 	        vk::raii::CommandBuffer & cmd,
-	        vk::ImageView y,
-	        vk::ImageView cbcr,
+	        std::array<vk::ImageView, 2> y,
+	        std::array<vk::ImageView, 2> cbcr,
+	        vk::ImageView alpha_y,
+	        vk::ImageView alpha_cbcr,
 	        bool flip_y,
 	        std::array<vk::ImageView, 2> src,
 	        std::array<xrt_rect, 2> src_rect,

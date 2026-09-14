@@ -25,6 +25,7 @@
 #include "utils/wivrn_vk_bundle.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -231,6 +232,12 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
+	// y_cbcr is now this stream's own dedicated single-array-layer image
+	// (see compositor.h's struct image comment -- was array layer
+	// stream_idx of one shared 3-layer image; a real GPU driver bug on
+	// this hardware corrupts compute writes to array layer >=1 of a
+	// multi-planar image, so each stream now gets its own image and
+	// baseArrayLayer is always 0).
 	if (need_transfer)
 	{
 		vk::ImageMemoryBarrier2 barrier{
@@ -242,7 +249,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 		        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 		                             .baseMipLevel = 0,
 		                             .levelCount = 1,
-		                             .baseArrayLayer = stream_idx,
+		                             .baseArrayLayer = 0,
 		                             .layerCount = 1},
 		};
 		cmd.pipelineBarrier2({
@@ -255,7 +262,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	        vk::BufferImageCopy{
 	                .imageSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-	                        .baseArrayLayer = stream_idx,
+	                        .baseArrayLayer = 0,
 	                        .layerCount = 1,
 	                },
 	                .imageExtent = {
@@ -268,7 +275,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	                .bufferOffset = vk::DeviceSize(extent.width) * extent.height,
 	                .imageSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-	                        .baseArrayLayer = stream_idx,
+	                        .baseArrayLayer = 0,
 	                        .layerCount = 1,
 	                },
 	                .imageExtent = {
@@ -347,10 +354,13 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 
 	// AMEDIAFORMAT_KEY_MAX_INPUT_SIZE (ensure_codec(), above) should make
 	// this impossible now -- keep the check anyway rather than silently
-	// std::min()-ing and truncating the frame again if it ever isn't (this
-	// exact silent truncation was the real cause of every "green chroma"
-	// corruption symptom investigated in docs/ANDROID_PORT.md's
-	// Milestone 4.5, so a loud failure here beats a quiet, misleading one).
+	// std::min()-ing and truncating the frame again if it ever isn't. This
+	// was a real, independently-confirmed bug (verified: zero "too small"
+	// truncation warnings after the fix), but it turned out NOT to be the
+	// cause of the green-chroma corruption investigated in
+	// docs/ANDROID_PORT.md's Milestone 4.5 -- that was a GPU driver bug
+	// (compute writes to array layer >=1 of a multi-planar image), fixed in
+	// compositor.h/.cpp instead. Kept here as a real, separate hardening.
 	if (in_size < payload_size)
 	{
 		U_LOG_E("mediacodec: input buffer too small on stream %d: %zu < %zu, dropping frame",

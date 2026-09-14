@@ -639,10 +639,9 @@ to the zero-copy encoder work below (video_encoder_mediacodec.cpp's current
 CPU-copy path may just not be fast/consistent enough at real frame rates),
 possibly a separate pacing issue — worth measuring before assuming which.
 
-## Milestone 4.5 — IN PROGRESS: multiple real bugs found and fixed along the
-## way (frame-desync/IDR livelock, lazy-alpha-encoder, encode concurrency,
-## MediaCodec input truncation); the original green-chroma corruption itself
-## is still NOT root-caused
+## Milestone 4.5 — DONE: root cause of the green-chroma corruption confirmed
+## and fixed (a real GPU driver bug), plus several other real bugs found and
+## fixed along the way
 
 **Symptom** (reported after Milestone 4): the stream showed pixelation and
 green artifacts, with what looked like stereo overlap; one eye usually showed
@@ -976,23 +975,146 @@ sender thread instead of blocking the encode-dispatch path — matches
 regression observed since re-applying it after the IDR-livelock fix made it
 safe.
 
-**Where this stands**: every layer that can be checked without a lot more
-investment has been checked and is clean or ruled out — network, client
-decoder, Monado's own render output, the Vulkan copy/barrier code, the
-MediaCodec configure-time format negotiation. Two directions left,
-neither started yet:
-- **GPU driver bug on this specific hardware**, combining a multi-planar
-  `2PLANE_420` format + 3 array layers + compute-shader `imageStore` write
-  + `vkCmdCopyImageToBuffer` read — none of which individually is unusual,
-  but the specific combination is untested territory for this GPU/driver.
-  Decisive test: restructure to separate single-layer images per stream
-  instead of one 3-layer array image. Invasive, not started.
-- **A byte-level A/B test of the encoder in isolation** (see point 6
-  above) — feed MediaCodec a synthetic, known-good NV12 buffer directly,
-  bypassing Monado/the compositor/Vulkan entirely, and check the decoded
-  output. This is the cheapest remaining way to tell "MediaCodec itself
-  mishandles this data" apart from "something upstream of MediaCodec is
-  still producing bad bytes we haven't caught."
+### Root cause found and fixed: a real GPU driver bug, confirmed by direct
+### on-device reproduction outside this codebase
+
+Continuing from "where this stands" above. In order:
+
+1. **A full 10-point re-verification against the actual code**, prompted by
+   a detailed external checklist (AHardwareBuffer/external-format usage,
+   MediaCodec stride/slice-height, direct mapping of an optimal-tiled
+   image, image-view/array-layer/aspect-mask correctness, copy-region
+   dimensions, barrier aspect masks, synchronization) — every one of these
+   was checked directly against the real code (not re-asserted from
+   memory) and came back clean. A live `vkQueueWaitIdle()` right after the
+   compute dispatch, before any copy, made **zero difference** — same
+   corruption, same shape, ruling out synchronization directly rather than
+   by inspection.
+2. **A minimal, standalone Vulkan program** (`ForeverXR/tools/foveation-pc-test/`,
+   disposable, not part of the port) that loads the *exact* unmodified
+   `foveation.spv` from the Android build and replays the *exact* real
+   captured UBO parameters and source image pulled mid-investigation from
+   the Pixel, reproducing the real on-device object shape precisely
+   (`VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`, `MUTABLE_FORMAT|EXTENDED_USAGE`,
+   plane-0/plane-1 views as `R8_UNORM`/`R8G8_UNORM`, matching copy
+   regions) — with a `mode` switch to run three configurations:
+
+   | Configuration | NVIDIA (desktop) | Mesa llvmpipe (software) | **Real Pixel** |
+   |---|---|---|---|
+   | Separate R8 + R8G8 images | clean | clean | **clean** |
+   | Multi-planar, 1 array layer | clean | clean | **clean** |
+   | Multi-planar, 3 array layers (exact real config) | clean | clean | **corrupted, same signature as production** |
+
+   Cross-compiled with the NDK and run directly on the Pixel via
+   `adb push` (no APK needed — a standalone executable, same pattern as
+   Milestone 1's early Vulkan-extension probes). This is airtight: same
+   shader binary, same real data, on the *same device*, differing only in
+   which Vulkan object shape it targets. **Neither multi-planar alone nor
+   array layers alone triggers it — only the combination does, and only
+   on this GPU.** Two independent desktop implementations (one
+   proprietary, one open-source/spec-compliant) stay clean throughout,
+   ruling out the shader's math entirely.
+3. **Web research** (dispatched in parallel) confirmed the device is a
+   **PowerVR D-Series DXT-48-1536** (Tensor G5 — Google switched away from
+   ARM Mali starting with this generation) and surfaced independently
+   confirmed, currently-unfixed Vulkan compute-shader correctness bugs on
+   this exact chip from unrelated projects (llama.cpp's quantization
+   shaders producing wrong numbers, PyTorch ExecuTorch's Vulkan backend
+   outputting all-zero/NaN textures) — a young, still-buggy driver, and
+   this is a new bug in the same family, not a fluke. A structurally
+   similar bug class (writing multiple array layers from one compute
+   dispatch corrupting all-but-one layer) has precedent elsewhere too:
+   [SDL3 GPU issue #12906](https://github.com/libsdl-org/SDL/issues/12906).
+   Tested that issue's exact workaround (splitting the single
+   `dispatch(...,...,2)` into two `dispatchBase(...,1)` calls against the
+   *same* 3-layer image) first, since it's cheaper than restructuring
+   images — **result: worse, not better** (the broken eye went from
+   partially-correct to solid green with zero detail), confirming the
+   array layer itself is the problem, not just how many dispatches touch
+   it in one command buffer.
+4. **Fix implemented**: `compositor.h`'s `struct image` now holds a
+   `stream_image` (own `image_allocation` + Y/CbCr views) per stream —
+   `content[2]` (left, right) plus a shared `alpha` — instead of one
+   `image_allocation` with `arrayLayers=3`. `make_images()` builds three
+   separate single-array-layer multi-planar images per compositor slot
+   instead of one three-layer image. `foveation.comp` now receives which
+   eye to process via a push constant (`pc.eye`) instead of
+   `gl_GlobalInvocationID.z`, and always writes to array layer 0 of
+   whichever image is bound (each destination image only has one layer
+   now); alpha keeps its existing x-offset packing (both eyes share one
+   alpha image, unchanged), just via its own dedicated image with 2 new
+   descriptor bindings (4, 5) instead of array layer 2 of the shared
+   image. `foveation.cpp`'s `foveate()` now dispatches once per eye
+   (`dispatch(gx, gy, 1)` × 2) against its own permanently-allocated
+   descriptor set (2 sets total — descriptor set *contents* aren't
+   snapshotted at bind-record time, so two dispatches recorded into the
+   same command buffer can't safely share one set rewritten in between).
+   `video_encoder_mediacodec.cpp`'s `present_image()` copy regions lost
+   their `baseArrayLayer = stream_idx` (always 0 now, since each stream's
+   image only has one layer).
+5. **A real crash found and fixed while first testing this live**:
+   `compositor.cpp`'s `beman::inplace_vector<vk::ImageMemoryBarrier2, 3>`
+   (a fixed-capacity, non-growing vector) overflowed once the single
+   shared pre-dispatch barrier became three (one per stream image) —
+   `std::bad_alloc`, `SIGABRT`, confirmed via a full tombstone backtrace
+   pointing straight at `inplace_vector::emplace_back` inside
+   `layer_commit()`. Fixed by bumping the capacity to 5 (worst case: 1
+   squasher-path barrier + 3 per-stream barriers, with margin) — a exact,
+   understood fix, not a guess, once the backtrace named the exact
+   overflow.
+6. **Verified live, repeatedly, on the real headset**: after the crash fix,
+   installed and run through the full test cycle — clean on both eyes,
+   confirmed by the user directly in-headset ("the tint and artifacts
+   problem is solved"), and independently confirmed via a fresh
+   `raw_nv12` capture of the previously-broken right eye showing a
+   correct, detailed, complex scene (sky gradient, terrain, ground plane)
+   with zero green tint, zero corruption — captured from the exact same
+   diagnostic path used throughout this investigation, now clean.
+7. **A real, expected latency regression from the fix, found and mostly
+   addressed the same session**: 2 dispatches instead of 1 means 2
+   descriptor sets instead of 1, and `foveate()` was rewriting all 6
+   bindings on both sets every single frame — real added per-frame CPU
+   cost that showed up as reported pixelation/latency/lag right after the
+   fix went in. Root cause: `y`/`cbcr`/`alpha_y`/`alpha_cbcr` (and the ubo
+   buffer) only ever take on 2 distinct values for the session's lifetime
+   (the compositor's 2 fixed double-buffer slots), alternating every
+   *other* frame — only `src` (Monado's own swapchain view) genuinely
+   changes every frame. Split the descriptor write into two
+   `vkUpdateDescriptorSets` calls per eye: one for `src` (binding 0,
+   always), one for the rest (bindings 1-5, only when the
+   `(y,cbcr,alpha_y,alpha_cbcr)` tuple actually changed since last time,
+   tracked via a small `last_bound` cache in `foveation.h`) — cutting the
+   redundant half of the per-frame descriptor-write cost.
+8. **Still open, explicitly requested next**: a genuine zero-copy encoder
+   input path. The compositor still copies the GPU image to a host buffer
+   (`vkCmdCopyImageToBuffer`) every frame, then `memcpy`s that into
+   MediaCodec's own input buffer — real, avoidable per-frame cost on top
+   of everything above. `video_encoder_mediacodec.h`'s own `ponytail:`
+   comment already names the upgrade path:
+   `AMediaCodec_createInputSurface()` + rendering directly into it via an
+   imported `AHardwareBuffer`, instead of the current GPU-copy-to-host-
+   buffer-then-memcpy path. Not started this session — real architecture
+   work, not a quick fix.
+
+**Diagnostic tooling kept from this investigation** (outside the port
+itself, not shipped): `ForeverXR/tools/foveation-pc-test/foveation_test.c`
+— the standalone multi-planar-image reproduction harness described above,
+runs on desktop (NVIDIA/lavapipe) or cross-compiled for Android via the
+NDK; useful again if a similar array-layer/multi-planar driver bug needs
+isolating on different hardware. All the temporary on-device debug dumps
+used to chase this (raw NV12 buffer captures, UBO buffer captures, the app
+source-image capture, the subgroup-properties log, `WIVRN_DUMP_VIDEO`
+wiring, the client's receive-side dump) have been removed now that the
+root cause is confirmed and fixed — they were real per-frame overhead
+(continuous disk I/O) not worth leaving active in normal operation.
+`ForeverXR/tools/vulkan-headers/` (vendored Vulkan-Headers, used to build
+the PC test harness without needing `libvulkan-dev`) is kept for reuse.
+`ForeverXR/tools/vulkan-validation/android-binaries.tar.gz` (prebuilt
+Android Vulkan validation layer binaries from KhronosGroup's GitHub
+releases) was downloaded but never actually needed or extracted — the PC
+harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
+already installed via apt) caught the real bug (a stale text-format `.spv`
+artifact, not the shader) before Android-side validation was ever required.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)

@@ -406,6 +406,7 @@ wivrn::vk_bundle::vk_bundle() :
 	        int32_t(queue.family_index),
 	        int32_t(encode_queue_family_index),
 	        int32_t(transfer_queue.family_index));
+
 }
 
 uint32_t wivrn::vk_bundle::get_memory_type(uint32_t type_bits, vk::MemoryPropertyFlags memory_props)
