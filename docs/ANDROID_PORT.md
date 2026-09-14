@@ -1116,6 +1116,79 @@ harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
 already installed via apt) caught the real bug (a stale text-format `.spv`
 artifact, not the shader) before Android-side validation was ever required.
 
+## Milestone 4.6 — INVESTIGATED, NOT VIABLE ON THIS DEVICE: zero-copy
+## MediaCodec input (`AMediaCodec_createInputSurface()`), a platform bug
+## below the app level
+
+`video_encoder_mediacodec.h`'s own `ponytail:` comment named this as the
+real upgrade path over the current GPU-copy-to-host-buffer-then-`memcpy`
+pipeline: render directly into MediaCodec's own input `Surface` instead.
+Investigated via two small standalone probes (`ForeverXR/tools/foveation-pc-test/mediacodec_surface_test.c`
+for Vulkan WSI, `mediacodec_egl_test.c` for EGL/GLES — both disposable,
+not part of the port, cross-compiled with the NDK and run directly on the
+Pixel), following the standard, officially-documented Android pattern:
+`AMediaCodec_createInputSurface()` → `ANativeWindow` → a swapchain/EGL
+surface targeting it → render → present → the codec's own `BufferQueue`
+consumer handles the rest.
+
+**Result: not viable on this device, and the reason is precisely
+characterized, not a mystery.** In order:
+
+1. Vulkan WSI mechanically works perfectly: `vkCreateAndroidSurfaceKHR`
+   succeeds, the queue can present, the surface reports 3 usable RGBA
+   formats (device negotiates its own RGB→encoder-native conversion —
+   confirmed no manual NV12/YUV handling is needed for this approach),
+   `supportedUsageFlags` even includes `STORAGE_BIT`, a swapchain creates
+   with 19 images, and up to 40 real frames acquire/render/present
+   cleanly with zero stalling (buffers genuinely cycle through the
+   `BufferQueue`) — but **zero encoded output ever arrives**, not even
+   the usually-immediate `INFO_OUTPUT_FORMAT_CHANGED` event.
+2. The EGL/GLES control test (the actually-standard, actually-tested
+   Android pattern for this) shows the **identical symptom**: zero output
+   events through 10 real presented frames, before eventually blocking on
+   a later `eglSwapBuffers` call waiting for a buffer that's never
+   released. Since EGL fails identically to Vulkan, this is **not** a
+   Vulkan WSI/vendor-driver interoperability gap.
+3. Ruled out directly, not assumed: explicit monotonically-increasing
+   presentation timestamps via `VK_GOOGLE_display_timing` /
+   `eglPresentationTimeANDROID` (both extensions confirmed present) — no
+   change. An explicit `request-sync` (force a keyframe) call, matching
+   what the real working ByteBuffer backend's `idr_handler` always does
+   for frame 0 — no change. `debug.stagefright.c2inputsurface` is already
+   `-1` (the framework-side `GraphicBufferSource` path Google's own
+   device trees recommend) — nothing to toggle. Only two AVC encoder
+   components exist on this device (`c2.google.avc.encoder`,
+   `c2.android.avc.encoder`; no distinct vendor hardware component, no
+   legacy OMX path at all) — **both show the exact same failure**,
+   ruling out a single-component bug.
+4. **The decisive evidence, from logcat captured during a failing run**:
+   `GraphicBufferSource` (Android's own framework-level Codec2 Surface
+   consumer — confirmed by (3) to be the one in use, not a vendor
+   implementation) logs `got buffer with new dataSpace ...` **exactly
+   once**, ever, then goes completely silent — no further buffer
+   acquisition, no encoder component activity, no errors — for the
+   remainder of every test run (confirmed with both encoder components).
+   The `BufferQueue` itself has 64 slots and happily accepts dozens of
+   queued frames from the producer side; it's specifically the consumer
+   that stops pulling after buffer #1.
+
+This isolates the failure to Android's own framework `GraphicBufferSource`
+implementation on this specific device/build, independent of: which
+encoder component, which graphics API, presentation timestamps, or
+explicit sync-frame requests — below the level of anything app code can
+work around without unstable/private platform APIs (which this
+investigation deliberately avoided using, per explicit instruction).
+Consistent with everything else found on this hardware this session (see
+Milestone 4.5): a genuinely immature platform/vendor stack, this time in
+the Codec2 Surface-input bridge rather than the Vulkan compute driver.
+
+**Conclusion**: keep the current, working ByteBuffer/NV12 encoder path
+(already fixed and latency-improved this session). Zero-copy via
+`AMediaCodec_createInputSurface()` is not achievable on this device
+without private/unstable platform APIs. If revisited on different
+hardware, the two probe programs are directly reusable (just re-run
+them first — don't assume the same platform bug exists elsewhere).
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
