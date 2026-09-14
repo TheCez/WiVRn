@@ -60,8 +60,34 @@
 #include <thread>
 #include <unistd.h>
 
+#include <sys/system_properties.h>
+
 namespace
 {
+
+// Milestone 5 diagnostic toggle (docs/ANDROID_PORT.md's perf branch entry,
+// the encoder/readback investigation): Android apps don't inherit shell
+// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG (all
+// checked via plain getenv() deeper in the server) need an explicit
+// setenv() somewhere on this side -- but unlike the one-off temporary
+// setenv() calls used for earlier investigations (e.g. the since-removed
+// version in commit 89655cd4), this reads a real Android system property
+// so the diagnostics can be toggled per-run without rebuilding/reinstalling:
+//   adb shell setprop debug.wivrn.dump 1
+// before starting the server app enables all three; unset (the default)
+// costs nothing beyond one __system_property_get() call at startup. Left
+// in permanently -- this corruption investigation is still open, unlike
+// past ones that got fully closed out.
+void apply_debug_dump_property()
+{
+	char value[PROP_VALUE_MAX] = {};
+	if (__system_property_get("debug.wivrn.dump", value) <= 0 or value[0] == '\0')
+		return;
+
+	setenv("WIVRN_DUMP_VIDEO", "/data/data/org.meumeu.wivrn.server/dump_sent", 1);
+	setenv("WIVRN_DUMP_NV12", "/data/data/org.meumeu.wivrn.server/dump_nv12", 1);
+	setenv("WIVRN_TIMING_LOG", "1", 1);
+}
 
 // Mirrors server/ipc_server_cb.cpp's pattern (same method_pointer2 trampoline
 // technique) -- and MUST replicate its mainloop_entering/leaving behavior
@@ -340,6 +366,7 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv * env, jobjec
 	// OpenXR client connect at all.
 	android_globals_store_vm_and_context(g_vm, g_service);
 
+	apply_debug_dump_property();
 
 	server_thread.emplace([](std::stop_token stop) {
 		run_server(stop);

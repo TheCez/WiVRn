@@ -24,6 +24,7 @@
 
 #include <array>
 #include <format>
+#include <fstream>
 #include <media/NdkMediaCodec.h>
 #include <span>
 #include <vector>
@@ -91,6 +92,21 @@ class video_encoder_mediacodec : public video_encoder
 	frame_timing_stats t_memcpy{std::format("mediacodec[{}] memcpy", stream_idx)};
 	frame_timing_stats t_codec_output_wait{std::format("mediacodec[{}] dequeueOutputBuffer wait", stream_idx)};
 	frame_timing_stats t_encode_total{std::format("mediacodec[{}] encode() total", stream_idx)};
+
+	// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch entry):
+	// opt-in (WIVRN_DUMP_NV12 env var, same pattern as the pre-existing
+	// WIVRN_DUMP_VIDEO), continuous raw capture of the EXACT NV12 bytes
+	// handed to AMediaCodec_queueInputBuffer(), each frame prefixed with
+	// its 8-byte little-endian frame_index so it can be correlated
+	// against the WIVRN_DUMP_VIDEO encoded-output capture (which logs
+	// the same frame_index per output when this is enabled) to answer
+	// one specific question: for a visibly corrupted encoded frame, was
+	// its source NV12 already corrupt, or clean? Kept as a real,
+	// committed, always-available diagnostic (not a throwaway edit) --
+	// intentionally NOT removed once this investigation concludes,
+	// unlike the temporary debug scaffolding removed in past milestones,
+	// since black-macroblock corruption of unknown cause is still open.
+	std::ofstream nv12_dump;
 
 	// SPS+PPS, captured once from the encoder's first (CODEC_CONFIG-flagged)
 	// output buffer. Devices don't reliably repeat these inline before every

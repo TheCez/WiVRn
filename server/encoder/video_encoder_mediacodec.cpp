@@ -90,6 +90,9 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 	if (settings.codec != h264)
 		throw std::runtime_error("mediacodec encoder only supports h264 for now");
 
+	if (auto dump_nv12 = std::getenv("WIVRN_DUMP_NV12"))
+		nv12_dump.open(std::string(dump_nv12) + "-" + std::to_string(stream_idx) + ".nv12raw", std::ios::binary);
+
 	// Buffer is always full NV12 size regardless of stream: MediaCodec was
 	// configured (KEY_COLOR_FORMAT/KEY_STRIDE/KEY_SLICE_HEIGHT below) to
 	// expect that size on every queueInputBuffer call, for every stream --
@@ -431,6 +434,19 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 		memcpy(in_buf, src, payload_size);
 	}
 
+	// Milestone 5 diagnostic: capture the EXACT bytes MediaCodec is about
+	// to encode, tagged with frame_index, to answer "was the NV12 already
+	// corrupt, or did MediaCodec/hardware produce the corruption" for any
+	// visibly-corrupted encoded frame found in the WIVRN_DUMP_VIDEO
+	// capture. See video_encoder_mediacodec.h's nv12_dump comment.
+	if (nv12_dump)
+	{
+		nv12_dump.write((const char *) &frame_index, sizeof(frame_index));
+		nv12_dump.write((const char *) in_buf, payload_size);
+		U_LOG_I("mediacodec[%d] nv12_dump: frame_index=%lu slot=%d bytes=%zu",
+		        stream_idx, (unsigned long) frame_index, slot, payload_size);
+	}
+
 	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, payload_size, os_monotonic_get_ns() / 1000, 0),
 	      "AMediaCodec_queueInputBuffer");
 
@@ -481,6 +497,15 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 			push_async(csd, true);
 		auto payload_copy = std::make_shared<std::vector<uint8_t>>(payload.begin(), payload.end());
 		AMediaCodec_releaseOutputBuffer(codec.get(), out_idx, false);
+		// Milestone 5 diagnostic: pair with the nv12_dump write above --
+		// this output corresponds to the frame_index just queued in THIS
+		// call (KEY_LATENCY=1, one-in-one-out), so a corrupted encoded
+		// access unit found in the WIVRN_DUMP_VIDEO capture can be
+		// matched to its exact source NV12 frame in nv12_dump by
+		// frame_index, without guessing from file position/ordering.
+		if (nv12_dump)
+			U_LOG_I("mediacodec[%d] output: frame_index=%lu size=%zu flags=%u idr=%d",
+			        stream_idx, (unsigned long) frame_index, payload.size(), info.flags, is_idr);
 		return data{
 		        .encoder = this,
 		        .span = *payload_copy,
