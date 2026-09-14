@@ -1116,9 +1116,11 @@ harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
 already installed via apt) caught the real bug (a stale text-format `.spv`
 artifact, not the shader) before Android-side validation was ever required.
 
-## Milestone 4.6 — INVESTIGATED: no usable public zero-copy MediaCodec
-## input path found on this device/firmware (both public Surface-input
-## mechanisms fail identically; not proven to be a hardware limit)
+## Milestone 4.6 — zero-copy MediaCodec input: both public Surface-input
+## mechanisms fail on this device/firmware; a third, architecturally
+## distinct public API (Block Model + QueueRequest.setHardwareBuffer())
+## WORKS for direct HardwareBuffer input — Vulkan/AHardwareBuffer bridging
+## not yet tested (Checkpoint 2)
 
 `video_encoder_mediacodec.h`'s own `ponytail:` comment named this as the
 real upgrade path over the current GPU-copy-to-host-buffer-then-`memcpy`
@@ -1202,26 +1204,85 @@ characterized, not a mystery.** In order:
    this exact stall for the entire run. This is the vendor's own component
    naming its own stuck state; not an inference from absence of output.
 
-**Conclusion, stated precisely**: on the tested stock Pixel 10 Pro XL
-firmware, both public MediaCodec Surface-input mechanisms fail to encode
-submitted frames:
+**Conclusion for the two Surface-input mechanisms, stated precisely**: on
+the tested stock Pixel 10 Pro XL firmware, both fail to encode submitted
+frames:
 1. `createInputSurface()`
 2. `createPersistentInputSurface()` + `setInputSurface()`
 
-ByteBuffer input works (and is what this port already uses, fixed and
-latency-improved in Milestone 4.5). **No usable public zero-copy
-MediaCodec input path has been found on this device/firmware** — this is
+Both fail downstream of every public API call succeeding, in the vendor's
+own hardware encoder component (`GC2_EncComp`), stuck at
+`instanceQueueCount(1)` forever — see the evidence above. This is
 deliberately not phrased as "the hardware cannot zero-copy encode", since
-that has not been proven (the stall is downstream of every public API
-call succeeding, in a vendor component we have no visibility or control
-over without private APIs this project has ruled out using). If revisited
-on different hardware, the three probe programs are directly reusable —
-re-run them first, don't assume the same platform bug exists elsewhere.
+that alone doesn't prove it — which is exactly why a third, architecturally
+distinct public API was tried next instead of stopping here.
 
-Returning to optimizing the working ByteBuffer/NV12 path is the next
-concrete step (the pixelation reported after Milestone 4.5's latency fix
-is still open and likely a separate, more tractable issue — bitrate or
-frame-pacing related — worth investigating on this proven-working path).
+### Update: MediaCodec Block Model + `QueueRequest.setHardwareBuffer()` —
+### WORKS for direct HardwareBuffer input (Checkpoint 1 confirmed)
+
+A third public API family exists that bypasses `Surface`/`ANativeWindow`/
+`BufferQueue`/`GraphicBufferSource`/EGL/Vulkan-WSI entirely:
+`MediaCodec.CONFIGURE_FLAG_USE_BLOCK_MODEL` (requires async
+`setCallback()`, confirmed live via
+`IllegalStateException: Block model is only valid with callback set`) +
+per-buffer `MediaCodec.QueueRequest.setHardwareBuffer(HardwareBuffer)`.
+This is Java-only (not exposed via NDK `AMediaCodec`), so the probe
+(`ForeverXR/tools/foveation-pc-test/BlockModelTest.java` +
+`hwbfill.c`, a small JNI helper using the public
+`AHardwareBuffer_fromHardwareBuffer()`/`AHardwareBuffer_lockPlanes()`
+bridge to CPU-fill a 2-plane YCbCr `HardwareBuffer`) runs standalone via
+`app_process` (no APK needed) rather than as native C.
+
+**Checkpoint 1 (CPU-filled `HardwareBuffer` → `QueueRequest.setHardwareBuffer()`
+→ hardware AVC encoder, deliberately not touching Vulkan or the working
+ByteBuffer backend): CASE A — WORKS.**
+
+- `HardwareBuffer.isSupported(896x960, YCBCR_420_888, layers=1,
+  USAGE_VIDEO_ENCODE|USAGE_CPU_WRITE_OFTEN)` = `true`; allocation succeeds.
+- `configure()` with `CONFIGURE_FLAG_USE_BLOCK_MODEL` accepted by
+  `c2.google.avc.encoder`.
+- All 60 submitted frames queued and **all 60 encoded** — continuous real
+  AVC output the entire run (not just the first item, unlike both Surface
+  mechanisms), including full-size IDR frames periodically (~210-249
+  bytes vs. ~38 bytes for P-frames of this flat-color test content).
+- `onOutputFormatChanged` fires immediately with real `csd-0`/`csd-1`
+  (SPS/PPS) — something neither Surface mechanism ever produced.
+- Clean EOS (`BUFFER_FLAG_END_OF_STREAM` observed, `done` latch released).
+- **Logcat confirms no stall**: `GC2_EncComp: [0][Id=206] VPU_EncOpen
+  codec AVC succeeded` followed by continuous encoding and a clean
+  `VPU_EncClose succeeded` at teardown — **the
+  `wait cmd queue for N times, instanceQueueCount(1)` self-diagnostic
+  that characterized both Surface-mode failures never appears.** This is
+  the vendor's own component confirming it received and processed many
+  work items, not one.
+- One implementation gotcha worth recording: block-model output is
+  **not** exposed via `getOutputBuffer()` — that throws
+  `IncompatibleWithBlockModelException`; must use
+  `getOutputFrame(index).getLinearBlock().map()` instead. Also,
+  `app_process`'s main thread has no `Looper` prepared by default and
+  `MediaCodec.setCallback()` needs one on the *calling* thread internally
+  regardless of the explicit `Handler` argument passed — fixed with an
+  explicit `Looper.prepare()` before any MediaCodec work (an artifact of
+  the `app_process` test harness, not of the API itself; a real Android
+  Service/Activity thread already has one).
+
+**This is not yet zero-copy for the real pipeline** — the compositor's
+frames live in a Vulkan `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` image, not a
+CPU-filled buffer. Checkpoint 2 (not yet attempted) is: can a Vulkan
+image's contents reach the *same* `HardwareBuffer` this API accepts,
+via `AHardwareBuffer_fromHardwareBuffer()`/`vkGetAndroidHardwareBufferPropertiesANDROID()`,
+either through a direct GPU compute write into the AHardwareBuffer-backed
+Vulkan image (single layer only — the PowerVR array-layer bug fixed in
+Milestone 4.5 rules out packing layers into it) or a `vkCmdCopyImage`
+from the existing known-good NV12 image if direct writes aren't legal.
+Do not conclude zero-copy is impossible or possible for the real pipeline
+until Checkpoint 2 is run — only that the MediaCodec-side input path
+itself is provably not the blocker via this third API.
+
+Returning to optimizing the working ByteBuffer/NV12 path remains a valid
+fallback regardless of Checkpoint 2's outcome (the pixelation reported
+after Milestone 4.5's latency fix is still open and likely a separate,
+more tractable issue — bitrate or frame-pacing related).
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
