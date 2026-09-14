@@ -1116,11 +1116,12 @@ harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
 already installed via apt) caught the real bug (a stale text-format `.spv`
 artifact, not the shader) before Android-side validation was ever required.
 
-## Milestone 4.6 — zero-copy MediaCodec input: both public Surface-input
-## mechanisms fail on this device/firmware; a third, architecturally
-## distinct public API (Block Model + QueueRequest.setHardwareBuffer())
-## WORKS for direct HardwareBuffer input — Vulkan/AHardwareBuffer bridging
-## not yet tested (Checkpoint 2)
+## Milestone 4.6 — INVESTIGATED: no usable public zero-copy MediaCodec
+## input path found on this device/firmware, across all three public API
+## families (Surface via Vulkan WSI, Surface via EGL, Block Model +
+## direct HardwareBuffer). Block Model's MediaCodec side genuinely works
+## (Checkpoint 1) but the Vulkan-side write path into the exact buffer
+## shape it accepts does not exist on this driver (Checkpoint 2)
 
 `video_encoder_mediacodec.h`'s own `ponytail:` comment named this as the
 real upgrade path over the current GPU-copy-to-host-buffer-then-`memcpy`
@@ -1266,23 +1267,112 @@ ByteBuffer backend): CASE A — WORKS.**
   the `app_process` test harness, not of the API itself; a real Android
   Service/Activity thread already has one).
 
-**This is not yet zero-copy for the real pipeline** — the compositor's
+**This was not yet zero-copy for the real pipeline** — the compositor's
 frames live in a Vulkan `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` image, not a
-CPU-filled buffer. Checkpoint 2 (not yet attempted) is: can a Vulkan
-image's contents reach the *same* `HardwareBuffer` this API accepts,
-via `AHardwareBuffer_fromHardwareBuffer()`/`vkGetAndroidHardwareBufferPropertiesANDROID()`,
-either through a direct GPU compute write into the AHardwareBuffer-backed
-Vulkan image (single layer only — the PowerVR array-layer bug fixed in
-Milestone 4.5 rules out packing layers into it) or a `vkCmdCopyImage`
-from the existing known-good NV12 image if direct writes aren't legal.
-Do not conclude zero-copy is impossible or possible for the real pipeline
-until Checkpoint 2 is run — only that the MediaCodec-side input path
-itself is provably not the blocker via this third API.
+CPU-filled buffer.
 
-Returning to optimizing the working ByteBuffer/NV12 path remains a valid
-fallback regardless of Checkpoint 2's outcome (the pixelation reported
-after Milestone 4.5's latency fix is still open and likely a separate,
-more tractable issue — bitrate or frame-pacing related).
+### Checkpoint 2: AHardwareBuffer ↔ Vulkan bridging — FAILS on this
+### device/driver (not a MediaCodec-side problem this time)
+
+Three standalone native probes (no Java, no MediaCodec —
+`ForeverXR/tools/foveation-pc-test/vk_ahb_probe.c`,
+`vk_ahb_export_test.c`, `vk_ahb_import_test.c`), run directly on-device:
+
+1. **`vk_ahb_probe.c`** — allocated the exact `YCBCR_420_888`
+   `AHardwareBuffer` shape Checkpoint 1 used (896x960, layers=1,
+   `USAGE_VIDEO_ENCODE`), plus a GPU usage bit
+   (`GPU_DATA_BUFFER`/`GPU_SAMPLED_IMAGE`/`GPU_COLOR_OUTPUT` each tried
+   individually — `AHardwareBuffer_isSupported()` reports **YES** for
+   all four), then imported it into Vulkan and called
+   `vkGetAndroidHardwareBufferPropertiesANDROID()`. **Result: CASE B —
+   `format=VK_FORMAT_UNDEFINED`, `externalFormat=0x301`.** This Pixel's
+   PowerVR gralloc allocator never exposes `YCBCR_420_888` to Vulkan as
+   the concrete `G8_B8R8_2PLANE_420_UNORM` format the compositor uses
+   internally — it's always an opaque external format.
+   `formatFeatures=0xbad081`: `STORAGE=0`, `TRANSFER_SRC=1`,
+   `TRANSFER_DST=1`, `SAMPLED=1`. Independently, a plain (non-AHB)
+   capability query (`vkGetPhysicalDeviceImageFormatProperties2` with the
+   AHB-external chain) for the concrete format with `STORAGE` usage also
+   comes back degenerate (`VK_SUCCESS` but `maxExtent=0x0`) — confirms
+   `STORAGE` is unsupported for AHB interop on this format in both
+   directions, not just an import-side quirk.
+2. **`vk_ahb_export_test.c`** (Step 15's "Vulkan-first" alternative —
+   create the concrete-format image ourselves, export its memory as an
+   `AHardwareBuffer` via `vkGetMemoryAndroidHardwareBufferANDROID()`,
+   sidestepping the opaque-format problem entirely): `vkCreateImage`
+   succeeds, `vkGetImageMemoryRequirements2` succeeds — but the actual
+   `vkAllocateMemory(export, dedicated)` call **fails with
+   `VK_ERROR_OUT_OF_DEVICE_MEMORY`**, despite the prior capability query
+   (`vkGetPhysicalDeviceImageFormatProperties2` for `TRANSFER_DST`-only
+   usage) reporting the combination supported with real, non-degenerate
+   limits. A genuine capability-query-vs-real-driver-behavior mismatch —
+   same character as the array-layer bug found in Milestone 4.5 (the
+   driver's own queries aren't trustworthy in isolation on this
+   hardware).
+3. **`vk_ahb_import_test.c`** — re-confirmed the CASE B external format
+   from probe 1, then actually created a `VkImage` for it
+   (`VK_FORMAT_UNDEFINED` + `VkExternalFormatANDROID`, usage
+   `TRANSFER_DST_BIT`) and imported the same AHB as dedicated memory.
+   **`vkCreateImage`/`vkAllocateMemory`/`vkBindImageMemory` all fully
+   succeed** — so the AHB genuinely is a valid Vulkan import target,
+   just an opaque one.
+
+**Why no write path exists, even with `TRANSFER_DST` "supported"** (this
+part is spec reasoning, not a live-tested result — see below): an image
+with a non-zero `externalFormat` has no Vulkan-visible texel size or
+layout, so a `vkCmdCopyImage` region's extent is only meaningful when
+*both* sides of the copy share the identical external format (this is
+why the extension's compatibility rules require it — the driver blits
+between two buffers of its own private layout without either side's
+texel geometry being expressible to Vulkan). Our compositor's real
+source image is a normal concrete `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`
+image, not `externalFormat=0x301`, so this copy has no legal encoding.
+And a same-external-format source is unobtainable any other way: the
+only way to get `externalFormat=0x301` memory is another
+`YCBCR_420_888` AHB allocation — which is subject to the exact same
+`STORAGE=0` constraint probe 1 found, so *nothing* can populate it via
+Vulkan. **This reasoning was not verified with a live illegal copy
+attempt** — deliberately, since it would need to run without validation
+layers (not installed on this stock, unrooted device) and risks an
+unrecoverable device-side hang for close to zero additional information,
+given two independent *empirical* failures (probe 1's `STORAGE=0`, probe
+2's real `vkAllocateMemory` failure) already point to the same
+conclusion through different mechanisms. Flagged here explicitly as
+reasoned-not-tested in case it's worth the risk later.
+
+Also checked (Step 16): the public NDK header
+(`android/hardware_buffer.h`) has no `AHARDWAREBUFFER_FORMAT_PRIVATE`
+constant — only named formats (`Y8Cb8Cr8_420`, `BLOB`, RGBA variants,
+`YCbCr_P010`/`P210`, etc.) and `BLOB` (a linear byte buffer, not a 2D
+image — not usable for `QueueRequest.setHardwareBuffer()`'s image input
+regardless). Not actionable within this project's public-API-only
+constraint; not pursued further.
+
+**Conclusion for Checkpoint 2, precisely**: on this Pixel 10 Pro XL,
+MediaCodec's block-model `HardwareBuffer` input (Checkpoint 1) is **not**
+the blocker — it works perfectly. The blocker is one layer earlier:
+**this device's gralloc allocator exposes the exact `YCBCR_420_888`
+buffer shape MediaCodec accepts to Vulkan only as an opaque external
+format with no legal GPU write path** on this driver — `STORAGE` is
+unsupported (real, tested), `TRANSFER`-based copy needs a same-format
+source that's unobtainable (reasoned from spec, not live-tested), and
+the "Vulkan-first, full control" alternative fails at actual memory
+allocation despite passing its own capability query (real, tested). The
+only way found to legally put pixel content into any AHardwareBuffer
+MediaCodec's block model accepts, on this device, is a CPU lock
+(`AHardwareBuffer_lockPlanes()` — exactly what Checkpoint 1's
+`hwbfill.c` already does). Combined with Milestone 4.6's Surface-input
+findings: **no usable public zero-copy MediaCodec input path has been
+found on this device/firmware**, across all three public API families
+tried (Surface via Vulkan WSI, Surface via EGL, and now Block Model +
+direct `HardwareBuffer`) — still deliberately not phrased as "impossible
+on this hardware," since each failure has a specific, different, named
+cause rather than a single proven hardware ceiling.
+
+Returning to optimizing the working ByteBuffer/NV12 path is the
+concrete next step (the pixelation reported after Milestone 4.5's
+latency fix is still open and likely a separate, more tractable issue —
+bitrate or frame-pacing related).
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
