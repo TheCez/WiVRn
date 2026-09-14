@@ -1,0 +1,109 @@
+// Android-phone-as-server app module. Packages libwivrn-server.so
+// (server/android/wivrn_server_jni.cpp) and its Service wrapper
+// (server/android/java/WivrnServerService.java) into an installable APK.
+// See docs/ANDROID_PORT.md for the full story -- this is a companion to
+// the root project (the existing WiVRn Quest client), not a replacement
+// for it; both build from the same top-level CMakeLists.txt with
+// different -D arguments (WIVRN_BUILD_CLIENT vs WIVRN_BUILD_SERVER).
+//
+// apply plugin (not `plugins {}`) matches the root build.gradle's style,
+// reusing its buildscript { classpath 'com.android.tools.build:gradle' }
+// and allprojects { repositories ... } -- both declared once, build-wide,
+// at the root, so they don't need repeating here.
+apply plugin: 'com.android.application'
+
+// Toolchain notes (see docs/ANDROID_PORT.md for the full rationale):
+// - ndkVersion here matches the root project's exactly (29.0.14206865),
+//   so both modules resolve the same real, SDK-managed NDK via
+//   local.properties' sdk.dir -- no custom NDK path needed in Gradle
+//   arguments, unlike the raw `cmake` invocations used earlier in this
+//   project's history (those predate this SDK being bootstrapped).
+// - Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11 are still
+//   not resolvable on this host through any Gradle/AGP mechanism, so the
+//   same -D overrides from the manual CMake commands are passed through
+//   here as externalNativeBuild.cmake.arguments below.
+def toolsDir = "${rootDir}/../tools"
+
+android {
+    namespace 'org.meumeu.wivrn.server'
+    ndkVersion = "29.0.14206865"
+
+    defaultConfig {
+        applicationId "org.meumeu.wivrn.server"
+        // Matches ANDROID_PLATFORM=android-30 used throughout this
+        // project's manual builds: std::jthread/std::stop_token's
+        // pthread_cond_clockwait needs bionic API 30+ at both compile
+        // and runtime, and the reference device (and any realistic
+        // target for phone-as-VR-server) is far newer anyway.
+        minSdkVersion 30
+        compileSdkVersion 34
+        targetSdkVersion 34
+
+        versionName = project.hasProperty('wivrn_version') ? wivrn_version : "1.0"
+        versionCode = project.hasProperty('wivrn_versionCode') ? wivrn_versionCode.toInteger() : 1
+
+        externalNativeBuild {
+            cmake {
+                arguments = [
+                    '-DANDROID_TOOLCHAIN=clang',
+                    '-DANDROID_STL=c++_static',
+                    '-DCMAKE_ANDROID_NDK_VERSION=' + ndkVersion,
+                    '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+                    '-DVulkan_INCLUDE_DIR=' + toolsDir + '/vulkan-headers/include',
+                    '-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=' + toolsDir + '/glslang/extracted/usr/bin/glslangValidator',
+                    '-DGLSLANGVALIDATOR_COMMAND=' + toolsDir + '/glslang/extracted/usr/bin/glslangValidator',
+                    '-DCMAKE_PREFIX_PATH=' + toolsDir + '/prefix',
+                    '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH',
+                    '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH',
+                    '-DWIVRN_ANDROID_JNI=ON',
+                    '-DWIVRN_BUILD_SERVER=ON',
+                    '-DWIVRN_BUILD_SERVER_LIBRARY=OFF',
+                    '-DWIVRN_BUILD_CLIENT=OFF',
+                    '-DWIVRN_BUILD_DASHBOARD=OFF',
+                    '-DWIVRN_BUILD_WIVRNCTL=OFF',
+                    '-DWIVRN_BUILD_DISSECTOR=OFF',
+                    '-DWIVRN_BUILD_TEST=OFF',
+                    '-DWIVRN_USE_SYSTEM_BOOST=OFF',
+                    '-DWIVRN_USE_SYSTEM_FREETYPE=OFF',
+                    '-DWIVRN_USE_NVENC=OFF',
+                    '-DWIVRN_USE_VAAPI=OFF',
+                    '-DWIVRN_USE_VULKAN_ENCODE=OFF',
+                    '-DWIVRN_USE_X264=OFF',
+                    '-DWIVRN_USE_PIPEWIRE=OFF',
+                    '-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF',
+                    '-DWIVRN_FEATURE_SOLARXR=OFF',
+                    '-DWIVRN_OPTIMIZE_SHADERS=OFF',
+                ]
+                targets 'wivrn-server'
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            // Same top-level CMakeLists.txt the client (root project)
+            // already builds from, just with the arguments above.
+            path "../CMakeLists.txt"
+            version "3.31.6"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['../server/android/java']
+            manifest.srcFile '../server/android/AndroidManifest.xml'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

@@ -46,38 +46,52 @@
 
 #include "utils/method.h"
 
+#include "driver/configuration.h"
+#include "driver/wivrn_connection.h"
 #include "server/ipc_server_interface.h"
+#include "target_instance_wivrn.h"
+#include "wivrn_ipc.h"
+#include "wivrn_sockets.h"
 
 #include <atomic>
+#include <iostream>
 #include <thread>
 
 namespace
 {
 
 // Mirrors server/ipc_server_cb.cpp's pattern (same method_pointer2 trampoline
-// technique), but additionally stashes the ipc_server* so nativeStop() can
-// call ipc_server_stop() on it -- ipc_server_cb itself has no accessor for
-// this.
+// technique) -- and MUST replicate its mainloop_entering/leaving behavior
+// exactly: instance::create_system() (target_instance_wivrn.cpp) asserts
+// that wivrn::instance::server is set, which only happens via
+// instance::set_ipc_server(). A first version of this file stashed the
+// ipc_server* into its own atomic but never called set_ipc_server(), which
+// crashed on launch (SIGABRT, "assertion server failed") the moment a
+// client tried to connect.
+//
+// Beyond that, this class also bridges client_connected/client_disconnected
+// up to WivrnServerService's onClientConnected/onClientDisconnected (see
+// nativeStart below for how the JavaVM*/jobject are cached), so the UI can
+// show live connection status instead of nothing.
 class android_ipc_server_cb : public ipc_server_callbacks
 {
 	void init_failed(xrt_result_t)
 	{}
 
-	void mainloop_entering(ipc_server * server, xrt_instance *)
+	void mainloop_entering(ipc_server * server, xrt_instance * xrt_inst)
 	{
 		running_server.store(server, std::memory_order_release);
+		static_cast<wivrn::instance *>(xrt_inst)->set_ipc_server(server);
 	}
 
-	void mainloop_leaving(ipc_server *, xrt_instance *)
+	void mainloop_leaving(ipc_server *, xrt_instance * xrt_inst)
 	{
 		running_server.store(nullptr, std::memory_order_release);
+		static_cast<wivrn::instance *>(xrt_inst)->set_ipc_server(nullptr);
 	}
 
-	void client_connected(ipc_server *, uint32_t)
-	{}
-
-	void client_disconnected(ipc_server *, uint32_t)
-	{}
+	void client_connected(ipc_server *, uint32_t client_id);
+	void client_disconnected(ipc_server *, uint32_t client_id);
 
 public:
 	using base_t = void;
@@ -99,39 +113,126 @@ std::atomic<ipc_server *> android_ipc_server_cb::running_server = nullptr;
 
 std::optional<std::jthread> server_thread;
 
-void run_server()
+// Cached in nativeStart, used by call_service_method() below.
+JavaVM * g_vm = nullptr;
+jobject g_service = nullptr; // GlobalRef
+
+// client_connected/client_disconnected run on the server thread, not
+// whatever thread called nativeStart, so this attaches/detaches around the
+// actual JNI call rather than reusing an env captured elsewhere.
+void call_service_method(const char * name, uint32_t client_id)
 {
-	android_ipc_server_cb server_cb;
+	if (!g_vm || !g_service)
+		return;
 
-	ipc_server_main_info server_info{
-	        .udgci = {
-	                .window_title = "WiVRn",
-	                .open = U_DEBUG_GUI_OPEN_NEVER,
-	        },
-	        .exit_on_disconnect = false,
-	        .no_stdin = true,
-	};
+	JNIEnv * env = nullptr;
+	bool attached = false;
+	if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK)
+	{
+		if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+			return;
+		attached = true;
+	}
 
-	// Blocks until ipc_server_stop() is called (from nativeStop()) or the
-	// server otherwise decides to exit.
-	ipc_server_main_common(&server_info, &server_cb, nullptr);
+	jclass cls = env->GetObjectClass(g_service);
+	jmethodID mid = env->GetMethodID(cls, name, "(I)V");
+	if (mid)
+		env->CallVoidMethod(g_service, mid, jint(client_id));
+	env->DeleteLocalRef(cls);
+
+	if (attached)
+		g_vm->DetachCurrentThread();
+}
+
+void android_ipc_server_cb::client_connected(ipc_server *, uint32_t client_id)
+{
+	call_service_method("onClientConnected", client_id);
+}
+
+void android_ipc_server_cb::client_disconnected(ipc_server *, uint32_t client_id)
+{
+	call_service_method("onClientDisconnected", client_id);
+}
+
+// wivrn::instance::create_system() (target_instance_wivrn.cpp) does
+// std::move(connection) on the extern global declared in wivrn_ipc.h --
+// populated on desktop by main.cpp's headset_connected(), *before*
+// start_server() is ever called, which is why ipc_server_main_common()
+// can safely call create_system() immediately at startup: it assumes a
+// connection already exists. Skipping straight to ipc_server_main_common()
+// without populating it first crashed here (SIGSEGV constructing a
+// headset_info_packet from a moved-from-null connection) the moment
+// create_system() ran, regardless of whether a headset had connected --
+// this is not optional plumbing, it's required for this call to be safe
+// at all. So: accept a TCP connection and construct wivrn_connection first,
+// exactly like headset_connected() does, then start the compositor.
+//
+// Known gap: unlike desktop, there is no PIN/pairing UI here yet --
+// wivrn::wivrn_connection::encryption_state::enabled (the same default
+// desktop uses before any explicit "pair a new device" action) with an
+// empty pin is used unconditionally. Revisit alongside NsdManager-based
+// discovery (see docs/ANDROID_PORT.md).
+//
+// Known gap: listener.accept() is a blocking call not interruptible by
+// std::stop_token; if nativeStop() is called while still waiting for a
+// first connection, server_thread->join() will block until a connection
+// (or a spurious wake) arrives. Fine for now, worth fixing before this
+// goes further.
+void run_server(std::stop_token stop)
+{
+	wivrn::TCPListener listener(wivrn::configuration().port);
+
+	while (!stop.stop_requested())
+	{
+		try
+		{
+			wivrn::TCP tcp = listener.accept().first;
+			connection = std::make_unique<wivrn::wivrn_connection>(
+			        stop, wivrn::wivrn_connection::encryption_state::enabled, "", std::move(tcp));
+		}
+		catch (std::exception & e)
+		{
+			std::cerr << "WiVRn: client connection failed: " << e.what() << std::endl;
+			continue;
+		}
+
+		android_ipc_server_cb server_cb;
+
+		ipc_server_main_info server_info{
+		        .udgci = {
+		                .window_title = "WiVRn",
+		                .open = U_DEBUG_GUI_OPEN_NEVER,
+		        },
+		        .exit_on_disconnect = false,
+		        .no_stdin = true,
+		};
+
+		// Blocks until ipc_server_stop() is called (from nativeStop()) or
+		// the server otherwise decides to exit (e.g. the headset
+		// disconnects). Returns to accept() afterward for the next
+		// connection, unless a stop was requested meanwhile.
+		ipc_server_main_common(&server_info, &server_cb, nullptr);
+	}
 }
 
 } // namespace
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv *, jobject)
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv * env, jobject thiz)
 {
 	if (server_thread)
 		return; // already running
 
-	server_thread.emplace([](std::stop_token) {
-		run_server();
+	env->GetJavaVM(&g_vm);
+	g_service = env->NewGlobalRef(thiz);
+
+	server_thread.emplace([](std::stop_token stop) {
+		run_server(stop);
 	});
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv *, jobject)
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv * env, jobject)
 {
 	if (!server_thread)
 		return;
@@ -142,4 +243,11 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv *, jobject)
 	server_thread->request_stop();
 	server_thread->join();
 	server_thread.reset();
+
+	if (g_service)
+	{
+		env->DeleteGlobalRef(g_service);
+		g_service = nullptr;
+	}
+	g_vm = nullptr;
 }

@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  DRAFT -- not yet wired into a real Gradle module. This is what the
-  server-side Android app's manifest needs to contain; it should be merged
-  into a real AndroidManifest.xml once a Gradle module exists for it (see
-  docs/ANDROID_PORT.md, "Milestone 2" -> next step). Written against the
-  same Vulkan/OpenXR feature requirements as the root (client) manifest,
-  since wivrn-server needs the same Vulkan capability the client does.
+  Manifest for the server-app Gradle module (see ../../../server-app/build.gradle,
+  which points sourceSets.main.manifest.srcFile at this file). Written
+  against the same Vulkan feature requirements as the root (client)
+  manifest, since wivrn-server needs the same Vulkan capability the
+  client does.
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.meumeu.wivrn.server">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- No package= attribute: the module's namespace comes from
+         server-app/build.gradle's android.namespace (modern AGP). -->
 
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400000" android:required="true"/>
     <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="true"/>
@@ -23,7 +23,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Streaming to a headset is squarely what Android's "connectedDevice"
-         foreground service type is for -- already confirmed working on
+         foreground service type is for: already confirmed working on
          this exact device for org.freedesktop.monado.openxr_runtime's own
          out-of-process runtime broker service (observed in adb logcat
          during earlier device testing), so reusing the same category here
@@ -34,6 +34,15 @@
 
     <application
         android:label="WiVRn Server">
+
+        <activity
+            android:name="org.meumeu.wivrn.server.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <service
             android:name="org.meumeu.wivrn.server.WivrnServerService"

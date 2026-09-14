@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WiVRn Android port <noreply@invalid>
+Date: Mon, 14 Sep 2026 00:00:00 +0000
+Subject: [PATCH] aux/android: include <vector> for std::vector usage
+
+org.freedesktop.monado.auxiliary.hpp uses std::vector<float> but never
+includes <vector> itself, relying on it being pulled in transitively
+by something else. That happens to work with some libc++ versions but
+not others -- surfaced building against NDK 29's libc++ (worked fine
+against NDK r28b). Fix the missing include directly rather than
+depending on transitive header inclusion.
+---
+ src/xrt/auxiliary/android/org.freedesktop.monado.auxiliary.hpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/xrt/auxiliary/android/org.freedesktop.monado.auxiliary.hpp b/src/xrt/auxiliary/android/org.freedesktop.monado.auxiliary.hpp
+index 0000000..0000000 100644
+--- a/src/xrt/auxiliary/android/org.freedesktop.monado.auxiliary.hpp
++++ b/src/xrt/auxiliary/android/org.freedesktop.monado.auxiliary.hpp
+@@ -10,6 +10,8 @@
+
+ #include "wrap/ObjectWrapperBase.h"
+
++#include <vector>
++
+ namespace wrap {
+ namespace android::app {
+ 	class Activity;
+--
+2.55.0

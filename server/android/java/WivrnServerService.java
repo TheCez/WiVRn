@@ -25,7 +25,12 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+
+import java.util.HashSet;
+import java.util.Set;
 
 // Foreground Service wrapper around wivrn-server's JNI entry point
 // (server/android/wivrn_server_jni.cpp, built when WIVRN_ANDROID_JNI=ON).
@@ -34,9 +39,14 @@ import android.os.IBinder;
 // comment for the specific simplification this implies versus desktop's
 // on-demand-per-connection compositor start.
 //
-// NOT YET WIRED INTO A BUILDABLE APK: this class exists and is written to
-// compile, but there is no Gradle module/AndroidManifest.xml that packages
-// it yet -- see docs/ANDROID_PORT.md for the concrete next step.
+// Connection status: onClientConnected/onClientDisconnected below are
+// called from native (android_ipc_server_cb in wivrn_server_jni.cpp,
+// bridging Monado's own ipc_server_callbacks) whenever a headset's TCP
+// connection to the compositor opens/closes. Right now that's the only
+// granularity available -- there's no separate "streaming vs. just
+// connected" native hook yet, and no headset name/model, just a numeric
+// client id -- so the UI (MainActivity) shows one honest "connected"
+// state rather than inventing detail this doesn't actually have.
 public class WivrnServerService extends Service
 {
 	private static final String CHANNEL_ID = "wivrn_server";
@@ -52,6 +62,43 @@ public class WivrnServerService extends Service
 	private native void nativeStop();
 
 	private boolean started = false;
+
+	private final Handler mainHandler = new Handler(Looper.getMainLooper());
+	private final Set<Integer> connectedClients = new HashSet<>();
+
+	public interface ConnectionListener
+	{
+		void onConnectedClientsChanged(Set<Integer> clientIds);
+	}
+
+	private static ConnectionListener listener;
+
+	public static void setConnectionListener(ConnectionListener l)
+	{
+		listener = l;
+	}
+
+	// Called from native (server thread, via JNIEnv obtained through
+	// AttachCurrentThread -- see wivrn_server_jni.cpp's call_service_method).
+	public void onClientConnected(int clientId)
+	{
+		mainHandler.post(() -> {
+			connectedClients.add(clientId);
+			updateNotification();
+			if (listener != null)
+				listener.onConnectedClientsChanged(connectedClients);
+		});
+	}
+
+	public void onClientDisconnected(int clientId)
+	{
+		mainHandler.post(() -> {
+			connectedClients.remove(clientId);
+			updateNotification();
+			if (listener != null)
+				listener.onConnectedClientsChanged(connectedClients);
+		});
+	}
 
 	@Override
 	public IBinder onBind(Intent intent)
@@ -87,6 +134,12 @@ public class WivrnServerService extends Service
 		super.onDestroy();
 	}
 
+	private void updateNotification()
+	{
+		NotificationManager manager = getSystemService(NotificationManager.class);
+		manager.notify(NOTIFICATION_ID, buildNotification());
+	}
+
 	private Notification buildNotification()
 	{
 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -99,9 +152,13 @@ public class WivrnServerService extends Service
 			manager.createNotificationChannel(channel);
 		}
 
+		String status = connectedClients.isEmpty()
+		        ? "No devices connected"
+		        : "Streaming (" + connectedClients.size() + " connected)";
+
 		return new Notification.Builder(this, CHANNEL_ID)
-		        .setContentTitle("WiVRn server running")
-		        .setContentText("Streaming to headset")
+		        .setContentTitle("WiVRn server")
+		        .setContentText(status)
 		        .setSmallIcon(android.R.drawable.ic_media_play)
 		        .build();
 	}
