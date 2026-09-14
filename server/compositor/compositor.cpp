@@ -333,8 +333,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
+			auto & img = get_layer_image(layer, view, data.sub.image_index);
 			src[view] = get_image_view(
-			        &get_layer_image(layer, view, data.sub.image_index),
+			        &img,
 			        layer.data.flags,
 			        data.sub.array_index);
 			src_rect[view] = data.sub.rect;
@@ -630,17 +631,39 @@ void compositor::encoder_work(std::stop_token tok)
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
-		try
+		// Encode each stream concurrently rather than sequentially on this
+		// one thread. This mattered little on desktop backends (NVENC,
+		// VAAPI, x264), where per-call overhead is negligible -- but
+		// Android's AMediaCodec has real per-call JNI/Binder overhead, so
+		// calling it sequentially for stream 0 then stream 1 on one thread
+		// meant stream 0's dequeue/queue calls always fully completed
+		// before stream 1's even started, every single frame,
+		// deterministically starving whichever stream comes later in this
+		// loop. See docs/ANDROID_PORT.md's Milestone 4.5 entry.
+		// wivrn_connection::send_control/send_stream (server/driver/
+		// wivrn_connection.h) gained a mutex alongside this change, since
+		// concurrent encode() calls can now genuinely race on the same
+		// underlying socket where they never could before.
 		{
+			beman::inplace_vector::inplace_vector<std::jthread, 3> workers;
 			for (auto & encoder: encoders)
 			{
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
-					encoder->encode(session, image.view_info, image.frame_index);
+				{
+					workers.emplace_back([&, e = encoder.get()] {
+						try
+						{
+							e->encode(session, image.view_info, image.frame_index);
+						}
+						catch (std::exception & ex)
+						{
+							U_LOG_W("encode error: %s", ex.what());
+						}
+					});
+				}
 			}
-		}
-		catch (std::exception & e)
-		{
-			U_LOG_W("encode error: %s", e.what());
+			// workers' jthreads join here as it goes out of scope, before
+			// this image is marked free for reuse.
 		}
 		image.busy = false;
 	}

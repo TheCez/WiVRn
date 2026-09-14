@@ -6,7 +6,8 @@
   manifest, since wivrn-server needs the same Vulkan capability the
   client does.
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- No package= attribute: the module's namespace comes from
          server-app/build.gradle's android.namespace (modern AGP). -->
 
@@ -48,6 +49,32 @@
             android:name="org.meumeu.wivrn.server.WivrnServerService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- OpenXR runtime broker registration + Monado's own IMonado AIDL
+             bind target, on one <service>: the broker intent-filter is only
+             ever statically read (queryIntentServices(), never actually
+             bound); the other is the real bind target for openxr_wivrn.so's
+             ipc_client (loaded into a local OpenXR app's own process, built
+             from the same vendored Monado with XRT_ANDROID_PACKAGE set to
+             this app's package: see server/CMakeLists.txt). See
+             MonadoIpcService's own comment and docs/ANDROID_PORT.md. -->
+        <service
+            android:name="org.meumeu.wivrn.server.MonadoIpcService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <meta-data
+                android:name="org.khronos.openxr.OpenXRRuntime.SoFilename"
+                android:value="libopenxr_wivrn.so" />
+            <meta-data
+                android:name="org.khronos.openxr.OpenXRRuntime.MajorVersion"
+                android:value="1" />
+            <intent-filter>
+                <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+            </intent-filter>
+        </service>
 
     </application>
 </manifest>

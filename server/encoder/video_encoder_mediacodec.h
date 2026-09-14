@@ -1,0 +1,113 @@
+/*
+ * WiVRn VR streaming
+ * Copyright (C) 2026  Ajay Chodankar <achodankar28@gmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "video_encoder.h"
+#include "vk/allocation.h"
+
+#include <array>
+#include <media/NdkMediaCodec.h>
+#include <vector>
+
+namespace wivrn
+{
+
+// Android's hardware video encoder, via the NDK's byte-buffer AMediaCodec
+// API (NdkMediaCodec.h) -- see docs/ANDROID_PORT.md's Milestone 3 entry for
+// the full story of why this exists at all.
+//
+// ponytail: this copies the compositor's rendered image out to a
+// host-visible VMA buffer first (present_image(), identical to
+// video_encoder_raw.cpp's own copy step) and memcpy's that into MediaCodec's
+// own input buffer in encode() -- not the genuinely zero-copy path
+// (AMediaCodec_createInputSurface() + rendering directly into it as a
+// VkSurfaceKHR/VkSwapchainKHR target, matching how the client's own decoder
+// consumes a Surface). That's real, meaningfully more work (restructuring
+// how the compositor's encode-target image is allocated) for a second pass
+// once this is proven to actually decode correctly on a real headset --
+// right now nothing produces a real H.264 bitstream from this phone at all,
+// which is the actual blocker. Upgrade path: swap this backend's image
+// storage for one backed by an AHardwareBuffer imported into Vulkan via
+// VK_ANDROID_external_memory_android_hardware_buffer, queued to the
+// encoder's input Surface instead of copied through a CPU buffer.
+class video_encoder_mediacodec : public video_encoder
+{
+	vk_bundle & vk;
+	vk::raii::CommandPool cmd_pool;
+
+	struct AMediaCodec_deleter
+	{
+		void operator()(AMediaCodec * c) const
+		{
+			if (c)
+			{
+				AMediaCodec_stop(c);
+				AMediaCodec_delete(c);
+			}
+		}
+	};
+	std::unique_ptr<AMediaCodec, AMediaCodec_deleter> codec;
+
+	struct in_t
+	{
+		vk::raii::Fence fence = nullptr;
+		vk::raii::CommandBuffer cmd = nullptr;
+		buffer_allocation buffer; // single NV12 buffer, Y then interleaved UV
+	};
+	std::array<in_t, num_slots> in;
+
+	// SPS+PPS, captured once from the encoder's first (CODEC_CONFIG-flagged)
+	// output buffer. Devices don't reliably repeat these inline before every
+	// keyframe on their own (unlike x264 with b_repeat_headers=1), and the
+	// client's decoder expects them there (in-band, no csd-0/csd-1 passed to
+	// AMediaCodec_configure on the client side -- see android_decoder.cpp) --
+	// so this gets prepended by hand before every IDR we send.
+	std::vector<uint8_t> csd;
+
+	// Real per-stream bitrate/fps, cached so the lazily-created codec (see
+	// ensure_codec below) can be configured with the same values the
+	// constructor would have used, without needing to hold onto the whole
+	// encoder_settings.
+	uint32_t bitrate;
+	float fps;
+
+	// AMediaCodec_create/configure/start is deferred to the first actual
+	// present_image() call rather than done unconditionally in the
+	// constructor: on this hardware, streams 0/1 (real eyes) are always
+	// used, but stream 2 (alpha/passthrough matte) almost never is -- most
+	// apps never submit an alpha-blend layer -- yet the compositor always
+	// constructs all 3 encoders up front (see compositor.cpp). Configuring
+	// and starting a real hardware encoder session for a stream that may
+	// then sit fed-nothing for the entire lifetime of the session wastes
+	// one of a small, fixed number of concurrent hardware video-encode
+	// sessions this SoC actually has -- starving the two streams that are
+	// really needed. Deferring means an unused alpha stream never touches
+	// the hardware encoder at all. See docs/ANDROID_PORT.md's Milestone 4.5
+	// entry for the investigation this came out of.
+	void ensure_codec();
+
+public:
+	video_encoder_mediacodec(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
+
+	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
+
+	std::optional<data> encode(uint8_t slot, uint64_t frame_id) override;
+};
+
+} // namespace wivrn

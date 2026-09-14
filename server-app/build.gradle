@@ -30,12 +30,16 @@ android {
 
     defaultConfig {
         applicationId "org.meumeu.wivrn.server"
-        // Matches ANDROID_PLATFORM=android-30 used throughout this
-        // project's manual builds: std::jthread/std::stop_token's
-        // pthread_cond_clockwait needs bionic API 30+ at both compile
-        // and runtime, and the reference device (and any realistic
-        // target for phone-as-VR-server) is far newer anyway.
-        minSdkVersion 30
+        // Was 30 (matching pthread_cond_clockwait's bionic floor for
+        // std::jthread/std::stop_token). Raised to 33: that's the first
+        // NDK API level whose libvulkan.so stub statically exports the
+        // Vulkan 1.3 core symbols VMA now needs (vkGetDeviceBufferMemoryRequirements
+        // / vkGetDeviceImageMemoryRequirements, required once VMA_VULKAN_VERSION
+        // was bumped to 1003000 -- see common/CMakeLists.txt) -- confirmed via
+        // `nm -D` across the NDK's per-API-level stubs, absent through API 32,
+        // present from 33. No realistic phone-as-VR-server target runs anything
+        // this old anyway.
+        minSdkVersion 33
         compileSdkVersion 34
         targetSdkVersion 34
 
@@ -72,9 +76,48 @@ android {
                     '-DWIVRN_USE_PIPEWIRE=OFF',
                     '-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF',
                     '-DWIVRN_FEATURE_SOLARXR=OFF',
-                    '-DWIVRN_OPTIMIZE_SHADERS=OFF',
+                    // Re-enabled: spirv-opt ships in the NDK's shader-tools dir
+                    // (CMAKE_PROGRAM_PATH below) -- OFF was likely just a
+                    // leftover from Milestone 1 when no path override existed
+                    // for it yet (only glslangValidator was overridden then).
+                    '-DWIVRN_OPTIMIZE_SHADERS=ON',
+                    '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin',
+                    // Reuse an already-populated FetchContent deps cache --
+                    // this sandbox has no outbound network, and any change
+                    // to these cmake arguments makes AGP hash a brand new,
+                    // empty .cxx build dir that would otherwise try (and
+                    // fail) to re-download boost/monado/openssl from scratch.
+                    // NOTE: pinned to this specific hash's _deps on purpose --
+                    // a copy at tools/wivrn-fetchcontent-cache was tried as a
+                    // stable alternative, but FetchContent's own subbuild
+                    // stamp files bake in absolute paths, so copying it
+                    // elsewhere makes CMake think it needs to re-populate.
+                    // Leave this pointed at a real, previously-built .cxx
+                    // hash dir.
+                    '-DFETCHCONTENT_BASE_DIR=' + "${projectDir}/.cxx/Debug/3k1y4v6y/arm64-v8a/_deps",
+                    // Makes the vendored Monado's own targets/openxr build
+                    // (openxr_wivrn, below) bind its loader .so to *this*
+                    // app's package instead of Monado's own default
+                    // (org.freedesktop.monado.openxr_runtime.out_of_process)
+                    // -- see Client.java's own javadoc ("There's a define in
+                    // xrt_config_android.h to use for this") and
+                    // MonadoIpcService/docs/ANDROID_PORT.md for the rest of
+                    // the OpenXR runtime broker story. Already-set
+                    // XRT_FEATURE_SERVICE=ON (server/CMakeLists.txt) makes
+                    // Monado build this target as a thin ipc_client
+                    // (XRT_FEATURE_IPC_CLIENT auto-computed ON) rather than a
+                    // second full standalone runtime -- exactly what's
+                    // needed, for free, not something added here.
+                    '-DXRT_ANDROID_PACKAGE=org.meumeu.wivrn.server',
                 ]
-                targets 'wivrn-server'
+                // openxr_wivrn: Monado's own targets/openxr, always defined
+                // by FetchContent_MakeAvailable(monado) (server/CMakeLists.txt
+                // sets XRT_OXR_RUNTIME_SUFFIX="wivrn", giving this exact
+                // target name) but never built before now since nothing
+                // asked ninja for it -- CMake configures every defined
+                // target regardless of this list, only *building* is scoped
+                // to what's named here.
+                targets 'wivrn-server', 'openxr_wivrn'
                 abiFilters 'arm64-v8a'
             }
         }
@@ -92,8 +135,15 @@ android {
     sourceSets {
         main {
             java.srcDirs = ['../server/android/java']
+            aidl.srcDirs = ['../server/android/aidl']
             manifest.srcFile '../server/android/AndroidManifest.xml'
         }
+    }
+
+    buildFeatures {
+        // Off by default since AGP 8 -- needed for IMonado.aidl (see
+        // MonadoIpcService/docs/ANDROID_PORT.md).
+        aidl true
     }
 
     buildTypes {
@@ -106,4 +156,12 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    // Needed by the vendored-verbatim Monado Java helper classes under
+    // server/android/java/org/freedesktop/monado/{ipc,auxiliary} (@Keep,
+    // @NonNull, @RequiresApi, etc.) -- see docs/ANDROID_PORT.md's OpenXR
+    // runtime broker section for why those exist in this module at all.
+    implementation 'androidx.annotation:annotation:1.7.1'
 }

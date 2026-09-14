@@ -39,6 +39,9 @@
 #include "ffmpeg/video_encoder_va.h"
 #include <libavutil/ffversion.h>
 #endif
+#if WIVRN_USE_MEDIACODEC
+#include "video_encoder_mediacodec.h"
+#endif
 
 namespace wivrn
 {
@@ -172,6 +175,38 @@ class prober
 	}
 #endif
 
+#if WIVRN_USE_MEDIACODEC
+	std::unordered_map<video_codec, bool> mediacodec_support;
+
+	bool check_mediacodec(video_codec codec)
+	{
+		if (auto it = mediacodec_support.find(codec); it != mediacodec_support.end())
+			return it->second;
+		try
+		{
+			video_encoder_mediacodec test(
+			        vk,
+			        encoder_settings{
+			                .width = 800,
+			                .height = 800,
+			                .codec = codec,
+			                .fps = 60,
+			                .bitrate = 50'000'000,
+			                .bit_depth = 8,
+			        },
+			        0);
+			mediacodec_support[codec] = true;
+			return true;
+		}
+		catch (std::exception & e)
+		{
+			mediacodec_support[codec] = false;
+			U_LOG_I("mediacodec not supported for %s: %s", std::string(magic_enum::enum_name(codec)).c_str(), e.what());
+			return false;
+		}
+	}
+#endif
+
 	static bool is_nvidia(vk::raii::PhysicalDevice & physical_device)
 	{
 		auto props = physical_device.getProperties();
@@ -253,6 +288,17 @@ public:
 			{
 				if (check_vaapi(codec))
 					return {encoder_vaapi, codec};
+			}
+		}
+#endif
+
+#if WIVRN_USE_MEDIACODEC
+		if (config.name.empty() or config.name == encoder_mediacodec)
+		{
+			for (auto codec: config.codec ? std::vector{*config.codec} : info.supported_codecs)
+			{
+				if (check_mediacodec(codec))
+					return {encoder_mediacodec, codec};
 			}
 		}
 #endif

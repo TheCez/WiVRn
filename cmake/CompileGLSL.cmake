@@ -1,6 +1,7 @@
 set(_THIS_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 find_program(HEXDUMP hexdump REQUIRED)
+find_program(SPIRV_OPT spirv-opt)
 
 function(compile_glsl_aux shader_stage shader_name glsl_filename output target_env)
 
@@ -28,9 +29,12 @@ function(compile_glsl_aux shader_stage shader_name glsl_filename output target_e
     )
 
     if (WIVRN_OPTIMIZE_SHADERS)
+        if (NOT SPIRV_OPT)
+            message(FATAL_ERROR "WIVRN_OPTIMIZE_SHADERS is ON but spirv-opt was not found (set CMAKE_PROGRAM_PATH or SPIRV_OPT)")
+        endif()
         add_custom_command(
             OUTPUT "${SPV_FILE}-opt"
-            COMMAND spirv-opt --target-env=${target_env} -O "${SPV_FILE}-nopt" -o "${SPV_FILE}-opt"
+            COMMAND "${SPIRV_OPT}" --target-env=${target_env} -O "${SPV_FILE}-nopt" -o "${SPV_FILE}-opt"
             DEPENDS "${SPV_FILE}-nopt"
             VERBATIM
         )

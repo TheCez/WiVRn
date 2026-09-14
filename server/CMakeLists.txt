@@ -181,6 +181,21 @@ if (WIVRN_BUILD_SERVER)
 		# zoned_time needs an IANA timezone database this libc++ wasn't
 		# built with, and enumerate_view isn't implemented at all yet.
 		target_compile_options(wivrn-server PRIVATE -fexperimental-library)
+		# Without this, vulkan_core.h never declares the Android-platform
+		# Vulkan extensions/structs at all (VK_ANDROID_external_memory_
+		# android_hardware_buffer's own extension-name macro included) --
+		# matches client/CMakeLists.txt's own existing
+		# -DVK_USE_PLATFORM_ANDROID_KHR exactly (client already needed
+		# this; wivrn-server never had a reason to until a local OpenXR
+		# app tried to import an AHardwareBuffer-backed swapchain image,
+		# which crashed instead -- vkGetAndroidHardwareBufferPropertiesANDROID
+		# resolved to a real symbol name either way (Monado declares its
+		# own PFN typedef regardless of this macro) but the *extension*
+		# was never actually requested at device creation, so the driver
+		# never populated that function pointer -- null pointer call, not
+		# a missing symbol at link time, which is why it wasn't caught
+		# earlier).
+		target_compile_definitions(wivrn-server PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
 	else()
 		target_sources(wivrn-server PRIVATE
 				active_runtime.cpp
@@ -239,6 +254,12 @@ if (WIVRN_BUILD_SERVER)
 	if(WIVRN_USE_X264)
 		target_sources(wivrn-server PRIVATE encoder/video_encoder_x264.cpp)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::X264)
+	endif()
+
+	if(WIVRN_USE_MEDIACODEC)
+		target_sources(wivrn-server PRIVATE encoder/video_encoder_mediacodec.cpp)
+		find_library(MEDIANDK_LIBRARY NAMES mediandk REQUIRED)
+		target_link_libraries(wivrn-server PRIVATE ${MEDIANDK_LIBRARY})
 	endif()
 
 	if(WIVRN_USE_PERFETTO)

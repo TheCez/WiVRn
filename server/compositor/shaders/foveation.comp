@@ -21,10 +21,19 @@
 // SPDX-License-Identifier: BSL-1.0
 
 #version 460
-#extension GL_KHR_shader_subgroup_basic: require
-#extension GL_KHR_shader_subgroup_shuffle_relative: require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Chroma is averaged over each 2x2 luma block by gathering the 4 relevant
+// invocations' already-computed colour through workgroup shared memory,
+// indexed by gl_LocalInvocationIndex (spec-guaranteed == SubgroupID *
+// SubgroupSize + SubgroupInvocationID, so this is exactly what the values
+// gathered here used to be). This used to be done with subgroupShuffleDown,
+// which silently returns garbage on hardware that doesn't actually support
+// VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT (never checked before using it) --
+// several Adreno GPUs, in particular. shared memory + barrier() is core
+// compute shader functionality, no subgroup extension/capability needed.
+shared vec4 tile[gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z];
 
 #define MAX_DIM 4097
 #define MAX_SAMPLES 4
@@ -99,7 +108,7 @@ void main()
 
 	// In order to know how subgroup are mapped, we have to do the swizzling ourselves
 	// in the work group.
-	uint id = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+	uint id = gl_LocalInvocationIndex;
 	uint iy = gl_WorkGroupID.y * gl_WorkGroupSize.y + ARmpRed8x8_y(id);
 	uint ix = gl_WorkGroupID.x * gl_WorkGroupSize.x + ARmpRed8x8_x(id);
 
@@ -131,10 +140,13 @@ void main()
 
 	imageStore(luma, ivec3(ix, iy, iz), vec4(colour.x));
 
-	vec4 sum = colour + subgroupShuffleDown(colour, 1) + subgroupShuffleDown(colour, 2) + subgroupShuffleDown(colour, 3);
+	tile[id] = colour;
+	barrier();
 
 	if ((id % 4)== 0)
 	{
+		vec4 sum = tile[id] + tile[id + 1] + tile[id + 2] + tile[id + 3];
+
 		// actual chroma
 		imageStore(chroma, ivec3(ix/2, iy/2, iz), vec4(sum.y, sum.z, 0, 0) / 4);
 

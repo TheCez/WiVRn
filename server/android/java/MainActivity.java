@@ -1,7 +1,6 @@
 /*
  * WiVRn VR streaming
- * Copyright (C) 2024  Guillaume Meunier <guillaume.meunier@centraliens.net>
- * Copyright (C) 2024  Patrick Nicolas <patricknicolas@laposte.net>
+ * Copyright (C) 2026  Ajay Chodankar <achodankar28@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,12 +32,12 @@ import java.util.Set;
 // like it already does today. All this UI needs to do is start the server
 // and show whether a headset is connected.
 //
-// "No devices connected" / "Streaming (N connected)" is the full extent of
-// status available right now (see WivrnServerService's onClientConnected/
-// onClientDisconnected) -- there's no native hook yet for anything more
-// specific (headset name/model, or a distinct "paired but not yet
-// streaming frames" state), so this doesn't pretend to show information it
-// doesn't have.
+// Three real states, driven by two separate native signals (see
+// WivrnServerService's own comment): "No devices connected" (no headset),
+// "{name} connected" (headset's network connection is up, but no local
+// OpenXR app is using it), "Streaming to {name}" (both) -- shared text
+// logic with the notification via WivrnServerService.statusText so they
+// can't drift apart.
 public class MainActivity extends Activity implements WivrnServerService.ConnectionListener
 {
 	private TextView status;
@@ -72,10 +71,8 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 
 	// Called on the main thread (see WivrnServerService's Handler).
 	@Override
-	public void onConnectedClientsChanged(Set<Integer> clientIds)
+	public void onStatusChanged(String headsetName, Set<Integer> connectedClients)
 	{
-		status.setText(clientIds.isEmpty()
-		        ? "No devices connected"
-		        : "Streaming (" + clientIds.size() + " connected)");
+		status.setText(WivrnServerService.statusText(headsetName, connectedClients));
 	}
 }

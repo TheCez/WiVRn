@@ -246,6 +246,19 @@ wivrn::vk_bundle::vk_bundle() :
 		        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 		        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+// For Monado's Android swapchain-import path (vk_create_image_from_native,
+// XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER on Android): a local OpenXR
+// app importing its own AHardwareBuffer-backed swapchain images into the
+// compositor needs this to resolve the external-memory handle type; without
+// it, vk_create_image_from_native crashed (null function pointer, offset
+// +1180) the moment a real local app tried to create one -- nothing before
+// broker registration ever exercised this path, so WiVRn's own device
+// extension list never needed it. Also the mechanism a genuinely zero-copy
+// video_encoder_mediacodec.cpp would use (see its own comment) -- not a
+// coincidence, same underlying AHardwareBuffer<->Vulkan interop either way.
+#ifdef VK_ANDROID_external_memory_android_hardware_buffer
+		        VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+#endif
 // For FFMPEG
 #ifdef VK_EXT_external_memory_dma_buf
 		        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,

@@ -42,6 +42,9 @@
 #include "video_encoder_vulkan_h264.h"
 #include "video_encoder_vulkan_h265.h"
 #endif
+#if WIVRN_USE_MEDIACODEC
+#include "video_encoder_mediacodec.h"
+#endif
 #include "video_encoder_raw.h"
 
 namespace wivrn
@@ -150,6 +153,15 @@ std::unique_ptr<video_encoder> video_encoder::create(
 		res = std::make_unique<video_encoder_va>(wivrn_vk, settings, stream_idx);
 #else
 		throw std::runtime_error("vaapi support not enabled");
+#endif
+	}
+
+	if (settings.encoder_name == encoder_mediacodec)
+	{
+#if WIVRN_USE_MEDIACODEC
+		res = std::make_unique<video_encoder_mediacodec>(wivrn_vk, settings, stream_idx);
+#else
+		throw std::runtime_error("mediacodec support not enabled");
 #endif
 	}
 

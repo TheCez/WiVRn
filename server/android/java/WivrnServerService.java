@@ -1,7 +1,6 @@
 /*
  * WiVRn VR streaming
- * Copyright (C) 2024  Guillaume Meunier <guillaume.meunier@centraliens.net>
- * Copyright (C) 2024  Patrick Nicolas <patricknicolas@laposte.net>
+ * Copyright (C) 2026  Ajay Chodankar <achodankar28@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,14 +38,22 @@ import java.util.Set;
 // comment for the specific simplification this implies versus desktop's
 // on-demand-per-connection compositor start.
 //
-// Connection status: onClientConnected/onClientDisconnected below are
-// called from native (android_ipc_server_cb in wivrn_server_jni.cpp,
-// bridging Monado's own ipc_server_callbacks) whenever a headset's TCP
-// connection to the compositor opens/closes. Right now that's the only
-// granularity available -- there's no separate "streaming vs. just
-// connected" native hook yet, and no headset name/model, just a numeric
-// client id -- so the UI (MainActivity) shows one honest "connected"
-// state rather than inventing detail this doesn't actually have.
+// Connection status is two genuinely separate native signals, combined here
+// into the three states the UI actually shows:
+//   - onHeadsetConnected/onHeadsetDisconnected: the real, network-level
+//     "a headset's TCP connection is up" signal, fired directly from
+//     run_server() in wivrn_server_jni.cpp (see its comment) with the
+//     client-reported device name (from_headset::headset_info_packet's
+//     system_name). This is what most people mean by "connected".
+//   - onClientConnected/onClientDisconnected: Monado's own
+//     ipc_server_callbacks (bridged via android_ipc_server_cb), which fire
+//     for a *local OpenXR application* on the phone using this runtime over
+//     IPC -- nothing does that yet (no OpenXR runtime broker registration),
+//     so in practice these don't fire today, but the plumbing (and the
+//     distinct "streaming" state once they do) is already correct.
+// "No devices connected" (no headset) / "{name} connected" (headset, no app
+// streaming through it yet) / "Streaming to {name}" (both) -- see
+// MainActivity for exactly how these combine.
 public class WivrnServerService extends Service
 {
 	private static final String CHANNEL_ID = "wivrn_server";
@@ -61,14 +68,22 @@ public class WivrnServerService extends Service
 
 	private native void nativeStop();
 
+	// Called from MonadoIpcService (a different Service, see its own
+	// comment) when a local OpenXR app hands off a new IPC client fd.
+	// Static: MonadoIpcService has no WivrnServerService instance to call
+	// through (and doesn't need one -- referencing this class is enough to
+	// trigger the loadLibrary above via normal Java class-init rules).
+	static native int nativeAddIpcClient(int fd);
+
 	private boolean started = false;
 
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private final Set<Integer> connectedClients = new HashSet<>();
+	private String headsetName = null; // null == no headset connected
 
 	public interface ConnectionListener
 	{
-		void onConnectedClientsChanged(Set<Integer> clientIds);
+		void onStatusChanged(String headsetName, Set<Integer> connectedClients);
 	}
 
 	private static ConnectionListener listener;
@@ -78,15 +93,37 @@ public class WivrnServerService extends Service
 		listener = l;
 	}
 
+	private void notifyChanged()
+	{
+		updateNotification();
+		if (listener != null)
+			listener.onStatusChanged(headsetName, connectedClients);
+	}
+
 	// Called from native (server thread, via JNIEnv obtained through
-	// AttachCurrentThread -- see wivrn_server_jni.cpp's call_service_method).
+	// AttachCurrentThread -- see wivrn_server_jni.cpp's call_service_method_*).
+	public void onHeadsetConnected(String name)
+	{
+		mainHandler.post(() -> {
+			headsetName = name;
+			notifyChanged();
+		});
+	}
+
+	public void onHeadsetDisconnected()
+	{
+		mainHandler.post(() -> {
+			headsetName = null;
+			connectedClients.clear(); // a new session starts clean
+			notifyChanged();
+		});
+	}
+
 	public void onClientConnected(int clientId)
 	{
 		mainHandler.post(() -> {
 			connectedClients.add(clientId);
-			updateNotification();
-			if (listener != null)
-				listener.onConnectedClientsChanged(connectedClients);
+			notifyChanged();
 		});
 	}
 
@@ -94,9 +131,7 @@ public class WivrnServerService extends Service
 	{
 		mainHandler.post(() -> {
 			connectedClients.remove(clientId);
-			updateNotification();
-			if (listener != null)
-				listener.onConnectedClientsChanged(connectedClients);
+			notifyChanged();
 		});
 	}
 
@@ -152,14 +187,21 @@ public class WivrnServerService extends Service
 			manager.createNotificationChannel(channel);
 		}
 
-		String status = connectedClients.isEmpty()
-		        ? "No devices connected"
-		        : "Streaming (" + connectedClients.size() + " connected)";
-
 		return new Notification.Builder(this, CHANNEL_ID)
 		        .setContentTitle("WiVRn server")
-		        .setContentText(status)
+		        .setContentText(statusText(headsetName, connectedClients))
 		        .setSmallIcon(android.R.drawable.ic_media_play)
 		        .build();
+	}
+
+	// Shared with MainActivity so the notification and the in-app UI never
+	// say something different.
+	public static String statusText(String headsetName, Set<Integer> connectedClients)
+	{
+		if (headsetName == null)
+			return "No devices connected";
+		if (connectedClients.isEmpty())
+			return headsetName + " connected";
+		return "Streaming to " + headsetName;
 	}
 }

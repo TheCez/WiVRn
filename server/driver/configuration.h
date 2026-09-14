@@ -51,7 +51,17 @@ struct configuration
 		std::optional<std::string> device;
 	};
 
-	std::array<encoder, 3> encoders; // left, right, alpha
+	// Left, right, alpha. Default-constructed (empty name, no codec) means
+	// "auto-detect a hardware encoder" (see server/encoder/encoder_settings.cpp's
+	// select_encoder). Used to need an Android-specific forced default here
+	// (video_encoder_mediacodec.cpp didn't exist yet, and select_encoder never
+	// auto-picks video_encoder_raw.cpp -- it's opt-in only, same as x264 needs
+	// an explicit encoder_x264 name) -- now that mediacodec exists and is
+	// probed by select_encoder exactly like NVENC/VAAPI/Vulkan video are on
+	// desktop, auto-detect works the same way on both platforms and this
+	// override isn't needed. A config file's "encoder" key still overrides
+	// this either way, same as desktop.
+	std::array<encoder, 3> encoders;
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;

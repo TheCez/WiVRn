@@ -59,6 +59,12 @@ option(WIVRN_USE_NVENC "Enable nvenc (Nvidia) hardware encoder" ON)
 option(WIVRN_USE_VAAPI "Enable vaapi (AMD/Intel) hardware encoder" ON)
 option(WIVRN_USE_VULKAN_ENCODE "Enable vulkan video encoder" ON)
 option(WIVRN_USE_X264 "Enable x264 software encoder" ON)
+# Android's own hardware video encoder (AMediaCodec/NdkMediaCodec), server-side
+# only -- the other four backends above are all desktop-only APIs (NVENC,
+# VAAPI/libav, Vulkan video, x264 the CPU fallback), none usable on Android;
+# see docs/ANDROID_PORT.md for why. Default ON for Android, OFF elsewhere --
+# there's no such library to link against off-Android.
+option(WIVRN_USE_MEDIACODEC "Enable Android MediaCodec hardware encoder" ${ANDROID})
 
 option(WIVRN_USE_PERFETTO "Enable Perfetto tracing via the Perfetto SDK (server only)" OFF)
 option(WIVRN_TRACE_MONADO "Also instrument Monado (percetto) under the same WIVRN_TRACING switch; pulls in a second Perfetto runtime, system backend only. Requires WIVRN_USE_PERFETTO" OFF)

@@ -73,7 +73,18 @@ if(ANDROID)
     file(ARCHIVE_EXTRACT INPUT ${FETCHCONTENT_BASE_DIR}/vulkan-sdk-${VULKAN_VERSION}.tar.gz DESTINATION ${CMAKE_BINARY_DIR})
 
     target_include_directories(wivrn-common SYSTEM PUBLIC ${CMAKE_BINARY_DIR}/Vulkan-Headers-vulkan-sdk-${VULKAN_VERSION}/include)
-    target_compile_definitions(wivrn-common PUBLIC VMA_VULKAN_VERSION=1001000)
+    # Was 1001000 (Vulkan 1.1): fine for the Quest client (its physical device
+    # only ever advertises 1.1), but the new Android server (wivrn_vk_bundle.cpp)
+    # requests VK_API_VERSION_1_3 unconditionally, same as desktop -- and on a
+    # modern phone GPU that's genuinely what the physical device supports. VMA
+    # asserts if the *runtime* vulkanApiVersion it's given is above this compile-time
+    # ceiling ("vulkanApiVersion >= VK_API_VERSION_1_3 but required Vulkan version is
+    # disabled by preprocessor macros"), which crashed wivrn-server (SIGABRT) the
+    # moment a real headset connected and the compositor tried to build its
+    # allocator. Raising the ceiling to 1.3 costs nothing on Quest -- VMA only
+    # compiles in extra codepaths, it doesn't require the actual device to use them
+    # -- and matches what desktop already gets for free from Vulkan::Headers.
+    target_compile_definitions(wivrn-common PUBLIC VMA_VULKAN_VERSION=1003000)
 else()
     target_link_libraries(wivrn-common PUBLIC Vulkan::Headers)
 endif()
