@@ -1116,22 +1116,37 @@ harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
 already installed via apt) caught the real bug (a stale text-format `.spv`
 artifact, not the shader) before Android-side validation was ever required.
 
-## Milestone 4.6 — INVESTIGATED, NOT VIABLE ON THIS DEVICE: zero-copy
-## MediaCodec input (`AMediaCodec_createInputSurface()`), a platform bug
-## below the app level
+## Milestone 4.6 — INVESTIGATED: no usable public zero-copy MediaCodec
+## input path found on this device/firmware (both public Surface-input
+## mechanisms fail identically; not proven to be a hardware limit)
 
 `video_encoder_mediacodec.h`'s own `ponytail:` comment named this as the
 real upgrade path over the current GPU-copy-to-host-buffer-then-`memcpy`
 pipeline: render directly into MediaCodec's own input `Surface` instead.
-Investigated via two small standalone probes (`ForeverXR/tools/foveation-pc-test/mediacodec_surface_test.c`
-for Vulkan WSI, `mediacodec_egl_test.c` for EGL/GLES — both disposable,
-not part of the port, cross-compiled with the NDK and run directly on the
-Pixel), following the standard, officially-documented Android pattern:
-`AMediaCodec_createInputSurface()` → `ANativeWindow` → a swapchain/EGL
-surface targeting it → render → present → the codec's own `BufferQueue`
-consumer handles the rest.
+The server runs on a stock, unrooted Pixel 10 Pro XL — the Quest 1 is only
+the remote streaming client — so this investigation deliberately stayed
+within **public NDK APIs only**: no `Codec2Client`, no private
+`GraphicBufferSource` access, no OMX private/native-buffer extensions, no
+vendor encoder libraries, no VNDK-only APIs, no root, no custom ROM.
 
-**Result: not viable on this device, and the reason is precisely
+Investigated both public Surface-input mechanisms via three small
+standalone probes (`ForeverXR/tools/foveation-pc-test/`:
+`mediacodec_surface_test.c` for Vulkan WSI, `mediacodec_egl_test.c` for
+EGL/GLES, `mediacodec_persistent_test.c` for the persistent-surface
+variant — all disposable, not part of the port, cross-compiled with the
+NDK and run directly on the Pixel):
+
+- **`AMediaCodec_createInputSurface()`**: `configure` → `createInputSurface`
+  → `start`, the standard pattern (`ANativeWindow` → a swapchain/EGL
+  surface targeting it → render → present → the codec's own `BufferQueue`
+  consumer handles the rest).
+- **`AMediaCodec_createPersistentInputSurface()` + `AMediaCodec_setInputSurface()`**:
+  the other public path (`createPersistentInputSurface` before `configure`,
+  independent of any codec instance, then `setInputSurface` after
+  `configure`, then `start`).
+
+**Result: no usable public zero-copy MediaCodec input path found on this
+device/firmware. Both mechanisms fail identically, precisely
 characterized, not a mystery.** In order:
 
 1. Vulkan WSI mechanically works perfectly: `vkCreateAndroidSurfaceKHR`
@@ -1161,33 +1176,52 @@ characterized, not a mystery.** In order:
    `c2.android.avc.encoder`; no distinct vendor hardware component, no
    legacy OMX path at all) — **both show the exact same failure**,
    ruling out a single-component bug.
-4. **The decisive evidence, from logcat captured during a failing run**:
-   `GraphicBufferSource` (Android's own framework-level Codec2 Surface
+4. `GraphicBufferSource` (Android's own framework-level Codec2 Surface
    consumer — confirmed by (3) to be the one in use, not a vendor
    implementation) logs `got buffer with new dataSpace ...` **exactly
-   once**, ever, then goes completely silent — no further buffer
-   acquisition, no encoder component activity, no errors — for the
-   remainder of every test run (confirmed with both encoder components).
-   The `BufferQueue` itself has 64 slots and happily accepts dozens of
-   queued frames from the producer side; it's specifically the consumer
-   that stops pulling after buffer #1.
+   once**, ever, then goes completely silent at that log level — no
+   further buffer acquisition, no errors. The `BufferQueue` itself has 64
+   slots and happily accepts dozens of queued frames from the producer
+   side; it's specifically the consumer that stops pulling after buffer #1.
+5. **`AMediaCodec_createPersistentInputSurface()` + `AMediaCodec_setInputSurface()`
+   fails identically** — same setup, same symptom (frames present cleanly
+   through frame 10+, zero output events, eventual producer stall). A
+   longer capture on this variant caught the most precise evidence yet,
+   one level deeper than `GraphicBufferSource`, straight from the vendor's
+   own hardware encoder component's self-reported diagnostics:
+   ```
+   GC2_EncComp: [0][Id=202] VPU_EncOpen codec AVC succeeded
+   GC2_EncComp: wait cmd queue for 0 times, instanceQueueCount(1) interrupted(0) flushing(0)
+   GC2_EncComp: wait cmd queue for 5 times, instanceQueueCount(1) interrupted(0) flushing(0)
+   GC2_EncComp: wait cmd queue for 10 times, instanceQueueCount(1) interrupted(0) flushing(0)
+   GC2_EncComp: wait cmd queue for 15 times, instanceQueueCount(1) interrupted(0) flushing(0)
+   ```
+   The hardware VPU opens successfully, receives exactly one work item
+   into its internal command queue (`instanceQueueCount(1)`), and that one
+   item never gets processed — the component periodically self-reports
+   this exact stall for the entire run. This is the vendor's own component
+   naming its own stuck state; not an inference from absence of output.
 
-This isolates the failure to Android's own framework `GraphicBufferSource`
-implementation on this specific device/build, independent of: which
-encoder component, which graphics API, presentation timestamps, or
-explicit sync-frame requests — below the level of anything app code can
-work around without unstable/private platform APIs (which this
-investigation deliberately avoided using, per explicit instruction).
-Consistent with everything else found on this hardware this session (see
-Milestone 4.5): a genuinely immature platform/vendor stack, this time in
-the Codec2 Surface-input bridge rather than the Vulkan compute driver.
+**Conclusion, stated precisely**: on the tested stock Pixel 10 Pro XL
+firmware, both public MediaCodec Surface-input mechanisms fail to encode
+submitted frames:
+1. `createInputSurface()`
+2. `createPersistentInputSurface()` + `setInputSurface()`
 
-**Conclusion**: keep the current, working ByteBuffer/NV12 encoder path
-(already fixed and latency-improved this session). Zero-copy via
-`AMediaCodec_createInputSurface()` is not achievable on this device
-without private/unstable platform APIs. If revisited on different
-hardware, the two probe programs are directly reusable (just re-run
-them first — don't assume the same platform bug exists elsewhere).
+ByteBuffer input works (and is what this port already uses, fixed and
+latency-improved in Milestone 4.5). **No usable public zero-copy
+MediaCodec input path has been found on this device/firmware** — this is
+deliberately not phrased as "the hardware cannot zero-copy encode", since
+that has not been proven (the stall is downstream of every public API
+call succeeding, in a vendor component we have no visibility or control
+over without private APIs this project has ruled out using). If revisited
+on different hardware, the three probe programs are directly reusable —
+re-run them first, don't assume the same platform bug exists elsewhere.
+
+Returning to optimizing the working ByteBuffer/NV12 path is the next
+concrete step (the pixelation reported after Milestone 4.5's latency fix
+is still open and likely a separate, more tractable issue — bitrate or
+frame-pacing related — worth investigating on this proven-working path).
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
