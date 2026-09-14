@@ -152,6 +152,14 @@ protected:
 	virtual std::optional<data> encode(uint8_t slot, uint64_t frame_index) = 0;
 
 	void SendData(std::span<uint8_t> data, bool end_of_frame, bool control = false);
+
+	// For a backend (async_send=true) that needs to send more than one
+	// payload per encode() call (e.g. codec config data ahead of a real
+	// frame) instead of returning a single `data` for the base class to
+	// push automatically: hands off to the same shared background sender
+	// thread `data` returned from encode() itself uses. Requires
+	// async_send=true (shared_sender != nullptr).
+	void push_async(data &&);
 };
 
 } // namespace wivrn

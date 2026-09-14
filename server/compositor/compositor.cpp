@@ -39,6 +39,7 @@
 #include "utils/wivrn_trace.h"
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
+
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -334,6 +335,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
 			auto & img = get_layer_image(layer, view, data.sub.image_index);
+
 			src[view] = get_image_view(
 			        &img,
 			        layer.data.flags,

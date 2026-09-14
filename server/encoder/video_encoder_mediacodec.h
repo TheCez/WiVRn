@@ -23,6 +23,7 @@
 
 #include <array>
 #include <media/NdkMediaCodec.h>
+#include <span>
 #include <vector>
 
 namespace wivrn
@@ -101,6 +102,14 @@ class video_encoder_mediacodec : public video_encoder
 	// the hardware encoder at all. See docs/ANDROID_PORT.md's Milestone 4.5
 	// entry for the investigation this came out of.
 	void ensure_codec();
+
+	// Copies `payload` into its own heap buffer and hands it to the shared
+	// background sender thread instead of calling the inherited SendData()
+	// directly -- see encode()'s own comment for why. Used for the cached
+	// SPS/PPS (csd), which the real per-frame payload's automatic push
+	// (encode()'s return value) can't cover since that only pushes one
+	// payload per call.
+	void push_async(std::span<const uint8_t> payload, bool control);
 
 public:
 	video_encoder_mediacodec(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);

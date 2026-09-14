@@ -41,6 +41,46 @@ No `sudo` was used anywhere in this toolchain (deliberately — avoids needing
 an interactive password mid-session). `apt-get download` (not `install`)
 worked without root for glslang-tools.
 
+**More host tools, added during the Milestone 4.5 investigation** (same
+`apt-get download` + `dpkg-deb -x` pattern as glslang-tools above, or a
+direct static-binary download where that's simpler):
+
+| Tool | Path | Needed for |
+|---|---|---|
+| spirv-opt | `ForeverXR/tools/spirv-tools/extracted/usr/bin/spirv-opt` | `WIVRN_OPTIMIZE_SHADERS=ON` (`cmake/CompileGLSL.cmake`'s `find_program(SPIRV_OPT spirv-opt)`) — was OFF for `server-app` since Milestone 1 for no real reason (spirv-opt just hadn't been wired up yet); re-enabling it made no correctness difference either way, but it's the correct default so left ON. Also ships inside the NDK itself (`<ndk>/shader-tools/linux-x86_64/spirv-opt`) if this copy ever goes stale. |
+| gettext (`msgfmt`/`msgmerge`) | `ForeverXR/tools/gettext/extracted/usr/bin/` | The **client**'s `CMakeLists.txt:199 find_package(Gettext)`, for locale `.mo` generation. `gettext-base` (commonly preinstalled) is NOT enough — only the full `gettext` package has `msgfmt`/`msgmerge`. |
+| rsvg-convert | `ForeverXR/tools/rsvg/extracted/usr/bin/rsvg-convert` | The **client**'s icon/image generation (`CMakeLists.txt:203`, `librsvg2-bin` package) |
+| ffmpeg (static build) | `ForeverXR/tools/ffmpeg-static/ffmpeg` | Not a build dependency — a **host-side diagnostic tool**, for decoding `WIVRN_DUMP_VIDEO` captures on this PC (see "Diagnosing stream corruption" below). The distro's `ffmpeg` package needs a long chain of shared libs (`libavdevice.so.60` etc.) not present on this host; the self-contained static build from `johnvansickle.com/ffmpeg` sidesteps that entirely — `curl -sL -o ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz && tar -xJf ffmpeg.tar.xz --strip-components=1 -C ForeverXR/tools/ffmpeg-static` |
+
+**Client build: not yet fully working.** Confirmed needed so far (spirv-opt,
+gettext, rsvg-convert above), but configuration currently still fails at
+`CMakeLists.txt:204 find_program(KTX ktx)` (the KTX texture tool) with more
+host tools likely needed after that one too — the client was never built
+from this from-scratch toolchain before this session; whatever produced the
+currently-installed `org.meumeu.wivrn.local` APK on the test Quest used a
+different, fuller toolchain (Android Studio, most likely) predating this
+project. Not pursued further once the server-side `WIVRN_DUMP_VIDEO` +
+host-ffmpeg approach below turned out to answer the same question without
+needing it. Extra `CMAKE_PROGRAM_PATH` entries and `-Pfetchcontent_base_dir=`
+for the client build (once resumed) go in the root `build.gradle`'s
+`externalNativeBuild.cmake.arguments`, not `server-app/build.gradle` — the
+client **is** the root project (see `settings.gradle`'s own comment).
+
+**Reusing an already-populated `FetchContent` cache** (this sandbox has no
+outbound network access for most of a session; only the very first
+`server-app` configure after a toolchain change can genuinely hit the
+network) — pass `-DFETCHCONTENT_BASE_DIR=<an already-populated _deps dir>`
+as an extra cmake argument (`server-app/build.gradle` already does this,
+hardcoded to a specific `.cxx/Debug/<hash>/arm64-v8a/_deps` that exists from
+an earlier successful configure) or, for an ad-hoc `./gradlew assembleDebug`
+invocation of the **root** (client) project, pass
+`-Pfetchcontent_base_dir=<same path>` (the root `build.gradle` already reads
+that Gradle property, see its own `fetchcontentBaseDir` local). **Don't**
+point this at a fresh, empty directory expecting it to get copied there —
+`FetchContent`'s own subbuild stamp files bake in absolute paths, so copying
+an already-populated `_deps` to a new location makes CMake think it needs to
+re-populate (learned the hard way earlier this session).
+
 **NDK version churn, briefly**: Milestone 1 discovered Unity's bundled NDK's
 libc++ was missing `std::jthread`/`std::stop_token` outright, so a
 standalone NDK r28b was downloaded. Milestone 2's Gradle build instead uses
@@ -98,6 +138,113 @@ mechanism on this host). Java/manifest sources are NOT under
 `server/android/java` and `server/android/AndroidManifest.xml` directly, so
 all server-side Android code stays colocated with the native code under
 `server/`, not scattered into a separate module tree.
+
+## Standard test cycle — build, install, launch on both devices
+
+Two physical devices, both reachable over `adb` wifi debugging:
+Pixel (server) at `-s 192.168.20.152:33627`, Quest 1 (client) at
+`-s 1PASH9BMJA9326` — check `adb devices` if these serials ever change (a
+reconnect/reboot can reassign the wifi one). Server package
+`org.meumeu.wivrn.server`, client package `org.meumeu.wivrn.local`, test
+OpenXR app `com.UnityTechnologies.com.unity.template.urpblank` (installed on
+the Pixel, launches against `wivrn-server` as its runtime — see Milestone 4).
+
+```bash
+export JAVA_HOME=/home/thecez/VR_Development/projects/ForeverXR/tools/jdk
+export PATH="$JAVA_HOME/bin:$PATH"
+cd /home/thecez/VR_Development/projects/ForeverXR/wivrn-android
+./gradlew :server-app:assembleDebug
+
+ADB=/home/thecez/VR_Development/projects/ForeverXR/tools/android-sdk/platform-tools/adb
+APK=server-app/build/outputs/apk/debug/server-app-debug.apk
+"$ADB" -s 192.168.20.152:33627 install -r "$APK"
+
+# Full clean restart (avoids stale-connection confusion between runs):
+"$ADB" -s 192.168.20.152:33627 shell am force-stop org.meumeu.wivrn.server
+"$ADB" -s 192.168.20.152:33627 shell am force-stop com.UnityTechnologies.com.unity.template.urpblank
+"$ADB" -s 1PASH9BMJA9326 shell am force-stop org.meumeu.wivrn.local
+sleep 2
+"$ADB" -s 192.168.20.152:33627 shell monkey -p org.meumeu.wivrn.server -c android.intent.category.LAUNCHER 1
+sleep 2
+"$ADB" -s 1PASH9BMJA9326 shell monkey -p org.meumeu.wivrn.local -c android.intent.category.LAUNCHER 1
+sleep 2
+"$ADB" -s 1PASH9BMJA9326 shell am start -a android.intent.action.VIEW -d "wivrn+tcp://192.168.20.152:9757" org.meumeu.wivrn.local
+sleep 4
+"$ADB" -s 192.168.20.152:33627 shell monkey -p com.UnityTechnologies.com.unity.template.urpblank -c android.intent.category.LAUNCHER 1
+```
+
+A `gradlew` build that finishes in ~1s (not the usual ~10-40s) is very
+likely a no-op because AGP thinks nothing changed — after any native source
+edit, sanity-check the actual shader/`.so` output timestamp is newer than
+the edited source file before trusting an install (a real trap encountered
+twice this session):
+```bash
+find server-app -iname "<name>.spv" -newer server/compositor/shaders/<name>.comp
+```
+
+**Reading logs**: `"$ADB" -s <serial> logcat -c` before a run to clear the
+buffer, then `logcat -d` to dump what's accumulated (not `-c` again — that
+clears). Useful greps: `"Failed to find a common frame"` /
+`"was not sent because no shard was received"` (client-side, symptom of the
+now-fixed IDR livelock, Milestone 4.5), `"IDR frame needed"` (server-side,
+should be near-zero in a healthy session), `"compositor debug"` (whatever
+ad-hoc `U_LOG_E` a debugging session happens to have added — **remove these
+before considering a fix "done"**, several were left in and cleaned up
+across this investigation).
+
+## Diagnosing stream corruption — capture what the server actually sent
+
+`server/encoder/video_encoder.cpp`'s `video_encoder::create()` already has a
+built-in raw-bitstream dump, gated on the `WIVRN_DUMP_VIDEO` environment
+variable (writes `<value>-<stream_idx>.<ext>`, continuously, for the
+lifetime of the process) — a real, pre-existing WiVRn feature, not something
+added for this investigation. Android apps don't inherit shell environment
+variables, so it needs wiring into the JNI entry point to actually fire;
+`server/android/wivrn_server_jni.cpp`'s `nativeStart()` currently has a
+**temporary** `setenv("WIVRN_DUMP_VIDEO", "/data/data/org.meumeu.wivrn.server/dump_sent", 1)`
+for this — remove once no longer needed, or make it conditional (e.g. a
+build flag) if it turns out worth keeping permanently.
+
+This lets you decode **exactly what the server sent** — independent of the
+network and the Quest's own decoder entirely — using a completely separate
+decoder (ffmpeg, on this PC). This is the fastest way to tell whether a
+visual bug is upstream (compositor/shader/encoder, before any bytes leave
+the phone) or downstream (network loss, or the client's own decode/render
+path): if the PC-decoded frame is already wrong, the client and network are
+provably not the cause.
+
+```bash
+ADB=/home/thecez/VR_Development/projects/ForeverXR/tools/android-sdk/platform-tools/adb
+FFMPEG=/home/thecez/VR_Development/projects/ForeverXR/tools/ffmpeg-static/ffmpeg
+DEBUGDIR=/home/thecez/VR_Development/projects/ForeverXR/wivrn-android/debugging
+
+# after a test run (see "Standard test cycle" above):
+"$ADB" -s 192.168.20.152:33627 exec-out run-as org.meumeu.wivrn.server \
+    cat /data/data/org.meumeu.wivrn.server/dump_sent-0.h264 > "$DEBUGDIR/dump_sent-0.h264"
+"$ADB" -s 192.168.20.152:33627 exec-out run-as org.meumeu.wivrn.server \
+    cat /data/data/org.meumeu.wivrn.server/dump_sent-1.h264 > "$DEBUGDIR/dump_sent-1.h264"
+
+# decode a few frames well past the loading splash (frame ~80+) to PNG:
+"$FFMPEG" -y -i "$DEBUGDIR/dump_sent-0.h264" -vf "select='gte(n\,80)'" -frames:v 3 "$DEBUGDIR/sent0_%02d.png" -loglevel error
+"$FFMPEG" -y -i "$DEBUGDIR/dump_sent-1.h264" -vf "select='gte(n\,80)'" -frames:v 3 "$DEBUGDIR/sent1_%02d.png" -loglevel error
+```
+
+`debugging/` (repo root) is a scratch folder for exactly this kind of
+capture — raw `.h264` dumps and decoded `.png` frames from different points
+in the investigation, kept around for before/after comparison rather than
+thrown in `/tmp`. Not committed to git as a matter of course (it's working
+data, not part of the port itself); prune old captures once a bug's closed
+out.
+
+The equivalent **receive-side** capture (what the Quest's decoder actually
+gets handed, in `client/decoder/android/android_decoder.cpp`'s
+`push_data()`) was attempted but not completed this session — the client
+build hit a chain of missing host tools (see "Client build: not yet fully
+working" above) deep enough that decoding the server's own sent dump turned
+out to answer the same question faster. If it's ever needed: `push_data()`
+receives `std::span<std::span<const uint8_t>> data` per call, already in
+Annex-B order for that frame — write each `sub_data` to a per-`stream_index`
+continuous file the same way, pull via `run-as org.meumeu.wivrn.local`.
 
 ## Milestone 1 — DONE: `wivrn-server` compiles, links, and runs on-device
 
@@ -492,8 +639,10 @@ to the zero-copy encoder work below (video_encoder_mediacodec.cpp's current
 CPU-copy path may just not be fast/consistent enough at real frame rates),
 possibly a separate pacing issue — worth measuring before assuming which.
 
-## Milestone 4.5 — DONE: root-caused and fixed the green-artifact/chroma
-## corruption bug; found (not yet fixed) a second, separate frame-desync bug
+## Milestone 4.5 — IN PROGRESS: multiple real bugs found and fixed along the
+## way (frame-desync/IDR livelock, lazy-alpha-encoder, encode concurrency,
+## MediaCodec input truncation); the original green-chroma corruption itself
+## is still NOT root-caused
 
 **Symptom** (reported after Milestone 4): the stream showed pixelation and
 green artifacts, with what looked like stereo overlap; one eye usually showed
@@ -711,6 +860,139 @@ to end) and instead found, from a live session:
   the CPU-copy pipeline this whole investigation has been circling, one
   way or another worth doing regardless of whether it turns out to affect
   this remaining issue.
+
+### Follow-up: the green corruption survives everything above — MAX_INPUT_SIZE
+### fix confirmed real but NOT the cause; structural trace found nothing;
+### MediaCodec's negotiated I/O format matches exactly what we asked for
+
+Picking up the "not fully resolved" note above. In order:
+
+1. **Independent-decode proof the corruption is server-side, not
+   network/client.** `WIVRN_DUMP_VIDEO` (a real, pre-existing WiVRn feature
+   in `video_encoder.cpp`'s `video_encoder::create()`) was wired up in
+   `wivrn_server_jni.cpp`'s `nativeStart()` — Android apps don't inherit
+   shell env vars, so this needed an explicit `setenv()` call (still
+   present, gated to nothing, always on — cheap, writes only to
+   app-private storage). Pulled the dump with `adb ... run-as ... cat`,
+   decoded independently on the PC with a static ffmpeg build (the distro
+   package's shared libs aren't on this host) — completely bypassing the
+   Quest's own decoder and the network. **The corruption is present in
+   this PC-side decode**, proving neither the network nor the client
+   decoder is the cause.
+2. **The installed Quest client is provably not at fault either.** Its
+   `lastUpdateTime` was confirmed byte-identical to a fresh install of the
+   official `WiVRn-release.apk` — so nothing this session's (incomplete,
+   still stuck on a missing `ktx` host tool) client-build attempt could
+   have broken is responsible.
+3. **Monado's own output, before WiVRn's compositor touches it, is clean.**
+   A temporary Vulkan capture (`debug_dump_app_image` in
+   `compositor.cpp`, since removed again — see below) dumped the app's
+   swapchain image straight from Monado's handoff, both eyes, well past
+   the loading splash. Both eyes render correctly. (The user separately
+   flagged the two eyes' UI panel not being at the same horizontal
+   position as a possible bug; the working theory is normal binocular
+   parallax for geometry at finite depth, not a bug — but this has **not**
+   been checked against WiVRn's actual per-eye `src_rect`/`src_fov`
+   handling, so treat it as plausible, not confirmed.)
+4. **`AMEDIAFORMAT_KEY_MAX_INPUT_SIZE` fix — real bug, confirmed fixed, but
+   not this bug.** A dispatched review found that without this key,
+   Codec2 sizes its input `ByteBuffer` from an internal default that can
+   be smaller than one actual NV12 frame (observed: 1MiB/512KiB on this
+   device, both under the ~1.23MiB a real 896×960 NV12 frame needs) —
+   silently, no error. `encode()`'s existing size guard means such a
+   frame would get truncated, and everything past the real buffer size
+   would stay zeroed, encoding as solid green. This looked like a
+   plausible full explanation. Applied `AMEDIAFORMAT_KEY_MAX_INPUT_SIZE`
+   in `ensure_codec()`; verified genuinely active (`grep -c "too small"`
+   → 0 across a full session log, where it would previously have fired).
+   **Re-tested with a fresh `WIVRN_DUMP_VIDEO` capture immediately after
+   confirming zero truncation warnings — the corruption is still there,
+   byte-identical in pattern.** So this was a real, independent latent
+   bug, worth keeping, but not the (or not the only) cause of the visible
+   symptom. Correcting the earlier, premature "this is what every green
+   chroma symptom turned out to actually be" claim in this doc's own
+   history above — that was wrong; it's now known to be wrong from a
+   direct re-test, not just untested optimism.
+5. **Manual structural trace, Monado handoff → encoder input, nothing
+   found.** Walked `image_formats()` (multi-planar
+   `eG8B8R82Plane420Unorm` for 8-bit), `make_images()` (one
+   `image_allocation` per compositor image, `arrayLayers=3` for
+   left/right/alpha, `usage=eStorage|eTransferSrc`), the queue-family/
+   layout-transition barrier at the end of `layer_commit()` (`eGeneral` →
+   `encoder->target_layout`, which for mediacodec is also `eGeneral`), and
+   `video_encoder_mediacodec.cpp`'s `present_image()` copy-region setup
+   (plane0/luma at buffer offset 0 full-res, plane1/chroma at
+   `width*height` half-res, both indexed by `stream_idx` as the array
+   layer). All structurally correct at the Vulkan-API-call level — no
+   coding bug found by reading it.
+6. **Tested the "MediaCodec doesn't actually honor the format we
+   requested" theory directly (prompted by the classic "greenish video
+   encoded with MediaCodec" failure mode, where hardware/Codec2 backends
+   silently keep their own padded/tiled layout despite `KEY_STRIDE`/
+   `KEY_SLICE_HEIGHT` configure-time hints) — result: negative for this
+   device.** Logged `AMediaCodec_getInputFormat()` right after
+   `AMediaCodec_start()` (temporary, since removed) and compared against
+   what was requested. Live result on-device:
+   `requested 896x960 stride=896 slice=960 color=21 -- got w=896 h=960
+   stride=896 slice=960 color=21` — an exact match, no silent padding, no
+   silently-substituted color format. This specific, well-known MediaCodec
+   footgun is **ruled out** on this hardware/codec combination — but it
+   only checked what the codec *reports*, not necessarily what the
+   underlying Codec2 component *actually does internally* with a
+   ByteBuffer input; if this gets re-opened, the next step would be a
+   byte-level A/B (feed a synthetic, known-correct NV12 buffer — e.g. a
+   flat mid-grey frame — directly into the same encoder call path,
+   independent of Monado/the compositor entirely, and decode what comes
+   out) rather than trusting the format-negotiation API further.
+
+**Cleanup done this pass**: removed `debug_dump_app_image` and its two call
+sites from `compositor.cpp` (it did an unconditional `vk.device.waitIdle()`
+per dumped frame for the first 60 frames of every run — a real stall, not
+worth leaving in now that the question it was answering is settled), the
+`layer_count`/`type0` one-shot debug log next to it, and the
+`AMediaCodec_getInputFormat()` diagnostic in `video_encoder_mediacodec.cpp`
+(one-shot, its result is now written down above). Left in place, because
+they're cheap and still useful for the next round of investigation: the
+`WIVRN_DUMP_VIDEO` `setenv()` in `wivrn_server_jni.cpp`, and a
+symmetrical receive-side dump in `client/decoder/android/android_decoder.cpp`'s
+`push_data()` (writes `dump_recv_<stream_index>.h264`, gated to 600 frames
+per stream) — added for an eventual receive-side capture but not yet pulled
+from a device, since it requires the client to actually be running code
+built by us, which the incomplete client-toolchain build still blocks (see
+"Toolchain" section for the `ktx` gap).
+
+**Also kept, unrelated to the corruption investigation but genuinely
+fixed**: `foveation.comp` is back to upstream's `subgroupShuffleDown` (the
+workgroup-shared-memory replacement documented earlier in this section was
+proven to make no difference to this bug — identical corruption either way
+— so per explicit instruction it was reverted to the original; it remains
+true that WiVRn never checks `VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT`
+before relying on it, a real portability gap worth fixing upstream someday,
+just not this bug). `video_encoder.h`/`.cpp` gained `push_async(data&&)`
+and `video_encoder_mediacodec.cpp` uses it (plus `async_send=true`) so CSD
+(SPS/PPS) and the main frame payload both go through the shared background
+sender thread instead of blocking the encode-dispatch path — matches
+`video_encoder_raw.cpp`/`video_encoder_vulkan.cpp`'s existing pattern, no
+regression observed since re-applying it after the IDR-livelock fix made it
+safe.
+
+**Where this stands**: every layer that can be checked without a lot more
+investment has been checked and is clean or ruled out — network, client
+decoder, Monado's own render output, the Vulkan copy/barrier code, the
+MediaCodec configure-time format negotiation. Two directions left,
+neither started yet:
+- **GPU driver bug on this specific hardware**, combining a multi-planar
+  `2PLANE_420` format + 3 array layers + compute-shader `imageStore` write
+  + `vkCmdCopyImageToBuffer` read — none of which individually is unusual,
+  but the specific combination is untested territory for this GPU/driver.
+  Decisive test: restructure to separate single-layer images per stream
+  instead of one 3-layer array image. Invasive, not started.
+- **A byte-level A/B test of the encoder in isolation** (see point 6
+  above) — feed MediaCodec a synthetic, known-good NV12 buffer directly,
+  bypassing Monado/the compositor/Vulkan entirely, and check the decoded
+  output. This is the cheapest remaining way to tell "MediaCodec itself
+  mishandles this data" apart from "something upstream of MediaCodec is
+  still producing bad bytes we haven't caught."
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)

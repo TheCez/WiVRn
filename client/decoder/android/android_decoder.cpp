@@ -22,7 +22,9 @@
 #include "scenes/stream.h"
 #include "utils/named_thread.h"
 #include <android/hardware_buffer.h>
+#include <array>
 #include <cassert>
+#include <cstdio>
 #include <magic_enum.hpp>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
@@ -215,6 +217,28 @@ decoder::~decoder()
 
 void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
+	// TEMPORARY debug: dump the exact bytes this decoder receives, in
+	// order, to a continuous file per stream -- to compare byte-for-byte
+	// against the server's WIVRN_DUMP_VIDEO dump of what it sent (see
+	// wivrn_server_jni.cpp). Pull via `adb shell run-as org.meumeu.wivrn.local
+	// cat .../dump_recv_<stream_index>.h264` and decode both with ffmpeg.
+	// Remove once diagnosed.
+	{
+		static std::array<int, 3> dump_frames = {0, 0, 0};
+		if (stream_index < 3 and dump_frames[stream_index] < 600)
+		{
+			auto path = "/data/data/org.meumeu.wivrn.local/dump_recv_" + std::to_string(stream_index) + ".h264";
+			if (FILE * f = fopen(path.c_str(), "ab"))
+			{
+				for (const auto & sub_data: data)
+					fwrite(sub_data.data(), 1, sub_data.size(), f);
+				fclose(f);
+			}
+			if (not partial)
+				++dump_frames[stream_index];
+		}
+	}
+
 	if (current_input_buffer.data == nullptr)
 		current_input_buffer = input_buffers.pop();
 	else if (current_input_buffer.frame_index != frame_index)

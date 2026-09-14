@@ -307,6 +307,12 @@ void video_encoder::encode(wivrn_session & cnx,
 	}
 }
 
+void video_encoder::push_async(data && d)
+{
+	assert(shared_sender);
+	shared_sender->push(std::move(d));
+}
+
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
 {
 	std::lock_guard lock(mutex);

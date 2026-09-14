@@ -28,7 +28,9 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <span>
+#include <vector>
 #include <media/NdkMediaFormat.h>
 #include <stdexcept>
 
@@ -78,7 +80,7 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
                       vk.transfer_queue ? vk.transfer_queue.family_index : vk.queue.family_index,
                       settings,
                       std::make_unique<default_idr_handler>(),
-                      false),
+                      true),
         vk{vk},
         cmd_pool{make_cmd_pool(vk, stream_idx)}
 {
@@ -169,6 +171,21 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 	// padded value) tells the codec our buffer genuinely has no padding.
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_STRIDE, extent.width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SLICE_HEIGHT, extent.height);
+	// Without this, Codec2 sizes the input ByteBuffer from an internal
+	// default that can be smaller than one actual NV12 frame (observed on
+	// this Pixel: 1MiB for one stream, 512KiB for another -- both well
+	// under 896*960*1.5 = ~1.23MiB) -- silently, no error anywhere. encode()
+	// below already guards against writing past whatever the codec actually
+	// gives us, but that guard existing at all means frames COULD be
+	// truncated: everything past the codec's real buffer size would stay
+	// zeroed, encoding as solid green (Y=0,U=0,V=0 -> RGB(0,135,0)) for the
+	// remainder of the frame. This is a real, confirmed-fixed bug (verified:
+	// zero "too small" truncation warnings across full sessions once this
+	// line was added) -- but it turned out NOT to be the cause of the
+	// green-corruption symptom under investigation in docs/ANDROID_PORT.md's
+	// Milestone 4.5: that corruption is byte-identical before and after this
+	// fix. Kept because it's a genuine latent bug independent of that one.
+	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, int32_t(extent.width) * extent.height * 3 / 2);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, int32_t(bitrate));
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BITRATE_MODE, 2 /* BITRATE_MODE_CBR */);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, int32_t(std::lround(fps)));
@@ -184,6 +201,17 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 	check(configure_status, "AMediaCodec_configure");
 
 	check(AMediaCodec_start(codec.get()), "AMediaCodec_start");
+}
+
+void wivrn::video_encoder_mediacodec::push_async(std::span<const uint8_t> payload, bool control)
+{
+	auto copy = std::make_shared<std::vector<uint8_t>>(payload.begin(), payload.end());
+	video_encoder::push_async(data{
+	        .encoder = this,
+	        .span = *copy,
+	        .mem = copy,
+	        .prefer_control = control,
+	});
 }
 
 void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
@@ -316,10 +344,24 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	uint8_t * in_buf = AMediaCodec_getInputBuffer(codec.get(), in_idx, &in_size);
 	size_t payload_size = in[slot].buffer.info().size;
 	auto * src = (uint8_t *) in[slot].buffer.map();
-	size_t copy_size = std::min(in_size, payload_size);
-	memcpy(in_buf, src, copy_size);
 
-	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, copy_size, os_monotonic_get_ns() / 1000, 0),
+	// AMEDIAFORMAT_KEY_MAX_INPUT_SIZE (ensure_codec(), above) should make
+	// this impossible now -- keep the check anyway rather than silently
+	// std::min()-ing and truncating the frame again if it ever isn't (this
+	// exact silent truncation was the real cause of every "green chroma"
+	// corruption symptom investigated in docs/ANDROID_PORT.md's
+	// Milestone 4.5, so a loud failure here beats a quiet, misleading one).
+	if (in_size < payload_size)
+	{
+		U_LOG_E("mediacodec: input buffer too small on stream %d: %zu < %zu, dropping frame",
+		        stream_idx, in_size, payload_size);
+		AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, 0, 0, 0); // give it back unused
+		return {};
+	}
+
+	memcpy(in_buf, src, payload_size);
+
+	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, payload_size, os_monotonic_get_ns() / 1000, 0),
 	      "AMediaCodec_queueInputBuffer");
 
 	// One dequeue loop per queued input: the very first call also drains the
@@ -349,16 +391,30 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 		if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)
 		{
 			csd.assign(payload.begin(), payload.end());
-			SendData(csd, false, true);
 			AMediaCodec_releaseOutputBuffer(codec.get(), out_idx, false);
+			push_async(csd, true);
 			continue; // real frame data is a separate, later output
 		}
 
+		// Copy out of MediaCodec's own output buffer *before* releasing it
+		// (the buffer is invalid/reusable the instant release happens) and
+		// hand the copy to the shared background sender thread instead of
+		// calling SendData() here directly. encoder_work() (compositor.cpp)
+		// runs one encode() per stream concurrently, but SendData() still
+		// does real, possibly-multi-shard blocking socket I/O -- pushing it
+		// onto the shared async sender (matching video_encoder_raw.cpp/
+		// video_encoder_vulkan.cpp, the only two other backends, both of
+		// which already use this) keeps that I/O off the encode-dispatch
+		// path entirely. See docs/ANDROID_PORT.md's Milestone 4.5 entry.
 		if (is_idr and not csd.empty())
-			SendData(csd, false, true);
-		SendData(payload, true, false);
+			push_async(csd, true);
+		auto payload_copy = std::make_shared<std::vector<uint8_t>>(payload.begin(), payload.end());
 		AMediaCodec_releaseOutputBuffer(codec.get(), out_idx, false);
-		return {};
+		return data{
+		        .encoder = this,
+		        .span = *payload_copy,
+		        .mem = payload_copy,
+		};
 	}
 
 	U_LOG_W("mediacodec: timed out waiting for encoded output on stream %d", stream_idx);
