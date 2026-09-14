@@ -641,6 +641,77 @@ GPU-copy-to-host-buffer-then-memcpy path), which should help both the
 remaining buffer-lifetime hazard (no separate host buffer to race over)
 and overall latency.
 
+**Follow-up, root-caused with hard evidence from a live device (not
+guessed)**: dispatched a fresh, independent review (a more thorough model,
+given how long the guessing above had gone in circles) to read
+`video_encoder_mediacodec.cpp` against the proven `video_encoder_raw.cpp`/
+`video_encoder_vulkan.cpp` backends and the shared base class, and to pull
+live evidence rather than theorize further. It refuted the buffer-slot-race
+theory above (the "byte-identical prefix" was just the NAL header + a
+skip-run encoding of a static top-of-frame -- expected, not evidence of a
+half-written buffer; the actual code has no slot-reuse hazard, traced end
+to end) and instead found, from a live session:
+
+- **Zero partial-shard frame loss** -- every incomplete frame had exactly
+  zero shards received, never some-but-not-all. Rules out network loss,
+  MTU, and bitstream corruption entirely.
+- Of 2045 frames, 115 were missing from **exactly one** decoder, never
+  both -- a per-stream *server-side gating decision*, not resource
+  contention (both encoders/decoders showed near-identical throughput
+  counters).
+- **Root cause**: `server/encoder/idr_handler.cpp`'s `default_idr_handler`
+  is a self-sustaining IDR livelock, running independently per stream.
+  `compositor::layer_commit()` drops a frame under load before any encoder
+  ever sees its `frame_index` (`encode_request >= 0` check). The client
+  correctly reports "didn't receive it" for that index, but
+  `on_feedback()`'s `running` branch couldn't distinguish "we never even
+  tried to send this" from "we sent it and it was genuinely lost" --
+  wrongly treating the former as loss and demanding an IDR, then
+  `should_skip()` skips *every* frame until that IDR is acknowledged (a
+  7-8 frame silent run, observed live). Each stream's IDR acks land at
+  different times, desyncing the two streams' frame timelines from each
+  other; once desynced by more than the client's 3-deep matching window,
+  `common_frame()` can never find a shared frame index between the two
+  decoders again, and whichever eye is left holding a stale/blank frame
+  renders as solid green (an all-zero YUV surface converts to
+  RGB(0,135,0)). Stream 1 is consistently constructed/presented/sent
+  second throughout the whole pipeline, so it's systematically the one
+  left stale -- explaining why it was always specifically the right eye.
+- **Fix applied** (`server/encoder/idr_handler.h`/`.cpp`): track which
+  frame indices this encoder actually encoded and sent (`sent_frames`, a
+  512-entry ring, mirroring the existing `non_ref_frames` ring), and only
+  let `on_feedback()`'s "was this genuinely lost" check treat a
+  `sent_to_decoder=false` report as real loss if that frame index is
+  actually in `sent_frames` -- a frame the compositor silently dropped
+  before this encoder ever touched it no longer triggers a false IDR
+  demand. Also fixed a real (if currently harmless) bug found along the
+  way: `non_ref_frames{512, uint64_t(-1)}`'s brace-init picks the
+  `initializer_list` constructor over the fill constructor, making it a
+  2-element vector instead of 512 -- changed to parens. Also fixed
+  `video_encoder_mediacodec.cpp` telling `AMediaCodec_queueInputBuffer` the
+  full `payload_size` when only `copy_size = min(in_size, payload_size)`
+  was actually copied (latent truncation risk, currently harmless since
+  they happen to be equal on this device).
+- **Verified live**: `Failed to find a common frame for all decoders` and
+  `IDR frame needed` both dropped to **zero** occurrences across multiple
+  fresh sessions (previously dozens within seconds). `Timeout on stream`
+  and partial-shard-loss messages also stayed at zero, confirming this
+  wasn't just moving the symptom around.
+- **Not fully resolved**: a visually different corruption still appears on
+  the right eye in sustained testing -- structured block-level noise now,
+  rather than the earlier uniform green wash or a frozen stale frame,
+  and it occurs with zero IDR requests, zero desync warnings, and zero
+  partial-shard loss logged, i.e. invisible to every diagnostic used so
+  far. The compositor is still genuinely dropping a meaningful fraction of
+  frames under load (a real, separate throughput/pacing issue, not a
+  correctness bug) -- whether the remaining corruption is downstream of
+  that, or a distinct issue, is not yet established. Next step (user's
+  call, already planned): a genuine zero-copy encoder input path (see
+  `video_encoder_mediacodec.h`'s own `ponytail:` comment), which removes
+  the CPU-copy pipeline this whole investigation has been circling, one
+  way or another worth doing regardless of whether it turns out to affect
+  this remaining issue.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 

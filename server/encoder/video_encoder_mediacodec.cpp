@@ -319,7 +319,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	size_t copy_size = std::min(in_size, payload_size);
 	memcpy(in_buf, src, copy_size);
 
-	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, payload_size, os_monotonic_get_ns() / 1000, 0),
+	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, copy_size, os_monotonic_get_ns() / 1000, 0),
 	      "AMediaCodec_queueInputBuffer");
 
 	// One dequeue loop per queued input: the very first call also drains the

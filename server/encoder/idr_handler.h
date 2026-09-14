@@ -55,7 +55,28 @@ class default_idr_handler : public idr_handler
 		uint64_t first_p;
 	};
 	std::variant<need_idr, wait_idr_feedback, idr_received, running> state;
-	std::vector<uint64_t> non_ref_frames{512, uint64_t(-1)};
+	// NOTE: parens, not braces -- brace-init here would pick the
+	// initializer_list<uint64_t> constructor (both args convert to
+	// uint64_t), making this a 2-element vector instead of a 512-element
+	// one filled with -1.
+	std::vector<uint64_t> non_ref_frames = std::vector<uint64_t>(512, uint64_t(-1));
+	// Frame indices this encoder actually encoded and sent, most recent
+	// 512. The compositor can drop a frame under load before the encoder
+	// ever sees it (server/compositor/compositor.cpp's layer_commit(),
+	// when encode_request is still >= 0 from the previous frame) -- such a
+	// frame's index never reaches get_type()/present_image() for this
+	// stream at all. The client still reports feedback for it (frame_index
+	// was never delivered), which on_feedback()'s "running" branch would
+	// otherwise mistake for a genuinely lost/corrupted frame and demand a
+	// new IDR -- entering a self-sustaining livelock (see this file's own
+	// should_skip(): every frame is skipped until that IDR is acknowledged,
+	// repeatedly, since the *next* frame can just as easily also be one the
+	// compositor dropped). Each of the 2-3 streams runs this state machine
+	// independently, so this desyncs them from each other, not just from
+	// real time -- see docs/ANDROID_PORT.md's Milestone 4.5 entry for the
+	// full trail. Only a frame index present here can legitimately trigger
+	// an IDR request; genuine loss (this encoder DID send it) still does.
+	std::vector<uint64_t> sent_frames = std::vector<uint64_t>(512, uint64_t(-1));
 
 public:
 	enum class frame_type
@@ -69,6 +90,7 @@ public:
 	bool should_skip(uint64_t frame_id) override;
 	void set_non_ref(uint64_t frame_index);
 	bool is_non_ref_frame(uint64_t frame_index);
+	bool was_sent(uint64_t frame_index);
 	frame_type get_type(uint64_t frame_index);
 };
 } // namespace wivrn
