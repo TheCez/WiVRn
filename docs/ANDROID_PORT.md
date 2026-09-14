@@ -1539,16 +1539,77 @@ investigation and its fix. This strongly suggests it's the **same
 long-standing, still-unresolved issue**, not something newly introduced
 by any change made this session.
 
-**Not yet determined / next steps**: exact root mechanism (application-side
-per-frame resource contention during the now-concurrent per-stream
-`encode()` calls introduced in `89655cd4`, vs. a genuine transient vendor
-VPU hiccup under load, vs. something else entirely); whether it correlates
-with thermal state, CPU scheduling, or session duration ("sustained load"
-in the old note); whether both streams are equally affected or one more
-than the other. The full pipelined-readback-ring rewrite (Parts C-H of
-the original plan) has not been started — deliberately paused to report
-this finding first, since it changes what "quality" work is actually
-worth doing next.
+**Not yet determined at that point**: exact root mechanism, whether both
+streams are equally affected, whether MediaCodec/hardware encode itself
+was responsible or was just faithfully encoding already-bad input.
+
+### Decisive follow-up: the NV12 input is already corrupt before MediaCodec ever sees it
+
+Per the plan's own priority order — *"For one visibly corrupted encoded
+frame, prove whether its immediately preceding NV12 input frame was
+clean or corrupt. That one answer determines which half of the remaining
+pipeline to spend time on"* — a proper, permanent, committed diagnostic
+was added (commit `b7dfca02`): `WIVRN_DUMP_NV12` (mirroring the existing
+`WIVRN_DUMP_VIDEO`) continuously captures the exact bytes handed to
+`AMediaCodec_queueInputBuffer()`, each frame prefixed with its 8-byte
+`frame_index`, toggled at runtime via the `debug.wivrn.dump` Android
+system property (`adb shell setprop debug.wivrn.dump 1`) — no
+rebuild/reinstall needed, unset by default.
+
+Method: a fresh live session (Quest 1, real Unity OpenXR app,
+`XR_SESSION_STATE_FOCUSED`) ran with the flag set. The encoded-output
+capture (stream 1/right eye, ~183 MB, 18350 frames) was decoded
+independently on the PC — ffmpeg itself logged a hard bitstream syntax
+error partway through (`cabac_init_idc 32 overflow` — a value with only
+3 legal values, 0-2 — `decode_slice_header error`, `Invalid data found
+when processing input`), confirming this is genuinely malformed H.264
+syntax, not merely an ugly-but-valid encode. A per-frame near-black-pixel
+scan flagged **1496 of 18350 frames (~8.2%)**, clustered in dense bursts
+(consistent with P-frame error propagation from one bad frame forward
+until the next IDR resets it) — including one **isolated** single-frame
+glitch at output position 1215 (0-indexed), chosen specifically because
+it isn't part of a multi-hundred-frame inherited-corruption cascade.
+
+The exact corresponding record was pulled from the frozen, byte-tagged
+`dump_nv12-1.nv12raw` (23.8 GB total; only the ~27 MB, 21-frame window
+around that position was pulled, via an on-device `dd` producing a
+frame-exact byte range — no need to transfer the full capture) and
+decoded directly as raw Y-plane bytes (no H.264 involved at all for this
+side). **Result: `frame_index=2995`'s raw NV12 Y-plane already shows
+8.77% near-black pixels — matching almost exactly the 8.77% black
+fraction of the corresponding corrupted encoded output frame — in the
+identical scattered/streaked spatial pattern.**
+
+**Conclusion, precisely: the corruption is already present in the NV12
+buffer at the moment it is copied into MediaCodec's input buffer.
+MediaCodec and the hardware encoder are exonerated as the source** — they
+are faithfully encoding already-corrupt input, not introducing the
+corruption themselves. This redirects the investigation to the GPU
+render/readback/synchronization path specifically:
+`compositor.cpp`/`foveation.comp`'s RGB→NV12 compute, the
+`vkCmdCopyImageToBuffer` readback in `present_image()`, and the fence/
+memory-visibility handling around it (the `HOST_COHERENT` invalidate fix
+above was real and necessary, but demonstrably not sufficient — the
+corruption persists with it in place).
+
+**Next steps** (not yet started): investigate the GPU/readback/sync path
+directly per the plan's remaining items — run one eye's encoder only vs.
+both concurrently (isolate whether this is a resource-contention/race
+condition specific to concurrent per-stream operation, `89655cd4`'s
+concurrent `encode()` change being one candidate), temporarily serialize
+the two streams' GPU copy submissions, and correlate corrupted frames
+against GPU fence-wait duration, staging slot, and thermal/load state
+(the `frame_timing_stats` instrumentation and the one `ECOServiceStatsProvider`
+asymmetry noted earlier are available for this but not yet correlated).
+Bitrate/rate-control tuning and network/packet analysis remain explicitly
+out of scope until this is resolved — confirmed twice over now (network
+ruled out by the encoder-side capture; MediaCodec/encoder ruled out by
+this NV12 capture) that neither is the cause.
+
+The full pipelined-readback-ring rewrite (Parts C-H of the original
+readback-pipelining plan) remains paused — correctly, per the decision
+to avoid changing pipeline timing before the root cause here is found,
+since a concurrency change could mask or alter this exact bug.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
