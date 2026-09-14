@@ -58,6 +58,10 @@ public:
 	// (NVIDIA, Mesa llvmpipe) with the exact same shader and data, and
 	// confirmed corrupted ONLY with arrayLayers>=2 when run directly on
 	// this device -- so single-layer images sidestep it entirely.
+	// Full writeup incl. exact repro and upstream-bug-report material:
+	// docs/pixel10-pro-xl-gpu-media-investigation.md, section B. DO NOT
+	// consolidate these back into array layers on this driver without
+	// re-running that document's reproduction harness first.
 	struct stream_image
 	{
 		image_allocation image;

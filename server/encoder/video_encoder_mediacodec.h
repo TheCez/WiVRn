@@ -36,17 +36,20 @@ namespace wivrn
 // ponytail: this copies the compositor's rendered image out to a
 // host-visible VMA buffer first (present_image(), identical to
 // video_encoder_raw.cpp's own copy step) and memcpy's that into MediaCodec's
-// own input buffer in encode() -- not the genuinely zero-copy path
-// (AMediaCodec_createInputSurface() + rendering directly into it as a
-// VkSurfaceKHR/VkSwapchainKHR target, matching how the client's own decoder
-// consumes a Surface). That's real, meaningfully more work (restructuring
-// how the compositor's encode-target image is allocated) for a second pass
-// once this is proven to actually decode correctly on a real headset --
-// right now nothing produces a real H.264 bitstream from this phone at all,
-// which is the actual blocker. Upgrade path: swap this backend's image
-// storage for one backed by an AHardwareBuffer imported into Vulkan via
-// VK_ANDROID_external_memory_android_hardware_buffer, queued to the
-// encoder's input Surface instead of copied through a CPU buffer.
+// own input buffer in encode() -- not genuinely zero-copy.
+//
+// A real, exhaustive zero-copy investigation was done and every public
+// GPU->MediaCodec route on this device/driver was tried and failed for a
+// specific, diagnosed reason (MediaCodec's own Surface-input path, direct
+// Vulkan STORAGE writes, Vulkan-exported AHardwareBuffer,
+// VK_ANDROID_external_format_resolve, and GL_EXT_YUV_target) -- see
+// docs/pixel10-pro-xl-gpu-media-investigation.md for the full record,
+// section H for the summary table. MediaCodec's Block Model +
+// QueueRequest.setHardwareBuffer() DOES work on this device (section G) --
+// the remaining blocker is populating that HardwareBuffer from the GPU,
+// not MediaCodec itself. If revisited (different device/firmware, or a
+// driver update), re-run that document's probes first rather than
+// re-deriving this from scratch.
 class video_encoder_mediacodec : public video_encoder
 {
 	vk_bundle & vk;

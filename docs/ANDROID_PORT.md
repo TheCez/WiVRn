@@ -643,6 +643,13 @@ possibly a separate pacing issue — worth measuring before assuming which.
 ## and fixed (a real GPU driver bug), plus several other real bugs found and
 ## fixed along the way
 
+**Full permanent technical record of this and the related Milestone 4.6
+investigation**: `docs/pixel10-pro-xl-gpu-media-investigation.md` —
+detailed enough to understand without this chat history, extract
+upstream PowerVR bug reports, and avoid accidentally reverting the
+workarounds it documents. This section and Milestone 4.6 below remain
+the narrative summary; that document is the detailed backing record.
+
 **Symptom** (reported after Milestone 4): the stream showed pixelation and
 green artifacts, with what looked like stereo overlap; one eye usually showed
 recognizable-but-tinted geometry, the other solid green with static noise.
