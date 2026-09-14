@@ -576,6 +576,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
 			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
 			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
+			squasher_gpu_time_log.sample(int64_t((ts[1] - ts[0]) * period));
+			foveation_gpu_time_log.sample(int64_t((ts[2] - ts[1]) * period));
 		}
 	}
 

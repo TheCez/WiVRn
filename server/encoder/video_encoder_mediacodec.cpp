@@ -129,6 +129,28 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 		        "mediacodec stream buffer");
 		in[i].fence = vk::raii::Fence(vk.device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
 
+		if (i == 0)
+		{
+			// Part D (readback pipeline investigation): VMA_MEMORY_USAGE_AUTO
+			// picks the actual memory type at allocation time -- log it once
+			// rather than assuming. This buffer is only ever written by the
+			// GPU (vkCmdCopyImageToBuffer) and read by the CPU (memcpy in
+			// encode()), never the other way, so HOST_COHERENT (no manual
+			// vkInvalidateMappedMemoryRanges needed before the CPU read) is
+			// what we want and currently rely on implicitly -- if this ever
+			// logs without eHostCoherent set, encode()'s CPU read is missing
+			// a required invalidate and may see stale data.
+			auto props = in[i].buffer.properties();
+			U_LOG_I("mediacodec[%d] staging buffer memory properties: %s%s%s(raw=%#x)",
+			        stream_idx,
+			        (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "HOST_VISIBLE " : "",
+			        (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "HOST_COHERENT " : "",
+			        (props & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL " : "",
+			        props);
+			if (not(props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+				U_LOG_W("mediacodec[%d] staging buffer is NOT HOST_COHERENT -- CPU reads in encode() need an explicit invalidate, currently missing", stream_idx);
+		}
+
 		if (stream_idx >= 2)
 		{
 			// present_image() never touches this stream's chroma half
@@ -223,7 +245,18 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	// compositor's already-NV12 image out to our own host-visible buffer.
 	// See this class's own comment (video_encoder_mediacodec.h) for why
 	// that's the deliberate first-pass tradeoff here.
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	//
+	// This wait is for a STALE slot: with num_slots==2, `slot` was last
+	// used two present_image() calls ago, and its GPU copy should long
+	// since have finished (encode() -- below -- already waited on this
+	// same fence before this call could even happen, via the base
+	// class's own present_slot/encode_slot busy/idle gate). Non-zero
+	// wait time here means the render thread is genuinely stalling on
+	// this encoder's own pipeline, not just the base class's slot gate.
+	auto t_wait_begin = os_monotonic_get_ns();
+	auto wait_result = vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000);
+	t_present_fence_wait.sample(os_monotonic_get_ns() - t_wait_begin);
+	if (wait_result == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
 		return;
@@ -310,6 +343,8 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encode(uint8_t slot, uint64_t frame_index)
 {
+	scoped_timing_sample total_timer(t_encode_total);
+
 	// Dynamic bitrate: real runtime AMediaCodec feature (see key_video_bitrate's
 	// own comment). Dynamic framerate isn't: unlike x264 (full param reconfig)
 	// there's no equivalently well-supported MediaCodec runtime call for it, so
@@ -335,13 +370,25 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 		AMediaFormat_delete(params);
 	}
 
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return {};
+		// This is the wait for THIS frame's GPU copy (present_image(),
+		// same slot) to finish -- unlike present_image()'s own fence
+		// wait (which waits on a stale slot from 2 frames ago). Real
+		// wait time here means the CPU is idle waiting on the GPU
+		// specifically for the frame this call is trying to encode.
+		scoped_timing_sample t(t_encode_fence_wait);
+		if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+		{
+			U_LOG_E("Timeout on stream %d", stream_idx);
+			return {};
+		}
 	}
 
-	ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec.get(), 10'000 /* 10ms */);
+	ssize_t in_idx;
+	{
+		scoped_timing_sample t(t_codec_input_wait);
+		in_idx = AMediaCodec_dequeueInputBuffer(codec.get(), 10'000 /* 10ms */);
+	}
 	if (in_idx < 0)
 	{
 		U_LOG_W("mediacodec: no input buffer available on stream %d", stream_idx);
@@ -369,7 +416,10 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 		return {};
 	}
 
-	memcpy(in_buf, src, payload_size);
+	{
+		scoped_timing_sample t(t_memcpy);
+		memcpy(in_buf, src, payload_size);
+	}
 
 	check(AMediaCodec_queueInputBuffer(codec.get(), in_idx, 0, payload_size, os_monotonic_get_ns() / 1000, 0),
 	      "AMediaCodec_queueInputBuffer");
@@ -380,6 +430,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	// (KEY_LATENCY=1 requests one-in-one-out where the device honors it).
 	// Bounded, not a true infinite loop: 100 * 10ms = 1s, matching the fence
 	// wait timeouts used throughout this file.
+	scoped_timing_sample output_wait_timer(t_codec_output_wait);
 	for (int attempt = 0; attempt < 100; ++attempt)
 	{
 		AMediaCodecBufferInfo info{};

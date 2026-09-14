@@ -18,10 +18,12 @@
 
 #pragma once
 
+#include "utils/frame_timing_stats.h"
 #include "video_encoder.h"
 #include "vk/allocation.h"
 
 #include <array>
+#include <format>
 #include <media/NdkMediaCodec.h>
 #include <span>
 #include <vector>
@@ -75,6 +77,20 @@ class video_encoder_mediacodec : public video_encoder
 		buffer_allocation buffer; // single NV12 buffer, Y then interleaved UV
 	};
 	std::array<in_t, num_slots> in;
+
+	// Part B (readback pipeline investigation, docs/ANDROID_PORT.md's perf
+	// branch): opt-in, near-zero-cost-when-disabled timing breakdown of the
+	// GPU-copy -> CPU-memcpy -> MediaCodec handoff, one line per stage
+	// every ~240 frames when WIVRN_TIMING_LOG is set. See
+	// frame_timing_stats.h; these are function/instance members rather
+	// than function-local statics only because the stage name needs this
+	// stream's index baked in.
+	frame_timing_stats t_present_fence_wait{std::format("mediacodec[{}] present_image fence wait (stale slot)", stream_idx)};
+	frame_timing_stats t_encode_fence_wait{std::format("mediacodec[{}] encode fence wait (this frame's copy)", stream_idx)};
+	frame_timing_stats t_codec_input_wait{std::format("mediacodec[{}] dequeueInputBuffer wait", stream_idx)};
+	frame_timing_stats t_memcpy{std::format("mediacodec[{}] memcpy", stream_idx)};
+	frame_timing_stats t_codec_output_wait{std::format("mediacodec[{}] dequeueOutputBuffer wait", stream_idx)};
+	frame_timing_stats t_encode_total{std::format("mediacodec[{}] encode() total", stream_idx)};
 
 	// SPS+PPS, captured once from the encoder's first (CODEC_CONFIG-flagged)
 	// output buffer. Devices don't reliably repeat these inline before every

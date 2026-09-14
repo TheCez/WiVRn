@@ -134,6 +134,7 @@ if (WIVRN_BUILD_SERVER)
 			utils/wivrn_vk_bundle.cpp
 			utils/wivrn_trace.cpp
 			utils/gpu_timestamp_pool.cpp
+			utils/frame_timing_stats.cpp
 		)
 
 	# ANDROID: build wivrn-server as a plain executable by default (matches

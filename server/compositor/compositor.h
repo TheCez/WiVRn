@@ -28,6 +28,7 @@
 #include "foveation.h"
 #include "layer_squasher.h"
 #include "pacer.h"
+#include "utils/frame_timing_stats.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include "main/comp_compositor.h"
@@ -99,6 +100,16 @@ private:
 	const u_logging_level log_level;
 	timings squasher_times;
 	timings foveation_times;
+
+	// Part B (readback pipeline investigation): same GPU query-pool
+	// timestamps squasher_times/foveation_times above already collect
+	// (Monado's own u_var debug-UI system, not reachable via logcat on
+	// this Android build -- no SDL2 GUI here), fed into the same
+	// logcat-based rolling-stats mechanism the mediacodec backend uses
+	// (frame_timing_stats.h) so both ends of the pipeline show up in one
+	// unified WIVRN_TIMING_LOG capture.
+	frame_timing_stats squasher_gpu_time_log{"compositor squasher GPU time"};
+	frame_timing_stats foveation_gpu_time_log{"compositor foveation GPU time"};
 	wivrn_session & session;
 	vk_bundle vk;
 	vk::raii::CommandPool cmd_pool;
