@@ -1451,6 +1451,105 @@ concrete next step (the pixelation reported after Milestone 4.5's
 latency fix is still open and likely a separate, more tractable issue —
 bitrate or frame-pacing related).
 
+## Milestone 5 (in progress, branch `perf/pipelined-mediacodec`) — readback
+## pipelining + the remaining pixelation/quality investigation
+
+Branched from `f2a46ada` (the Pixel PowerVR investigation doc commit).
+Goal: (1) pipeline the GPU-copy → CPU-memcpy → MediaCodec readback path to
+reduce stalls, (2) root-cause the visible pixelation reported after
+Milestone 4.5. Do NOT reopen the zero-copy investigation for this work —
+it's closed (see `docs/pixel10-pro-xl-gpu-media-investigation.md`).
+
+**Instrumentation added** (`d654c757`): `server/utils/frame_timing_stats.h`/`.cpp`,
+a lightweight opt-in (`WIVRN_TIMING_LOG` env var) rolling avg/p50/p95/max
+logcat logger, wired into every real wait/copy boundary in
+`video_encoder_mediacodec.cpp`'s `present_image()`/`encode()`, plus the
+compositor's existing GPU query-pool compute timing. Baseline/after
+numeric comparison not yet collected — the investigation below took
+priority once it surfaced a real, decisive finding.
+
+**Real bug found and fixed as a direct result of that instrumentation**
+(`bd666aa6`): the mediacodec staging buffer is `HOST_VISIBLE` but **not
+`HOST_COHERENT`** on this driver (confirmed live via a new one-time log at
+encoder construction: `mediacodec[N] staging buffer is NOT HOST_COHERENT`)
+— meaning the GPU's `vkCmdCopyImageToBuffer` write was not guaranteed
+visible to the CPU's `memcpy` read in `encode()` without an explicit
+invalidate, which was missing. Added `basic_allocation::invalidate()`
+(`common/vk/allocation.h`/`.cpp`, wrapping `vmaInvalidateAllocation`,
+shared by desktop and Android) and call it before the read. **This did
+NOT eliminate the visible pixelation** — confirmed live, before and after
+this fix, so it is a real, independent correctness gap, not the (or not
+the only) cause of the reported quality issue.
+
+### The pixelation is confirmed encoder-side, not network — a major, decisive finding
+
+Per the investigation's own priority order (prove local-stream cleanliness
+*before* touching bitrate/network), `WIVRN_DUMP_VIDEO` (pre-existing
+WiVRn feature, temporarily wired into `wivrn_server_jni.cpp`'s
+`nativeStart()` again for this one capture, same pattern as commit
+`89655cd4`, reverted once done) captured the exact H.264 bytes the server
+sent, for both eyes, during a real live session (Quest 1 connected, real
+Unity OpenXR app driving it, `XR_SESSION_STATE_FOCUSED` reached). Decoded
+**independently on the PC** (a separate static `ffmpeg` build — no
+network, no Quest, no client decoder involved at all):
+
+- The vast majority of sampled frames, both streams, are completely
+  clean.
+- **Scattered, transient block-level corruption (near-black macroblocks)
+  does appear in the raw, pre-network, server-side encoded bitstream
+  itself**, confirmed by direct visual inspection of independently-decoded
+  frames. Re-sampling the identical frame-index range minutes apart
+  showed it present at one sampling and absent at another — genuinely
+  intermittent/transient, not deterministic per frame index.
+- The user separately confirmed, live in-headset, seeing the same kind of
+  artifact on **both** eyes (this investigation's own sampling had, by
+  chance, only directly caught it on stream 1/right eye at first — the
+  user's live observation is the more reliable signal on which streams
+  are affected).
+- `GC2_EncComp` (the vendor hardware encoder component) logged zero
+  stall/error/warning messages correlating with the corrupted frames in
+  the captured window — opened cleanly (`VPU_EncOpen ... succeeded`) for
+  both streams' hardware channels, no `wait cmd queue`-style distress
+  signal like Milestone 4.6's Surface-input investigation found. One
+  minor asymmetry noted but not yet explored: the second stream's
+  `ECOServiceStatsProvider` registration logged `Failed to add stats
+  provider` at encoder-open time (immediately after the first stream's
+  identical registration succeeded) — possibly benign (a duplicate-key
+  collision on a telemetry hook, not necessarily related to the video
+  path at all), flagged for follow-up, not yet investigated further.
+
+**Conclusion, precisely**: this is **not** a network, packetization, or
+Quest-side decoder problem — the corruption is provably already present
+in the bytes the server itself produced, before anything is sent.
+Bitrate tuning, rate-control-mode changes, and packet/network analysis
+(Parts K/L/M/R of the original investigation plan) are **not** the right
+next step until this is root-caused; per the plan's own explicit
+instruction, they were deliberately not pursued yet. This also is **not**
+the already-fixed Milestone 4.5 array-layer driver bug (fixed and
+confirmed clean separately) and **not** eliminated by the HOST_COHERENT
+fix above (both already ruled out by direct live testing).
+
+**This matches a previously-noted, never-root-caused issue from earlier
+in this project** — commit `33895ed6`'s own message: *"A separate,
+differently-shaped corruption (structured block-level noise, not the
+same visual signature as before) still appears on the right eye under
+sustained load, with zero IDR/desync/partial-loss events logged — not
+yet root-caused."* That note predates even the Milestone 4.5 array-layer
+investigation and its fix. This strongly suggests it's the **same
+long-standing, still-unresolved issue**, not something newly introduced
+by any change made this session.
+
+**Not yet determined / next steps**: exact root mechanism (application-side
+per-frame resource contention during the now-concurrent per-stream
+`encode()` calls introduced in `89655cd4`, vs. a genuine transient vendor
+VPU hiccup under load, vs. something else entirely); whether it correlates
+with thermal state, CPU scheduling, or session duration ("sustained load"
+in the old note); whether both streams are equally affected or one more
+than the other. The full pipelined-readback-ring rewrite (Parts C-H of
+the original plan) has not been started — deliberately paused to report
+this finding first, since it changes what "quality" work is actually
+worth doing next.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
