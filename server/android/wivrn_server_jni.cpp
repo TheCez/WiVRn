@@ -67,19 +67,25 @@ namespace
 
 // Milestone 5 diagnostic toggle (docs/ANDROID_PORT.md's perf branch entry,
 // the encoder/readback investigation): Android apps don't inherit shell
-// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG (all
-// checked via plain getenv() deeper in the server) need an explicit
+// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG/
+// WIVRN_ONLY_STREAM (all checked via plain getenv() deeper in the server
+// -- portable, since compositor.cpp is shared with the desktop build and
+// can't use <sys/system_properties.h> directly) need an explicit
 // setenv() somewhere on this side -- but unlike the one-off temporary
 // setenv() calls used for earlier investigations (e.g. the since-removed
-// version in commit 89655cd4), this reads a real Android system property
+// version in commit 89655cd4), this reads real Android system properties
 // so the diagnostics can be toggled per-run without rebuilding/reinstalling:
 //   adb shell setprop debug.wivrn.dump 1
-// before starting the server app enables all three; unset (the default)
-// costs nothing beyond one __system_property_get() call at startup. Left
-// in permanently -- this corruption investigation is still open, unlike
-// past ones that got fully closed out.
+// before starting the server app enables the dump/timing trio; unset
+// (the default) costs nothing beyond two __system_property_get() calls
+// at startup. Left in permanently -- this corruption investigation is
+// still open, unlike past ones that got fully closed out.
 void apply_debug_dump_property()
 {
+	char only_stream[PROP_VALUE_MAX] = {};
+	if (__system_property_get("debug.wivrn.only_stream", only_stream) > 0 and only_stream[0] != '\0')
+		setenv("WIVRN_ONLY_STREAM", only_stream, 1);
+
 	char value[PROP_VALUE_MAX] = {};
 	if (__system_property_get("debug.wivrn.dump", value) <= 0 or value[0] == '\0')
 		return;

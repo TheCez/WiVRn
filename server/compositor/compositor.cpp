@@ -66,6 +66,18 @@ static auto renderdoc()
 
 DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 
+// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch entry): the
+// investigation's "run one eye / one encoder only" isolation step, to
+// determine whether the NV12-input corruption (proven present before
+// MediaCodec ever sees it) is specific to concurrent per-stream
+// operation. -1 (default) = both eyes run normally; 0 or 1 = only that
+// stream_idx gets a real present_image()/encode() -- the other
+// encoder object still exists but is never fed a frame. Set via the
+// Android system property debug.wivrn.only_stream (forwarded to this
+// env var by wivrn_server_jni.cpp's apply_debug_dump_property()) or
+// directly via WIVRN_ONLY_STREAM on desktop.
+DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
+
 namespace details
 {
 template <auto Method, typename Result, typename... Args>
@@ -472,6 +484,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
+		else if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
+			continue;
 		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
 		{
 			image_barriers.push_back(
@@ -535,6 +549,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
+			continue;
+		if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
 			continue;
 		encoder->present_image(
 		        stream_vk_image(encoder->stream_idx),
@@ -696,6 +712,8 @@ void compositor::encoder_work(std::stop_token tok)
 			beman::inplace_vector::inplace_vector<std::jthread, 3> workers;
 			for (auto & encoder: encoders)
 			{
+				if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
+					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
 				{
 					workers.emplace_back([&, e = encoder.get()] {
