@@ -1116,12 +1116,15 @@ harness's own desktop-side validation-layer runs (`vulkan-validationlayers`,
 already installed via apt) caught the real bug (a stale text-format `.spv`
 artifact, not the shader) before Android-side validation was ever required.
 
-## Milestone 4.6 — INVESTIGATED: no usable public zero-copy MediaCodec
-## input path found on this device/firmware, across all three public API
-## families (Surface via Vulkan WSI, Surface via EGL, Block Model +
-## direct HardwareBuffer). Block Model's MediaCodec side genuinely works
-## (Checkpoint 1) but the Vulkan-side write path into the exact buffer
-## shape it accepts does not exist on this driver (Checkpoint 2)
+## Milestone 4.6 — EXHAUSTIVELY INVESTIGATED: no usable public zero-copy
+## MediaCodec input path found on this device/firmware. Tried: both
+## Surface-input mechanisms (Vulkan WSI, EGL); Block Model + direct
+## HardwareBuffer (MediaCodec side genuinely works -- Checkpoint 1); and
+## every public GPU-write mechanism into that HardwareBuffer, including
+## the two extensions purpose-built for this exact scenario
+## (VK_ANDROID_external_format_resolve, GL_EXT_YUV_target) -- both
+## present, enabled, correctly used, and both fail at the driver level
+## (Checkpoint 2)
 
 `video_encoder_mediacodec.h`'s own `ponytail:` comment named this as the
 real upgrade path over the current GPU-copy-to-host-buffer-then-`memcpy`
@@ -1348,26 +1351,93 @@ image — not usable for `QueueRequest.setHardwareBuffer()`'s image input
 regardless). Not actionable within this project's public-API-only
 constraint; not pursued further.
 
+### Update: PATH A (`VK_ANDROID_external_format_resolve`) and PATH B
+### (`GL_EXT_YUV_target`) — the two extensions purpose-built for exactly
+### this scenario — both tried, both fail at the driver level
+
+The `STORAGE=0`/export-OOM findings above don't end the investigation on
+their own: Android and Khronos ship two extensions specifically designed
+to render into an opaque external-format YUV `AHardwareBuffer` without
+`STORAGE`/plain `TRANSFER` — `VK_ANDROID_external_format_resolve`
+(Vulkan) and `GL_EXT_YUV_target` (GLES). Both were tried in full,
+end-to-end, before concluding anything.
+
+**PATH A — `VK_ANDROID_external_format_resolve`** (probes
+`vk_ext_format_resolve_probe.c`, `vkyuvresolve.c` + `YuvResolveTest.java`):
+extension present, `externalFormatResolve` feature `VK_TRUE`,
+`colorAttachmentFormat=37` (`VK_FORMAT_R8G8B8A8_UNORM`, renderable) for
+the exact `externalFormat=0x301` Checkpoint 1's buffer uses. Built the
+full render+resolve pipeline (tried both the `nullColorAttachmentWithExternalFormatResolve`
+implicit-attachment form and an explicit real RGBA attachment +
+`resolveImageView` form). **Every Vulkan call succeeds**
+(`vkCreateImage`/`vkAllocateMemory`/`vkBindImageMemory`/`vkCreateImageView`/
+`vkQueueSubmit`/`vkWaitForFences`, all 60 frames, `VK_SUCCESS`
+throughout), and MediaCodec produces 60 real encoded AVC frames — but
+**the write is a silent no-op**, proven three independent ways: (1)
+swapping the fragment shader three times (quadrants → gradient →
+magenta) produces byte-for-byte identical (same MD5) `.h264` output
+regardless of shader content; (2) the shader itself is independently
+proven correct — the identical shader rendering into a real,
+CPU-readable RGBA image (no AHB, no resolve) gives exactly the right
+per-quadrant RGB values via `vkCmdCopyImageToBuffer` readback; (3) a
+diagnostic buffer with added CPU-read usage, rendered with solid
+magenta, then `AHardwareBuffer_lockPlanes()`'d directly: **Y=0 at every
+sample point**. A genuine driver-side silent failure — this extension is
+`SPEC_VERSION=1`, brand new — not an application bug.
+
+**PATH B — `GL_EXT_YUV_target`** (probes `egl_gles_ext_probe.c`,
+`glyuvtarget.c` + `GlYuvTargetTest.java`): all required extensions
+present (`GL_EXT_YUV_target`, `GL_OES_EGL_image_external[_essl3]`,
+`GL_OES_EGL_image`, `EGL_ANDROID_get_native_client_buffer`,
+`EGL_ANDROID_image_native_buffer`, `EGL_KHR_image_base`). The AHB
+bridges to an `EGLImage` cleanly (`eglGetNativeClientBufferANDROID` +
+`eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)`, both `EGL_SUCCESS`). But
+**it can never be attached to an FBO as a write target**: tried both
+valid OES binding mechanisms — `GL_TEXTURE_EXTERNAL_OES` via
+`glEGLImageTargetTexture2DOES` (+ `glFramebufferTexture`, since
+`glFramebufferTexture2D`'s `textarget` param doesn't accept
+`EXTERNAL_OES`), and `GL_RENDERBUFFER` via
+`glEGLImageTargetRenderbufferStorageOES` (+ `glFramebufferRenderbuffer`,
+the mechanism `GL_OES_EGL_image` actually defines for write targets) —
+also tried binding the `layout(yuv)` program before the completeness
+check in case of ordering sensitivity. **Every variant gives the
+identical result**: zero GL errors at any step, but
+`glCheckFramebufferStatus` returns exactly `0` — not
+`GL_FRAMEBUFFER_COMPLETE` (`0x8CD5`) nor any other spec-defined status
+enum (all are non-zero). A genuine driver contract violation, not a
+binding-mechanism mistake (two independently-correct mechanisms fail
+identically).
+
+**Secondary (Step 16, PRIVATE/implementation-defined format)**:
+confirmed on both surfaces — no `PRIVATE` constant exists in
+`android/hardware_buffer.h` (native) nor in `android.hardware.HardwareBuffer`'s
+public constants (`javap`-verified: only named formats). Not obtainable
+through any public API.
+
 **Conclusion for Checkpoint 2, precisely**: on this Pixel 10 Pro XL,
 MediaCodec's block-model `HardwareBuffer` input (Checkpoint 1) is **not**
-the blocker — it works perfectly. The blocker is one layer earlier:
-**this device's gralloc allocator exposes the exact `YCBCR_420_888`
-buffer shape MediaCodec accepts to Vulkan only as an opaque external
-format with no legal GPU write path** on this driver — `STORAGE` is
-unsupported (real, tested), `TRANSFER`-based copy needs a same-format
-source that's unobtainable (reasoned from spec, not live-tested), and
-the "Vulkan-first, full control" alternative fails at actual memory
-allocation despite passing its own capability query (real, tested). The
-only way found to legally put pixel content into any AHardwareBuffer
-MediaCodec's block model accepts, on this device, is a CPU lock
-(`AHardwareBuffer_lockPlanes()` — exactly what Checkpoint 1's
-`hwbfill.c` already does). Combined with Milestone 4.6's Surface-input
-findings: **no usable public zero-copy MediaCodec input path has been
-found on this device/firmware**, across all three public API families
-tried (Surface via Vulkan WSI, Surface via EGL, and now Block Model +
-direct `HardwareBuffer`) — still deliberately not phrased as "impossible
-on this hardware," since each failure has a specific, different, named
-cause rather than a single proven hardware ceiling.
+the blocker — it works perfectly. Every public GPU-write mechanism into
+a MediaCodec-accepted YUV `HardwareBuffer` has now been tried: Vulkan
+`STORAGE` (unsupported), Vulkan `TRANSFER`-copy from a concrete source
+(spec-illegal, reasoned not live-tested), Vulkan-first export
+(`vkAllocateMemory` fails despite passing its capability query),
+`VK_ANDROID_external_format_resolve` (every call succeeds, write
+silently discarded), `GL_EXT_YUV_target` (framebuffer never becomes
+usable, no error given), and PRIVATE format (not reachable via public
+API). The two extensions *specifically built* for this exact scenario
+are both present, enabled, and used correctly by multiple
+independently-verified implementation variants — and both fail at the
+driver level. The only way found to legally put pixel content into any
+AHardwareBuffer MediaCodec's block model accepts, on this device, is a
+CPU lock (`AHardwareBuffer_lockPlanes()` — exactly what Checkpoint 1's
+`hwbfill.c` already does). Combined with the Surface-input findings:
+**no usable public zero-copy MediaCodec input path has been found on
+this device/firmware** — still deliberately not phrased as "impossible
+on this hardware," since every failure has a specific, distinct, named
+cause (mostly real empirical driver failures, one spec-reasoned) rather
+than a single proven hardware ceiling. If revisited on different
+hardware/firmware, all probes in `ForeverXR/tools/foveation-pc-test/`
+are directly reusable — re-run them first.
 
 Returning to optimizing the working ByteBuffer/NV12 path is the
 concrete next step (the pixelation reported after Milestone 4.5's
