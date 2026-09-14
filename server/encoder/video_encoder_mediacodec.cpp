@@ -399,6 +399,16 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	size_t payload_size = in[slot].buffer.info().size;
 	auto * src = (uint8_t *) in[slot].buffer.map();
 
+	// Real, confirmed finding on this device (see the HOST_COHERENT log
+	// at construction, above): this staging buffer's memory type is
+	// HOST_VISIBLE but NOT HOST_COHERENT, so the GPU's
+	// vkCmdCopyImageToBuffer write (present_image()) is not guaranteed
+	// visible to this CPU read without an explicit invalidate first --
+	// this was previously missing. No-op-cheap if the type were ever
+	// coherent instead (VMA checks internally), so this is safe to leave
+	// unconditional rather than branch on the one-time property log.
+	in[slot].buffer.invalidate();
+
 	// AMEDIAFORMAT_KEY_MAX_INPUT_SIZE (ensure_codec(), above) should make
 	// this impossible now -- keep the check anyway rather than silently
 	// std::min()-ing and truncating the frame again if it ever isn't. This

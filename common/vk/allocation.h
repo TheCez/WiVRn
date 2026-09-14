@@ -33,6 +33,13 @@ struct basic_allocation_traits_base
 {
 	static void * map(VmaAllocation allocation);
 	static void unmap(VmaAllocation allocation);
+	// No-op if the allocation's memory type is already HOST_COHERENT
+	// (VMA checks internally) -- always safe/cheap to call rather than
+	// tracking coherence yourself. Needed before a CPU read of memory a
+	// GPU write may have landed in but not yet made CPU-visible; see
+	// basic_allocation::invalidate()'s own comment for why this matters
+	// on this project's Pixel target specifically.
+	static void invalidate(VmaAllocation allocation, vk::DeviceSize offset, vk::DeviceSize size);
 };
 
 template <>
@@ -240,6 +247,20 @@ public:
 
 		traits::unmap(allocation);
 		mapped = nullptr;
+	}
+
+	// Call before a CPU read of mapped memory that a GPU write (e.g.
+	// vkCmdCopyImageToBuffer) may have landed in: on memory types that
+	// are HOST_VISIBLE but not HOST_COHERENT, the GPU's write is not
+	// automatically visible to the CPU without this (real, confirmed
+	// finding on this project's Pixel target: VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+	// picks a non-coherent type there for the mediacodec encoder's
+	// staging buffer -- see video_encoder_mediacodec.cpp's own log at
+	// construction). Cheap/no-op if the type is already coherent (VMA
+	// checks internally), so unconditional calls are fine.
+	void invalidate(vk::DeviceSize offset = 0, vk::DeviceSize size = VK_WHOLE_SIZE)
+	{
+		traits::invalidate(allocation, offset, size);
 	}
 
 	vk::DeviceSize size() const
