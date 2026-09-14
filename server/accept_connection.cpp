@@ -31,14 +31,27 @@
 
 std::unique_ptr<wivrn::TCP> wivrn::accept_connection(wivrn_session & cnx, std::stop_token stop, std::function<void(wivrn_session &)> tick)
 {
+#ifndef __ANDROID__
+	// On desktop, wivrn-server coordinates with a separate, system-installed
+	// Monado OpenXR service process over wivrn_ipc_socket_monado (headset
+	// connect/disconnect notifications, and a way for that process to ask
+	// this loop to stop). On Android, Monado is linked directly into this
+	// same process -- there is no separate service to coordinate with.
 	wivrn_ipc_socket_monado->send(from_monado::headset_disconnected{});
+#endif
 
 	wivrn::TCPListener listener(configuration().port);
 
+#ifndef __ANDROID__
 	pollfd fds[2]{
 	        {.fd = listener.get_fd(), .events = POLLIN},
 	        {.fd = wivrn_ipc_socket_monado->get_fd(), .events = POLLIN},
 	};
+#else
+	pollfd fds[1]{
+	        {.fd = listener.get_fd(), .events = POLLIN},
+	};
+#endif
 
 	while (not stop.stop_requested())
 	{
@@ -50,10 +63,13 @@ std::unique_ptr<wivrn::TCP> wivrn::accept_connection(wivrn_session & cnx, std::s
 
 		if (fds[0].revents & POLLIN)
 		{
+#ifndef __ANDROID__
 			wivrn_ipc_socket_monado->send(from_monado::headset_connected{});
+#endif
 			return std::make_unique<wivrn::TCP>(listener.accept().first);
 		}
 
+#ifndef __ANDROID__
 		if (fds[1].revents & POLLIN)
 		{
 			auto packet = receive_from_main();
@@ -70,6 +86,7 @@ std::unique_ptr<wivrn::TCP> wivrn::accept_connection(wivrn_session & cnx, std::s
 				           },
 				           *packet);
 		}
+#endif
 
 		if (tick)
 			tick(cnx);

@@ -20,6 +20,7 @@
 #include "foveation.h"
 
 #include "driver/xrt_cast.h"
+#include "utils/enumerate_polyfill.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "vk/specialization_constants.h"
 #include "wivrn_packets.h"

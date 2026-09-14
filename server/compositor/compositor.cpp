@@ -34,6 +34,7 @@
 #include "driver/wivrn_session.h"
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
+#include "utils/enumerate_polyfill.h"
 #include "utils/method.h"
 #include "utils/wivrn_trace.h"
 

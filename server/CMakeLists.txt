@@ -93,13 +93,7 @@ FetchContent_MakeAvailable(monado)
 if (WIVRN_BUILD_SERVER)
 	add_executable(wivrn-server
 			accept_connection.cpp
-			active_runtime.cpp
-			avahi_publisher.cpp
 			hostname.cpp
-			main.cpp
-			sleep_inhibitor.cpp
-			start_application.cpp
-			start_systemd_unit.cpp
 			ipc_server_cb.cpp
 			target_instance_wivrn.cpp
 			wivrn_ipc.cpp
@@ -132,7 +126,6 @@ if (WIVRN_BUILD_SERVER)
 			driver/wivrn_fb_face2_tracker.cpp
 			driver/wivrn_htc_face_tracker.cpp
 			driver/wivrn_generic_tracker.cpp
-			driver/wivrn_uinput.cpp
 			driver/wivrn_session.cpp
 			driver/wivrn_connection.cpp
 			driver/xrt_cast.cpp
@@ -141,6 +134,44 @@ if (WIVRN_BUILD_SERVER)
 			utils/wivrn_trace.cpp
 			utils/gpu_timestamp_pool.cpp
 		)
+
+	# main.cpp is the desktop entry point: it drives the D-Bus dashboard IPC
+	# (GDBus/glib/libnotify) directly, and start_systemd_unit.cpp,
+	# avahi_publisher.cpp and sleep_inhibitor.cpp exist solely to support it
+	# (each of the three has no includer anywhere else in this tree). None of
+	# that has an Android equivalent, so the whole cluster is swapped for a
+	# placeholder entry point on Android rather than #ifdef'd piecemeal.
+	# start_application.cpp (fork+exec of a desktop app, glib-based) is only
+	# used by main.cpp and start_systemd_unit.cpp, so it goes in the same
+	# bucket. wivrn_uinput.cpp opens /dev/uinput directly, which an
+	# unprivileged Android app cannot do, so it gets its own no-op
+	# implementation -- unlike the others, wivrn_session.h holds a real
+	# std::optional<wivrn_uinput> member, so it can't simply be dropped.
+	if(ANDROID)
+		target_sources(wivrn-server PRIVATE
+				android/wivrn_server_android_stub_main.cpp
+				driver/wivrn_uinput_android.cpp
+			)
+		# std::jthread/std::stop_token are used unconditionally throughout
+		# this codebase. The Android NDK's libc++ implements them, but only
+		# behind -fexperimental-library (checked against NDK r28b/Clang 19).
+		# std::chrono::zoned_time and std::ranges::enumerate_view are used
+		# behind their own feature-test guards/polyfill (see
+		# driver/configuration.cpp and utils/enumerate_polyfill.h) since
+		# zoned_time needs an IANA timezone database this libc++ wasn't
+		# built with, and enumerate_view isn't implemented at all yet.
+		target_compile_options(wivrn-server PRIVATE -fexperimental-library)
+	else()
+		target_sources(wivrn-server PRIVATE
+				active_runtime.cpp
+				avahi_publisher.cpp
+				main.cpp
+				sleep_inhibitor.cpp
+				start_application.cpp
+				start_systemd_unit.cpp
+				driver/wivrn_uinput.cpp
+			)
+	endif()
 	target_compile_features(wivrn-server PRIVATE cxx_std_20)
 	target_compile_definitions(wivrn-server PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
 
@@ -217,6 +248,9 @@ if (WIVRN_BUILD_SERVER)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::libpipewire)
 	endif()
 
+	# D-Bus dashboard IPC (GDBus codegen + glib + libnotify): desktop-only,
+	# only used by main.cpp, which itself is excluded on Android above.
+	if(NOT ANDROID)
 	# Generate dbus interface code as a separate target to avoid warnings in generated code
 	add_custom_command(OUTPUT wivrn_server_dbus.c wivrn_server_dbus.h
 			   COMMAND ${GDBUS_CODEGEN} ${CMAKE_CURRENT_SOURCE_DIR}/../dbus/io.github.wivrn.Server.xml --interface-prefix io.github.wivrn --generate-c-code wivrn_server_dbus --c-namespace Wivrn
@@ -241,6 +275,7 @@ if (WIVRN_BUILD_SERVER)
 	target_sources(wivrn-server-dbus PRIVATE
 		${CMAKE_CURRENT_BINARY_DIR}/systemd_manager.c ${CMAKE_CURRENT_BINARY_DIR}/systemd_manager.h
 		${CMAKE_CURRENT_BINARY_DIR}/systemd_unit.c ${CMAKE_CURRENT_BINARY_DIR}/systemd_unit.h)
+	endif()
 
 	target_link_libraries(
 		wivrn-server
@@ -257,13 +292,19 @@ if (WIVRN_BUILD_SERVER)
 			xrt-external-openxr
 			xrt-interfaces
 
-			PkgConfig::AVAHI
 			Eigen3::Eigen
 			wivrn-common
-			wivrn-common-server
 			wivrn-external
 			nlohmann_json::nlohmann_json
 		)
+
+	if(NOT ANDROID)
+		# wivrn-common-server (Steam/Flatpak/XDG desktop app discovery and
+		# launch): only used by main.cpp and the get_application_list
+		# handler in driver/wivrn_session.cpp, both desktop-only paths --
+		# see common/CMakeLists.txt.
+		target_link_libraries(wivrn-server PRIVATE wivrn-common-server PkgConfig::AVAHI)
+	endif()
 
 	include(CompileGLSL)
 	FetchContent_GetProperties(monado SOURCE_DIR _monado_src)

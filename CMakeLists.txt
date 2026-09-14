@@ -122,12 +122,18 @@ if (WIVRN_USE_SYSTEM_BOOST AND NEED_COMMON)
 endif()
 
 if (WIVRN_BUILD_SERVER)
-    find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
+    if (NOT ANDROID)
+        find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
+    endif()
     if (Vulkan_VERSION  VERSION_LESS "1.4.304")
         message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
     endif()
 
-    if (NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
+    # On Android, none of NVENC/VAAPI/X264/Vulkan-encode are wired up yet
+    # (no Vulkan Video encode support confirmed on the reference device, and
+    # the others are desktop-only APIs) -- encoder_settings.cpp already
+    # falls back to the always-built "raw" encoder in that case.
+    if (NOT ANDROID AND NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
         message(FATAL_ERROR "No encoder selected, use at least one of WIVRN_USE_NVENC, WIVRN_USE_VAAPI, WIVRN_USE_VULKAN_ENCODE or WIVRN_USE_X264")
     endif()
 
@@ -144,17 +150,21 @@ if (WIVRN_BUILD_SERVER)
         pkg_check_modules(libpipewire REQUIRED IMPORTED_TARGET libpipewire-0.3)
     endif()
 
-    pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
     find_package(Eigen3 REQUIRED)
     find_package(nlohmann_json REQUIRED)
     find_package(CLI11 REQUIRED)
 
-    pkg_check_modules(glib2 REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2.0)
-
-    pkg_check_modules(libnotify REQUIRED IMPORTED_TARGET libnotify)
+    # Avahi (mDNS publish) and the D-Bus dashboard IPC (glib2, libnotify) are
+    # desktop-only; server/CMakeLists.txt excludes their only callers
+    # (avahi_publisher.cpp, main.cpp) from the Android build.
+    if (NOT ANDROID)
+        pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
+        pkg_check_modules(glib2 REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2.0)
+        pkg_check_modules(libnotify REQUIRED IMPORTED_TARGET libnotify)
+    endif()
 endif()
 
-if (WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER)
+if ((WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER) AND NOT ANDROID)
     pkg_check_modules(librsvg-2.0 REQUIRED IMPORTED_TARGET librsvg-2.0)
     find_package(LibArchive REQUIRED)
     find_package(PNG REQUIRED)
@@ -208,7 +218,11 @@ if (WIVRN_BUILD_CLIENT AND NOT ANDROID)
     endif()
 endif()
 
-if(ANDROID)
+# native_app_glue is only needed by the client (a NativeActivity app) --
+# server/CMakeLists.txt's wivrn-server is a plain executable and doesn't
+# link against it. AndroidNdkModules.cmake no longer ships with CMake, so
+# only pull it in when it's actually needed.
+if(ANDROID AND WIVRN_BUILD_CLIENT)
     set(ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
     set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
     include(AndroidNdkModules)

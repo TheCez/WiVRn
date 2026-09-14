@@ -26,7 +26,10 @@ add_library(wivrn-common STATIC EXCLUDE_FROM_ALL
     vk/vk_mem_alloc.cpp
 )
 
-if (WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER)
+if ((WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER) AND NOT ANDROID)
+    # Desktop app discovery/launch (Steam/Flatpak/XDG): not linked by the
+    # Android build of wivrn-server -- see server/CMakeLists.txt and
+    # driver/wivrn_session.cpp's get_application_list handler.
     add_library(wivrn-common-server STATIC EXCLUDE_FROM_ALL
         application.cpp
         utils/flatpak.cpp

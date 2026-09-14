@@ -20,6 +20,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "utils/enumerate_polyfill.h"
 #include "wivrn-server_shaders.h"
 #include "wivrn_config.h"
 

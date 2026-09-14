@@ -21,6 +21,7 @@
 #include "driver/configuration.h"
 #include "driver/wivrn_session.h"
 #include "util/u_logging.h"
+#include "utils/enumerate_polyfill.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "video_encoder.h"
 #include "wivrn_packets.h"

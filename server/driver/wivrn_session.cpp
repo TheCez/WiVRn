@@ -21,13 +21,17 @@
 #include "wivrn_session.h"
 
 #include "accept_connection.h"
-#include "application.h"
 #include "configuration.h"
 #include "driver/app_pacer.h"
 #include "driver/xrt_cast.h"
 #include "server/ipc_server.h"
-#include "utils/load_icon.h"
 #include "utils/method.h"
+#ifndef __ANDROID__
+// Desktop app discovery/launch (Steam/Flatpak/XDG) -- see
+// get_application_list below and common/CMakeLists.txt.
+#include "application.h"
+#include "utils/load_icon.h"
+#endif
 #include "utils/scoped_lock.h"
 #include "utils/wivrn_trace.h"
 
@@ -885,6 +889,7 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 	        .variant = std::move(request.variant),
 	};
 
+#ifndef __ANDROID__
 	auto apps = list_applications();
 
 	for (const auto & [id, app]: apps)
@@ -894,8 +899,12 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 		        // FIXME: use locale
 		        app.name.at(""));
 	}
+#endif
 	send_control(std::move(response));
 
+#ifndef __ANDROID__
+	// Android has nothing to list: the streamed app is wivrn-server's own
+	// host process, not something launched from a desktop app picker.
 	for (const auto & [id, app]: apps)
 	{
 		if (app.icon_path)
@@ -926,6 +935,7 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 			}
 		}
 	}
+#endif
 }
 
 void wivrn_session::operator()(const from_headset::start_app & request)

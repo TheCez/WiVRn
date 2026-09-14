@@ -35,6 +35,7 @@
 #include "layer_squasher.h"
 
 #include "driver/wivrn_hmd.h"
+#include "utils/enumerate_polyfill.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "vk/specialization_constants.h"
 
