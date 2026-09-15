@@ -1592,19 +1592,66 @@ memory-visibility handling around it (the `HOST_COHERENT` invalidate fix
 above was real and necessary, but demonstrably not sufficient — the
 corruption persists with it in place).
 
-**Next steps** (not yet started): investigate the GPU/readback/sync path
-directly per the plan's remaining items — run one eye's encoder only vs.
-both concurrently (isolate whether this is a resource-contention/race
-condition specific to concurrent per-stream operation, `89655cd4`'s
-concurrent `encode()` change being one candidate), temporarily serialize
-the two streams' GPU copy submissions, and correlate corrupted frames
-against GPU fence-wait duration, staging slot, and thermal/load state
-(the `frame_timing_stats` instrumentation and the one `ECOServiceStatsProvider`
-asymmetry noted earlier are available for this but not yet correlated).
-Bitrate/rate-control tuning and network/packet analysis remain explicitly
-out of scope until this is resolved — confirmed twice over now (network
-ruled out by the encoder-side capture; MediaCodec/encoder ruled out by
-this NV12 capture) that neither is the cause.
+### Isolation result: concurrent operation of both streams is a major amplifying factor
+
+Per the plan's "run one eye / one encoder only" step, a committed
+diagnostic toggle was added (commit `6531aec2`): `WIVRN_ONLY_STREAM`
+(`-1` default = both streams run normally; `0`/`1` = only that
+`stream_idx` gets `present_image()`/`encode()` calls at all — the other
+encoder object exists but is never fed a frame or given a worker
+thread). **On Android, this specific mechanism (Monado's
+`DEBUG_GET_ONCE_NUM_OPTION`) reads an Android system property directly
+— `debug.xrt.WIVRN_ONLY_STREAM` — bypassing `getenv()`/env vars
+entirely**, confirmed by reading `u_debug.c`'s Android-specific
+`get_option_raw()`; this is different from `WIVRN_DUMP_VIDEO`/
+`WIVRN_DUMP_NV12`/`WIVRN_TIMING_LOG` (plain `getenv()`-based, genuinely
+need the env-var forwarding `apply_debug_dump_property()` provides). A
+`debug.wivrn.only_stream`-to-`WIVRN_ONLY_STREAM`-env-var forwarding path
+was added first, based on the incorrect assumption both mechanisms
+worked the same way, and confirmed inert (stream 0 kept producing output
+despite being "disabled") before this was traced down — worth knowing if
+touching this code again: **set `debug.xrt.WIVRN_ONLY_STREAM` directly
+on Android**, don't rely on the env-var forwarding for options read via
+Monado's own `DEBUG_GET_ONCE_*` macros.
+
+Three ~45-second live sessions, same method as above (WIVRN_DUMP_VIDEO
+capture, independent PC decode, per-frame near-black-pixel scan
+excluding the initial loading-splash frames):
+
+| Configuration | Frames | Flagged corrupted | Rate |
+|---|---|---|---|
+| Left eye (stream 0) alone | 3108 | 15 | **0.48%** |
+| Right eye (stream 1) alone | 3276 | ~53 | **~1.6%** |
+| Both eyes concurrent (earlier capture) | 18339 | 1496 | **~8.2%** |
+
+**Conclusion**: running both streams concurrently produces roughly
+**4-15× more corruption** than either stream running alone — decisive
+evidence that concurrent per-stream operation (GPU copy submission
+and/or `encode()`'s hardware-encoder interaction) is a major amplifying
+factor, not merely a random transient VPU hiccup independent of load.
+A smaller baseline of corruption exists even with a single stream
+running alone, and right eye alone is consistently ~3× worse than left
+eye alone (matching the historical note's specific call-out of the
+right eye) — suggesting **two separate, stackable contributing causes**:
+some inherent stream-0-vs-1 asymmetry, and a much larger
+concurrency-related contribution.
+
+**Next steps** (not yet started): narrow down the concurrency mechanism
+specifically — the concurrent per-stream `encode()` worker threads
+introduced in `89655cd4` are the most direct suspect (temporarily
+serializing them, per the plan's step 4, is the next cheap experiment),
+but the shared render-thread GPU submission path (`layer_commit()`
+submits one compute dispatch feeding both streams' images, then calls
+each encoder's `present_image()` in sequence on the same thread — see
+"Part A" pipeline mapping earlier in this milestone) is also a candidate
+and isn't ruled out by this test alone. Correlate corrupted frames
+against the existing `frame_timing_stats` GPU fence-wait data and the
+one `ECOServiceStatsProvider` asymmetry noted earlier (not yet done).
+Bitrate/rate-control tuning and network/packet analysis remain
+explicitly out of scope until this is resolved — confirmed multiple
+times now (network ruled out by the encoder-side capture; MediaCodec/
+encoder ruled out by the NV12 capture; now further localized to
+concurrency specifically) that none of those are the cause.
 
 The full pipelined-readback-ring rewrite (Parts C-H of the original
 readback-pipelining plan) remains paused — correctly, per the decision

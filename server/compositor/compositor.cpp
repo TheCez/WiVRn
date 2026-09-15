@@ -72,10 +72,17 @@ DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 // MediaCodec ever sees it) is specific to concurrent per-stream
 // operation. -1 (default) = both eyes run normally; 0 or 1 = only that
 // stream_idx gets a real present_image()/encode() -- the other
-// encoder object still exists but is never fed a frame. Set via the
-// Android system property debug.wivrn.only_stream (forwarded to this
-// env var by wivrn_server_jni.cpp's apply_debug_dump_property()) or
-// directly via WIVRN_ONLY_STREAM on desktop.
+// encoder object still exists but is never fed a frame. Result so far:
+// concurrent operation is a major amplifying factor (~4-15x more
+// corruption with both streams active vs. either alone) -- see the doc.
+//
+// To set: on Android, this specific macro's DEBUG_GET_ONCE_NUM_OPTION
+// backend (u_debug.c) reads an Android system property DIRECTLY,
+// bypassing getenv()/setenv() entirely --
+//   adb shell setprop debug.xrt.WIVRN_ONLY_STREAM 0     (or 1)
+// (confirmed the hard way: an env-var-forwarding attempt via
+// wivrn_server_jni.cpp was silently inert). On desktop, the same macro
+// reads the WIVRN_ONLY_STREAM env var normally.
 DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
 
 namespace details

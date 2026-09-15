@@ -67,25 +67,32 @@ namespace
 
 // Milestone 5 diagnostic toggle (docs/ANDROID_PORT.md's perf branch entry,
 // the encoder/readback investigation): Android apps don't inherit shell
-// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG/
-// WIVRN_ONLY_STREAM (all checked via plain getenv() deeper in the server
-// -- portable, since compositor.cpp is shared with the desktop build and
-// can't use <sys/system_properties.h> directly) need an explicit
+// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG (all
+// checked via plain getenv() deeper in the server) need an explicit
 // setenv() somewhere on this side -- but unlike the one-off temporary
 // setenv() calls used for earlier investigations (e.g. the since-removed
-// version in commit 89655cd4), this reads real Android system properties
+// version in commit 89655cd4), this reads a real Android system property
 // so the diagnostics can be toggled per-run without rebuilding/reinstalling:
 //   adb shell setprop debug.wivrn.dump 1
 // before starting the server app enables the dump/timing trio; unset
-// (the default) costs nothing beyond two __system_property_get() calls
-// at startup. Left in permanently -- this corruption investigation is
-// still open, unlike past ones that got fully closed out.
+// (the default) costs nothing beyond one __system_property_get() call at
+// startup. Left in permanently -- this corruption investigation is still
+// open, unlike past ones that got fully closed out.
+//
+// NOTE, confirmed the hard way: WIVRN_ONLY_STREAM (compositor.cpp's
+// stream-isolation toggle) deliberately does NOT get a setenv() here.
+// It's read via Monado's own DEBUG_GET_ONCE_NUM_OPTION, whose Android
+// backend (u_debug.c's get_option_raw()) reads an Android system
+// property DIRECTLY -- "debug.xrt.<NAME>" -- and never calls getenv()
+// at all on this platform, unlike desktop's build of the same macro. An
+// earlier version of this function forwarded a debug.wivrn.only_stream
+// property to a WIVRN_ONLY_STREAM env var here, which was silently inert
+// (confirmed live: the "disabled" stream kept producing output). To
+// actually toggle it on Android: `adb shell setprop
+// debug.xrt.WIVRN_ONLY_STREAM 0` (or 1), no code path through this file
+// at all.
 void apply_debug_dump_property()
 {
-	char only_stream[PROP_VALUE_MAX] = {};
-	if (__system_property_get("debug.wivrn.only_stream", only_stream) > 0 and only_stream[0] != '\0')
-		setenv("WIVRN_ONLY_STREAM", only_stream, 1);
-
 	char value[PROP_VALUE_MAX] = {};
 	if (__system_property_get("debug.wivrn.dump", value) <= 0 or value[0] == '\0')
 		return;
