@@ -27,7 +27,26 @@
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_limits.h"
+#include "util/u_debug.h"
 #include "util/u_logging.h"
+
+// Stereo-fusion diagnostic (docs/ANDROID_PORT.md, VRChat/Adreno stereo
+// investigation): forces compute_params()'s foveation CENTER to dead-ahead
+// (angle 0) for both axes of both eyes, ignoring gaze/eye-position/the
+// natural-gaze-down-10-degrees adjustment entirely, while leaving the
+// actual compression ratio/math untouched (forcing "no compression" outright
+// crashes -- fill_ubo() asserts count>0, since our encode resolution here is
+// genuinely smaller than VRChat's real render resolution, confirmed live:
+// this device hit that assertion with extent_w > foveated_size.width).
+// Tests whether an eye-position/gaze-dependent ASYMMETRY between the two
+// eyes' foveation centers (not foveation/compression itself) is the source
+// of a warped/wobbly or vertically-mismatched per-eye image.
+// `adb shell setprop debug.xrt.WIVRN_DISABLE_FOVEATION 1` on Android;
+// WIVRN_DISABLE_FOVEATION env var on desktop.
+DEBUG_GET_ONCE_NUM_OPTION(disable_foveation, "WIVRN_DISABLE_FOVEATION", 0)
+
+// See its own call site's comment, below.
+DEBUG_GET_ONCE_NUM_OPTION(log_foveation_ubo, "WIVRN_LOG_FOVEATION_UBO", 0)
 
 #include <array>
 #include <cmath>
@@ -398,11 +417,13 @@ void foveation::compute_params()
 	{
 		const auto & fov = last.fovs[i];
 
+		bool neutral = debug_get_num_option_disable_foveation();
+
 		size_t extent_w = std::abs(last.src[i].extent.w);
 		if (foveated_size.width < extent_w)
 		{
 			auto distance = manual_foveation.enabled ? manual_foveation.distance : convergence_distance;
-			auto angle_x = convergence_angle(distance, eye_x[i], -e.x);
+			auto angle_x = neutral ? 0.0 : convergence_angle(distance, eye_x[i], -e.x);
 			auto center = angles_to_center(angle_x, fov.angle_left, fov.angle_right);
 			fill_param_2d(center, foveated_size.width, extent_w, params[i].x);
 		}
@@ -412,8 +433,8 @@ void foveation::compute_params()
 		size_t extent_h = std::abs(last.src[i].extent.h);
 		if (foveated_size.height < extent_h)
 		{
-			auto angle_y = -e.y;
-			if (is_zero_quat(gaze) and not manual_foveation.enabled)
+			auto angle_y = neutral ? 0.0 : -e.y;
+			if (not neutral and is_zero_quat(gaze) and not manual_foveation.enabled)
 			{
 				// Natural gaze is not straight forward, adjust the angle
 				angle_y += angle_offset;
@@ -614,6 +635,36 @@ void foveation::update_ubo(
 		         extent,
 		         foveated_size.height);
 	}
+	// Stereo-fusion diagnostic (docs/ANDROID_PORT.md): logs the raw
+	// per-eye source rect (to check for a flip/sign asymmetry between
+	// eyes) and the first/last few x-index table entries actually written
+	// into the UBO the foveation.comp shader indexes with (to directly
+	// catch an unsigned underflow/huge-value bug at the edge buckets,
+	// rather than inferring one from source reading alone). Confirmed
+	// live on the Adreno/Turnip tablet: both eyes' tables are clean,
+	// monotonic, correctly bounded -- ruling out an underflow here as the
+	// cause of the right-eye seam found downstream of this point.
+	// `adb shell setprop debug.xrt.WIVRN_LOG_FOVEATION_UBO 1`.
+	if (debug_get_num_option_log_foveation_ubo())
+	{
+	for (size_t view = 0; view < 2; ++view)
+	{
+		auto xspan = std::span(ubo.x + view * RENDER_FOVEATION_BUFFER_DIMENSIONS, RENDER_FOVEATION_BUFFER_DIMENSIONS);
+		U_LOG_E("DIAG3 view=%zu src_rect offset=(%d,%d) extent=(%d,%d) foveated_size=(%u,%u) params.x.size=%zu params.y.size=%zu",
+		        view,
+		        src_rect[view].offset.w, src_rect[view].offset.h,
+		        src_rect[view].extent.w, src_rect[view].extent.h,
+		        foveated_size.width, foveated_size.height,
+		        params[view].x.size(), params[view].y.size());
+		U_LOG_E("DIAG3 view=%zu ubo.x[0..4]=%u,%u,%u,%u,%u ubo.x[last-4..last]=%u,%u,%u,%u,%u",
+		        view,
+		        xspan[0], xspan[1], xspan[2], xspan[3], xspan[4],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 5], xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 4],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 3], xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 2],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 1]);
+	}
+	}
+
 	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffer, 0, sizeof(ubo));
 	std::memcpy(gpu_buffer.data<ubo_data>(), &ubo, sizeof(ubo));
 }

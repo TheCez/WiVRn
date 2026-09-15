@@ -56,6 +56,23 @@ DEBUG_GET_ONCE_NUM_OPTION(force_gpu_wait, "WIVRN_FORCE_GPU_WAIT", 0)
 // debug.xrt.WIVRN_HOST_IMAGE_COPY 1`.
 DEBUG_GET_ONCE_NUM_OPTION(host_image_copy, "WIVRN_HOST_IMAGE_COPY", 0)
 
+// Stereo-fusion diagnostic (docs/ANDROID_PORT.md, VRChat/Adreno stereo
+// investigation): swaps which array layer each stream_idx reads its pixel
+// content from (0<->1 only, alpha stream 2 untouched), while every other
+// per-stream identity (stream_idx itself, and the pose/fov this stream's
+// shard.view_info carries) stays exactly as before. If this measurably
+// fixes/changes the headset's stereo sensation, the two eyes' encoded
+// video content is associated with the wrong stream somewhere upstream of
+// this read (compositor render target assignment); if not, the desync
+// isn't a left/right content swap at this level. Deliberately only the
+// encoder's own read-side derivation (this function) -- NOT compositor.cpp's
+// image_layer(), which also governs where the compositor renders each eye
+// TO and where its own compute/copy passes write, so touching it would
+// change rendering, not just which content is encoded on which channel.
+// `adb shell setprop debug.xrt.WIVRN_SWAP_EYE_LAYERS 1` on Android;
+// WIVRN_SWAP_EYE_LAYERS env var on desktop.
+DEBUG_GET_ONCE_NUM_OPTION(swap_eye_layers, "WIVRN_SWAP_EYE_LAYERS", 0)
+
 namespace
 {
 // MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar (Java-side
@@ -313,7 +330,10 @@ void wivrn::video_encoder_mediacodec::push_async(std::span<const uint8_t> payloa
 
 uint32_t wivrn::video_encoder_mediacodec::image_layer() const
 {
-	return vk.multi_layer_stream_images ? stream_idx : 0;
+	uint8_t effective_stream_idx = stream_idx;
+	if (stream_idx < 2 and debug_get_num_option_swap_eye_layers())
+		effective_stream_idx = 1 - stream_idx;
+	return vk.multi_layer_stream_images ? effective_stream_idx : 0;
 }
 
 void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)

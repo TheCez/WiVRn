@@ -26,6 +26,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <magic_enum.hpp>
 #include <openxr/openxr.h>
+#include <sys/system_properties.h>
 #define GLM_FORCE_RADIANS
 
 #include "stream.h"
@@ -52,6 +53,27 @@
 
 using namespace wivrn;
 using namespace beman::inplace_vector;
+
+namespace
+{
+// Diagnostic only (docs/ANDROID_PORT.md's stereo-desync investigation):
+// swaps which decoded eye texture/pose/fov/foveation feeds which final
+// projection view, at the last possible point before defoveation/
+// composition-layer submission -- i.e. after every other stage (server
+// render, encode, network, decode, common_frame() pairing) has already
+// run identically to the non-debug path. If this measurably changes/
+// fixes the stereo sensation, the eyes are swapped somewhere upstream of
+// this point; if not, the desync isn't a left/right swap at all.
+// `adb shell setprop debug.wivrn.swap_eyes 1` before starting the client.
+bool debug_swap_eyes()
+{
+	static const bool swap = [] {
+		char value[PROP_VALUE_MAX] = {};
+		return __system_property_get("debug.wivrn.swap_eyes", value) > 0 and value[0] == '1';
+	}();
+	return swap;
+}
+} // namespace
 
 // clang-format off
 static const std::unordered_map<std::string, device_id> device_ids = {
@@ -974,6 +996,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				images[j].layout_a = blit_handle->current_layout;
 			}
 		}
+	}
+
+	// Diagnostic only, see debug_swap_eyes()'s own comment: swaps the
+	// whole per-view bundle (texture, pose, fov, foveation) together, so
+	// a left/right swap test doesn't itself introduce a pose/texture
+	// mismatch that wouldn't exist in a real swapped-eyes bug.
+	if (view_count == 2 and debug_swap_eyes())
+	{
+		std::swap(images[0], images[1]);
+		std::swap(pose[0], pose[1]);
+		std::swap(fov[0], fov[1]);
+		std::swap(foveation[0], foveation[1]);
 	}
 
 	// Allow the headset to time warp if we are redisplaying a frame

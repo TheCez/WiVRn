@@ -118,6 +118,17 @@ DEBUG_GET_ONCE_NUM_OPTION(serialize_encode, "WIVRN_SERIALIZE_ENCODE", 0)
 // debug.xrt.WIVRN_STAGGER_US <microseconds>`.
 DEBUG_GET_ONCE_NUM_OPTION(stagger_us, "WIVRN_STAGGER_US", 0)
 
+// Milestone 8 diagnostic (docs/ANDROID_PORT.md's VRChat stereo-fusion
+// investigation): per-view pose/array_index/image_index for the fast
+// (single XRT_LAYER_PROJECTION layer) path, every frame -- confirmed live
+// that both views get correct, symmetric pose data (only X differs, by a
+// fixed IPD offset) and consistent array_index/image_index assignment,
+// ruling out our own view-extraction code as the source of the eventual
+// right-eye stereo-fusion bug traced to the Adreno/Turnip path instead.
+// Off by default (unconditional would spam every frame in production).
+// `adb shell setprop debug.xrt.WIVRN_LOG_VIEW_POSE 1`.
+DEBUG_GET_ONCE_NUM_OPTION(log_view_pose, "WIVRN_LOG_VIEW_POSE", 0)
+
 namespace details
 {
 template <auto Method, typename Result, typename... Args>
@@ -487,6 +498,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
 			auto & img = get_layer_image(layer, view, data.sub.image_index);
+
+			if (debug_get_num_option_log_view_pose())
+				U_LOG_E("view=%d image_index=%u array_index=%u pose_pos=(%f,%f,%f) pose_orient=(%f,%f,%f,%f)",
+				        view,
+				        data.sub.image_index,
+				        data.sub.array_index,
+				        data.pose.position.x, data.pose.position.y, data.pose.position.z,
+				        data.pose.orientation.x, data.pose.orientation.y, data.pose.orientation.z, data.pose.orientation.w);
 
 			src[view] = get_image_view(
 			        &img,
