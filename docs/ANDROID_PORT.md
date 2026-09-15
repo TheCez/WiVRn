@@ -2676,6 +2676,73 @@ generation (Adreno 642L, Snapdragon 778G, A6xx) — every available package is
 sourced from a materially newer chip family. Turnip remains the only route
 to a working `synchronization2`-capable driver on this hardware.
 
+### Milestone 10 follow-up — the seam is already present in VRChat's raw imported swapchain image, before WiVRn's own code ever touches it
+
+Prompted by a real architectural observation: WiVRn's compositor runs as a
+**separate OS process** from VRChat (Monado's IPC client/server split), which
+is *why* an AHardwareBuffer-backed, cross-process-shareable, 2-array-layer
+swapchain image is needed for the app at all. The historical "Cardboard
+style Monado" comparison point (`comp_window_android.c`) runs in-process with
+the app and never needs this — and is confirmed to work fine with VRChat on
+this same tablet. That difference is the whole reason to suspect the
+array-layer-1 import/read path specifically, rather than assuming the bug is
+somewhere generic in "our Monado build".
+
+**Test**: a new one-shot diagnostic, `dump_app_image_once()` in
+`server/compositor/compositor.cpp` (gated behind
+`WIVRN_DUMP_APP_IMAGE`, read live via a direct `debug_get_num_option()` call
+rather than the cached `DEBUG_GET_ONCE_NUM_OPTION` macro — see the code
+comment; the macro latches its value on first read for the rest of the
+process lifetime, which would make it impossible to toggle live once a
+one-shot flag has already fired). It uses the same proven methodology as the
+historical Milestone 4.5 investigation: a `vkCmdCopyImageToBuffer` of
+VRChat's own imported swapchain image, at the exact array layer WiVRn is
+about to read (`data.sub.array_index`), straight to a raw RGBA file —
+inserted in the fast-path loop right after `get_layer_image()` and *before*
+`get_image_view()`/anything else touches the image. This captures VRChat's
+content exactly as Monado handed it to us, before foveation, before
+encoding, before anything WiVRn-specific.
+
+Captured on the Adreno tablet (SM-X810) with VRChat actually rendering (not
+its loading splash — the one-shot had to be flipped on live via `setprop`
+once frames were confirmed flowing, since the cached-macro version would
+otherwise always capture the first, black, loading-screen frame). Raw
+buffers are 1728×1910 RGBA (matches VRChat's real swapchain extent, same
+size seen in the earlier Pixel AHardwareBuffer-allocation error).
+
+**Result**: a column-wise edge-strength scan (cumulative per-row color delta
+between adjacent columns, sampled across the full 1910-row height) found:
+- Eye 0 (left): no standout column — the highest cumulative diff is ~440,
+  consistent with ordinary gradient/dithering noise and the floating login
+  panel's own diagonal edge.
+- Eye 1 (right): column x≈383 (of 1728) has a cumulative diff of **~4200**
+  — roughly 10x every other column — a hard, consistent vertical seam
+  running the full image height, isolated to this one column, present only
+  in eye 1.
+
+This is decisive: **the seam already exists in the raw content Monado handed
+us, before WiVRn's own foveation shader or any other WiVRn-specific
+processing ever runs.** This clears `foveation.comp` (and the fast-path
+image-view/barrier code, already suspected of being innocent since it's
+shared Monado code used by the working in-process path too) of blame. The
+corruption is being introduced at or before the point where WiVRn's
+compositor first reads array layer 1 of VRChat's externally-imported,
+cross-process AHardwareBuffer-backed swapchain image — i.e. either a real
+Adreno/Turnip driver bug specifically on reads of array layer ≥1 of a
+multi-layer imported AHardwareBuffer, or VRChat/Unity's own multiview write
+into that layer. Since the in-process (no AHardwareBuffer import) Cardboard
+path doesn't exhibit this bug, the AHardwareBuffer import/read of layer 1
+specifically remains the prime suspect over "VRChat writes it wrong
+generally" (which should then also affect the in-process path).
+
+**Not yet done**: pinning down whether the seam originates on the write side
+(VRChat/Unity's own render into layer 1) or the read side (Turnip importing/
+sampling layer 1) — the next natural test would be a similar raw dump from
+inside VRChat's own process (if feasible) or testing whether a
+single-array-layer-per-eye (non-multiview) VRChat swapchain path avoids the
+seam entirely, which would squarely implicate multi-layer AHardwareBuffer
+import/export on this driver.
+
 ## Milestone 11 (new device, still open) — Galaxy S22 (Exynos 2200 / Xclipse 920): MdiEx driver test, VRChat renders nothing
 
 Separate device, separate investigation, prompted by testing whether

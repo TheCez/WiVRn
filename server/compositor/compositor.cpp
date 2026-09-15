@@ -41,6 +41,8 @@
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 
 #include <chrono>
+#include <format>
+#include <fstream>
 
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
@@ -150,6 +152,104 @@ namespace
 const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
 {
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
+}
+
+// Right-eye seam diagnostic (docs/ANDROID_PORT.md's stereo-fusion
+// investigation): same methodology as Milestone 4.5's since-removed
+// debug_dump_app_image (dump the APP'S OWN swapchain image -- the one
+// Monado handed us, before our own foveation shader ever touches it --
+// straight to a raw RGBA file via vkCmdCopyImageToBuffer). Answers: is the
+// x~=143 right-eye seam already present in what VRChat/Monado gave us (an
+// import/read issue with array layer 1 specifically), or does our own
+// foveation.comp shader introduce it? One-shot per view (a `dumped` guard,
+// not gated on frame count) -- this stalls the queue with a blocking wait,
+// fine for a single manual capture, not something to leave running.
+// `adb shell setprop debug.xrt.WIVRN_DUMP_APP_IMAGE 1`. Deliberately NOT
+// DEBUG_GET_ONCE_NUM_OPTION -- that macro latches the property's value on
+// its first read for the rest of the process lifetime (see its own
+// definition), which would make this unusable as a live toggle: flipping
+// the property after VRChat has moved past its (black) loading screen is
+// the whole point, so this re-reads the property every call instead.
+void dump_app_image_once(wivrn::vk_bundle & vk, vk::raii::CommandPool & cmd_pool, const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index, uint32_t array_index, int view)
+{
+	static std::array<bool, 2> dumped{false, false};
+	if (view < 0 or view > 1 or dumped[view] or not debug_get_num_option("WIVRN_DUMP_APP_IMAGE", 0))
+		return;
+	dumped[view] = true;
+
+	auto * sc = reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index));
+	vk::Image image = sc->vkic.images[image_index].handle;
+	vk::Extent2D extent{sc->vkic.info.width, sc->vkic.info.height};
+
+	vk::DeviceSize size = vk::DeviceSize(extent.width) * extent.height * 4;
+	buffer_allocation staging(
+	        vk.device,
+	        {
+	                .size = size,
+	                .usage = vk::BufferUsageFlagBits::eTransferDst,
+	        },
+	        {
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+	        },
+	        std::format("dump_app_image staging {}", view));
+
+	auto cmd_buffers = vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1});
+	vk::raii::CommandBuffer cmd{std::move(cmd_buffers[0])};
+	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+	vk::ImageSubresourceRange range{
+	        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	        .baseMipLevel = 0,
+	        .levelCount = 1,
+	        .baseArrayLayer = array_index,
+	        .layerCount = 1,
+	};
+	cmd.pipelineBarrier(
+	        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+	                .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+	                .image = image,
+	                .subresourceRange = range,
+	        });
+	cmd.copyImageToBuffer(
+	        image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(staging),
+	        vk::BufferImageCopy{
+	                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = array_index, .layerCount = 1},
+	                .imageExtent = {extent.width, extent.height, 1},
+	        });
+	cmd.pipelineBarrier(
+	        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .image = image,
+	                .subresourceRange = range,
+	        });
+	cmd.end();
+
+	vk::raii::Fence fence(vk.device, vk::FenceCreateInfo{});
+	{
+		vk::CommandBufferSubmitInfo cmd_info{.commandBuffer = *cmd};
+		std::unique_lock lock{vk.queue.mutex};
+		vk.queue.queue.submit2(vk::SubmitInfo2{.commandBufferInfoCount = 1, .pCommandBufferInfos = &cmd_info}, *fence);
+	}
+	if (vk.device.waitForFences(*fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	{
+		U_LOG_E("dump_app_image_once: timeout waiting for GPU, view=%d", view);
+		return;
+	}
+	staging.invalidate();
+
+	auto path = std::format("/data/data/org.meumeu.wivrn.server/files/dump_app_image_view{}.rgba", view);
+	std::ofstream f(path, std::ios::binary);
+	f.write(staging.data<char>(), size);
+	U_LOG_E("dump_app_image_once: wrote %s (%ux%u, array_layer=%u)", path.c_str(), extent.width, extent.height, array_index);
 }
 
 // Which array layer stream `stream_idx` (0=left, 1=right, 2=alpha) lives at:
@@ -498,6 +598,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
 			auto & img = get_layer_image(layer, view, data.sub.image_index);
+
+			dump_app_image_once(vk, cmd_pool, layer, view, data.sub.image_index, data.sub.array_index, view);
 
 			if (debug_get_num_option_log_view_pose())
 				U_LOG_E("view=%d image_index=%u array_index=%u pose_pos=(%f,%f,%f) pose_orient=(%f,%f,%f,%f)",
