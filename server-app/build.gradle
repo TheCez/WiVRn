@@ -138,6 +138,25 @@ android {
             aidl.srcDirs = ['../server/android/aidl']
             manifest.srcFile '../server/android/AndroidManifest.xml'
         }
+        // Debug-only: bundles the Khronos Vulkan validation layer into the
+        // APK's own native lib dir (<abi>/libVkLayer_khronos_validation.so),
+        // one of the paths the Android Vulkan loader already searches for
+        // every app (confirmed live via `adb shell setprop debug.xrt.vulkan
+        // 1`-style loader tracing: "searching for layers in
+        // '.../lib/arm64'"). This is what actually makes
+        // WIVRN_VK_VALIDATION (wivrn_vk_bundle.cpp) work -- Android's
+        // system-wide "Enable GPU debug layers" developer option / adb
+        // settings (enable_gpu_debug_layers/gpu_debug_app/gpu_debug_layers)
+        // do NOT work on this device/OS build: the loader's own debug trace
+        // never once searches /data/local/tmp/vulkan/debug, confirmed live,
+        // and enabling that mechanism process-wide also crashes the app's
+        // own hardware-accelerated UI renderer (libhwui) before the
+        // compositor's Vulkan instance is ever reached. Silently
+        // contributes nothing if the directory is absent (not fetched by
+        // this checkout) -- see docs/ANDROID_PORT.md.
+        debug {
+            jniLibs.srcDirs += ["${toolsDir}/vulkan-validation/android-binaries-1.4.357.0"]
+        }
     }
 
     buildFeatures {

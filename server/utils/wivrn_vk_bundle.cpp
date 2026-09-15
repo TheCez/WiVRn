@@ -33,6 +33,30 @@ DEBUG_GET_ONCE_NUM_OPTION(force_gpu_index, "XRT_COMPOSITOR_FORCE_GPU_INDEX", -1)
 // Default 3: left and right eye + alpha
 DEBUG_GET_ONCE_NUM_OPTION(max_vulkan_encoders, "WIVRN_MAX_VULKAN_ENCODERS", 3)
 
+// Corruption-investigation diagnostic (docs/ANDROID_PORT.md's perf branch):
+// explicitly request VK_LAYER_KHRONOS_validation for THIS instance only,
+// rather than Android's system-wide "enable GPU debug layers" developer
+// option / adb settings (enable_gpu_debug_layers/gpu_debug_app/
+// gpu_debug_layers). That mechanism does not work at all on this device/OS
+// build -- confirmed live, the Vulkan loader's own debug trace never once
+// searches /data/local/tmp/vulkan/debug (the documented location for it)
+// regardless of those settings -- and additionally injects the layer into
+// every Vulkan instance the whole process creates when it does anything,
+// including the app's own Activity/View system (libhwui's Vulkan-backed UI
+// renderer), which crashed before this instance was ever reached.
+//
+// What actually works: the layer .so is bundled directly into this
+// (debug-only) APK's own native library directory via server-app/
+// build.gradle's debug jniLibs source set -- one of the paths the loader
+// *does* search for every app, confirmed live ("searching for layers in
+// '.../lib/arm64'" in its own trace). With that in place, this explicit
+// request is enough on its own; no adb settings or pushed files needed.
+// `adb shell setprop debug.xrt.WIVRN_VK_VALIDATION 1` (no rebuild needed
+// once the debug APK is installed). Validation output arrives through the
+// existing message_callback below (severity Warning/Error already maps to
+// U_LOG_WARN/ERROR, so it's visible even without raising XRT_LOG).
+DEBUG_GET_ONCE_NUM_OPTION(vk_validation, "WIVRN_VK_VALIDATION", 0)
+
 namespace
 {
 
@@ -166,10 +190,25 @@ wivrn::vk_bundle::vk_bundle() :
 				instance_extensions.push_back(*it);
 		}
 
+		std::vector<const char *> instance_layers;
+		if (debug_get_num_option_vk_validation())
+		{
+			bool available = false;
+			for (auto & layer: vk_ctx.enumerateInstanceLayerProperties())
+				if (std::string_view(layer.layerName) == "VK_LAYER_KHRONOS_validation")
+					available = true;
+			if (available)
+				instance_layers.push_back("VK_LAYER_KHRONOS_validation");
+			else
+				U_LOG_W("WIVRN_VK_VALIDATION set but VK_LAYER_KHRONOS_validation is not available");
+		}
+
 		instance = vk::raii::Instance(
 		        vk_ctx,
 		        vk::InstanceCreateInfo{
 		                .pApplicationInfo = &app_info,
+		                .enabledLayerCount = uint32_t(instance_layers.size()),
+		                .ppEnabledLayerNames = instance_layers.data(),
 		                .enabledExtensionCount = uint32_t(instance_extensions.size()),
 		                .ppEnabledExtensionNames = instance_extensions.data(),
 		        });
