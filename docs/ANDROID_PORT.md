@@ -1745,6 +1745,100 @@ readback-pipelining plan) remains paused — correctly, per the decision
 to avoid changing pipeline timing before the root cause here is found,
 since a concurrency change could mask or alter this exact bug.
 
+**Follow-up: a fixed stagger between the two streams also does NOT fix
+it** (`f2576aeb`, `WIVRN_STAGGER_US=3000` — the render thread sleeps 3ms
+between the first and second stream's `present_image()`/encode-worker
+start each frame):
+
+| Configuration | Left | Right |
+|---|---|---|
+| Both, normal concurrent (baseline) | ~0.5-3% (varies by run) | ~8-11% |
+| Both, 3ms stagger | **7.97%** | 11.60% |
+
+Left got *worse* under staggering (7.97% vs. its usual low single digits),
+right stayed about the same. This rules out simple temporal staggering
+(at this value) as a fix too, and is consistent with the resource-
+contention hypothesis above rather than a fixable ordering/timing issue:
+spreading the two streams' work out in time didn't reduce contention, it
+just shifted which stream's work landed in the more/less loaded window.
+
+**`VK_EXT_host_image_copy` experiment (`7eb2c715`) — inconclusive, not
+recommended to pursue further without a dedicated session.** Rationale:
+this replaces the queue-submitted `vkCmdCopyImageToBuffer()` readback
+with `vkCopyImageToMemory()` (core in Vulkan 1.4, confirmed present and
+correctly reporting non-degenerate limits for this exact image shape via
+a standalone probe — see the toolchain table above), which runs
+synchronously on the host and never touches GPU queue scheduling at all —
+mechanistically different from every synchronization-based experiment
+above. Behind `WIVRN_HOST_IMAGE_COPY` (default 0, unchanged behavior).
+
+What actually happened testing it, in order:
+
+1. First live attempt: the server process SIGSEGV'd on the very first
+   frame inside `video_encoder_mediacodec::present_image()` (fault addr
+   `0x70`, null-pointer-shaped), killing `MonadoIpcService` and dropping
+   the Quest connection ("connection refused" is just what a dead
+   listener looks like from the client side).
+2. Investigating the crash, the code appeared to reference Vulkan struct
+   names (`vk::CopyImageToMemoryInfo`, `vk::ImageToMemoryCopy`,
+   `Device::copyImageToMemory` — the core, non-`EXT`-suffixed names) that
+   don't exist in `common/CMakeLists.txt`'s own separately-fetched
+   `Vulkan-Headers-vulkan-sdk-1.3.268.0` (pre-dates Vulkan 1.4). This led
+   to an incorrect diagnosis that a stray Vulkan-Headers install was
+   accidentally shadowing the pinned SDK, and — **mistakenly** —
+   `ForeverXR/tools/vulkan-headers/` (Vulkan-Headers 1.4.328) got deleted
+   to "fix" it.
+3. That directory is not stray: it's documented, load-bearing toolchain
+   infrastructure (see the toolchain table above and the entry right
+   after Milestone 4's array-layer investigation) — upstream WiVRn's own
+   `CMakeLists.txt` requires `Vulkan_VERSION >= 1.4.304` to build
+   `wivrn-server` at all, and `server-app/build.gradle` passes
+   `-DVulkan_INCLUDE_DIR=.../tools/vulkan-headers/include` specifically
+   because the NDK's own bundled headers report too old a version. The
+   core Vulkan 1.4 names in the diagnostic code were correct all along.
+   Deleting it broke the *entire* server build (`CMake Error: Vulkan
+   version must be at least 1.4.304, found`); re-downloaded
+   Vulkan-Headers v1.4.328 from upstream to restore it, and reverted the
+   EXT-suffixed rewrite back to the original core-name code once the real
+   toolchain was back in place.
+4. With the real toolchain restored (no code logic change from the
+   version that crashed), a second live attempt ran for the tested window
+   (~15s+) **without the SIGSEGV recurring** — but the Unity/Quest session
+   never reached `XR_SESSION_STATE_FOCUSED` on this run (a separate
+   connectivity issue, not a crash — server process stayed alive
+   throughout), so **no corruption-rate data was actually collected**
+   before the session ended for the day.
+
+**Status: unresolved.** The one confirmed crash is not safely attributable
+to `vkCopyImageToMemory()` itself — it happened while the build was
+(unknowingly, at the time) still using the correct headers, so the
+SIGSEGV's real cause is still unknown; it could be a genuine driver bug
+in this PowerVR driver's host-image-copy implementation (this device's
+driver has already shown multiple other Vulkan-capability-reporting bugs
+in this investigation — see `docs/pixel10-pro-xl-gpu-media-investigation.md`),
+or something in this diagnostic code itself. `WIVRN_HOST_IMAGE_COPY`
+defaults to 0 (off); the code is committed and buildable but **should not
+be re-enabled for a real test without first adding a defensive check**
+(e.g. confirm the resolved `vkCopyImageToMemory`/`vkCopyImageToMemoryEXT`
+function pointer is non-null before calling it, and/or run the very first
+frame under close, immediate crash-log watching rather than a long
+unattended capture window) — do not repeat the un-guarded retry pattern.
+
+**Session conclusion for today**: five mechanistically distinct
+mitigation attempts (plain concurrency baseline, serialize `encode()`,
+force full GPU-copy sync, 3ms stagger, host-image-copy readback) have
+been tried. Four are clean negative results; the fifth is inconclusive
+due to an unrelated build mistake consuming the retest window. The
+resource-contention hypothesis (two concurrent real-time GPU-compute +
+hardware-encode pipelines competing for the same SoC resources) remains
+the leading explanation and has not been contradicted by anything tried
+so far. Next session should either (a) retry host-image-copy once more
+with the defensive check above and a short, closely-watched first frame,
+or (b) if that's not worth the risk, move to the pacing/scheduling
+direction already proposed, or accept resource contention as a
+documented platform limitation similar to the closed zero-copy
+investigation.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
