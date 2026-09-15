@@ -48,6 +48,11 @@ set(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3   ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS    ON)
+# Steam Frame's OpenXR interaction profile -- see docs/ANDROID_PORT.md's
+# controller-support milestone. VRChat's Android build only ever suggests
+# bindings for this profile and never falls back to plain Oculus Touch, so
+# without it VRChat's controllers are entirely unbound.
+set(XRT_FEATURE_OPENXR_INTERACTION_VALVE_FRAME_CONTROLLER ON)
 set(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS    ON)
 set(XRT_FEATURE_OPENXR_LAYER_DEPTH              OFF)
 set(XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS         OFF)
