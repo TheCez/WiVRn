@@ -356,8 +356,17 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
+	// video_encoder_mediacodec only ever supports 8-bit (see its constructor's
+	// own check) regardless of codec -- unlike vaapi/nvenc, where h265/av1
+	// backends can genuinely do 10-bit. Without this, selecting mediacodec
+	// with codec=h265 and no explicit bit_depth falls through to the "not
+	// h264/raw, so must be a 10-bit-capable backend" default below, and
+	// video_encoder_mediacodec's constructor throws ("only supports 8-bit
+	// encoding") before a session can even be created. Found via a live
+	// HEVC A/B test on the Pixel (docs/ANDROID_PORT.md's perf branch).
 	if (std::ranges::contains(res, video_codec::h264, &encoder_settings::codec) or
-	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec))
+	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec) or
+	    std::ranges::contains(res, std::string(encoder_mediacodec), &encoder_settings::encoder_name))
 		bit_depth = 8;
 	else if (not bit_depth)
 		bit_depth = 10;
