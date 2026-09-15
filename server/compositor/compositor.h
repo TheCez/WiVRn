@@ -47,31 +47,44 @@ class video_encoder;
 class compositor : public comp_base
 {
 public:
-	// Each stream gets its OWN dedicated single-array-layer multi-planar
-	// image, instead of one 3-array-layer image shared across streams.
-	// Real GPU driver bug, confirmed via a minimal standalone reproduction
-	// outside this codebase (see docs/ANDROID_PORT.md's Milestone 4.5): on
-	// this hardware (PowerVR DXT-48-1536 / Tensor G5), a compute shader
-	// write to array layer >=1 of a VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
-	// image is corrupted -- neither a multi-planar image alone (1 layer)
-	// nor a non-multi-planar array image triggers it, only the combination.
+	// On PowerVR (Imagination Technologies) GPUs specifically, each stream
+	// gets its OWN dedicated single-array-layer multi-planar image instead
+	// of sharing array layers of one 3-array-layer image. Real GPU driver
+	// bug, confirmed via a minimal standalone reproduction outside this
+	// codebase (see docs/ANDROID_PORT.md's Milestone 4.5): on this
+	// hardware (PowerVR DXT-48-1536 / Tensor G5), a compute shader write
+	// to array layer >=1 of a VK_FORMAT_G8_B8R8_2PLANE_420_UNORM image is
+	// corrupted -- neither a multi-planar image alone (1 layer) nor a
+	// non-multi-planar array image triggers it, only the combination.
 	// Confirmed clean on two independent desktop Vulkan implementations
 	// (NVIDIA, Mesa llvmpipe) with the exact same shader and data, and
 	// confirmed corrupted ONLY with arrayLayers>=2 when run directly on
-	// this device -- so single-layer images sidestep it entirely.
-	// Full writeup incl. exact repro and upstream-bug-report material:
+	// this device -- so single-layer images sidestep it entirely. Full
+	// writeup incl. exact repro and upstream-bug-report material:
 	// docs/pixel10-pro-xl-gpu-media-investigation.md, section B. DO NOT
-	// consolidate these back into array layers on this driver without
-	// re-running that document's reproduction harness first.
+	// widen multi_layer_stream_images's denylist away from PowerVR-only
+	// without re-running that document's reproduction harness first.
+	//
+	// Every other GPU vendor (confirmed on a Samsung Galaxy S22's Exynos
+	// 2200/Xclipse 920 -- see docs/ANDROID_PORT.md's cross-device
+	// confirmation entry) uses one shared 3-array-layer image instead:
+	// fewer allocations, fewer barriers/dispatches. See
+	// vk_bundle::multi_layer_stream_images.
+	//
+	// Either way, `content`/`alpha` below are non-owning views: the
+	// backing memory they point into is owned by `image::storage` (either
+	// 3 separate single-layer allocations, or 1 shared 3-layer one).
 	struct stream_image
 	{
-		image_allocation image;
+		vk::Image image;
 		vk::raii::ImageView view_y;
 		vk::raii::ImageView view_cbcr;
 	};
 	struct image
 	{
 		std::atomic<bool> busy = false;
+		std::vector<image_allocation> storage;
+		vk::Extent3D extent;
 		std::array<stream_image, 2> content; // left, right
 		stream_image alpha;                   // shared, both eyes packed by x-offset (unchanged from before)
 		to_headset::video_stream_data_shard::view_info_t view_info{};

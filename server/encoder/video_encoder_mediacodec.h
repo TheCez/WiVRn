@@ -147,6 +147,20 @@ class video_encoder_mediacodec : public video_encoder
 	// payload per call.
 	void push_async(std::span<const uint8_t> payload, bool control);
 
+	// Which array layer of the image present_image() is handed lives at:
+	// always 0 on the PowerVR single-layer workaround path (compositor.cpp
+	// gives each stream its own dedicated image there), or this stream's
+	// own index (0=left, 1=right, 2=alpha) when compositor.cpp instead
+	// shares one 3-layer image across streams on every other GPU vendor --
+	// see compositor.h's struct image comment and
+	// vk_bundle::multi_layer_stream_images. Mirrors compositor.cpp's own
+	// image_layer() helper, computed independently here since this class
+	// only has vk_bundle + its own stream_idx to go on, not the
+	// compositor's stream_image objects. Defined out-of-line (.cpp) since
+	// vk_bundle is only forward-declared where `vk` is declared
+	// (video_encoder.h).
+	uint32_t image_layer() const;
+
 public:
 	video_encoder_mediacodec(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 

@@ -311,6 +311,11 @@ void wivrn::video_encoder_mediacodec::push_async(std::span<const uint8_t> payloa
 	});
 }
 
+uint32_t wivrn::video_encoder_mediacodec::image_layer() const
+{
+	return vk.multi_layer_stream_images ? stream_idx : 0;
+}
+
 void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
 	ensure_codec();
@@ -346,12 +351,12 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 		std::array regions{
 		        vk::ImageToMemoryCopy{
 		                .pHostPointer = in[slot].buffer.map(),
-		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane0, .baseArrayLayer = 0, .layerCount = 1},
+		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane0, .baseArrayLayer = image_layer(), .layerCount = 1},
 		                .imageExtent = {.width = extent.width, .height = extent.height, .depth = 1},
 		        },
 		        vk::ImageToMemoryCopy{
 		                .pHostPointer = (uint8_t *) in[slot].buffer.map() + vk::DeviceSize(extent.width) * extent.height,
-		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane1, .baseArrayLayer = 0, .layerCount = 1},
+		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane1, .baseArrayLayer = image_layer(), .layerCount = 1},
 		                .imageExtent = {.width = extent.width / 2, .height = extent.height / 2, .depth = 1},
 		        },
 		};
@@ -390,12 +395,11 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	// y_cbcr is now this stream's own dedicated single-array-layer image
-	// (see compositor.h's struct image comment -- was array layer
-	// stream_idx of one shared 3-layer image; a real GPU driver bug on
-	// this hardware corrupts compute writes to array layer >=1 of a
-	// multi-planar image, so each stream now gets its own image and
-	// baseArrayLayer is always 0).
+	// y_cbcr is this stream's own dedicated single-array-layer image on
+	// the PowerVR single-layer workaround path (image_layer() == 0
+	// there), or array layer image_layer() (== stream_idx) of one shared
+	// 3-layer image on every other GPU vendor -- see compositor.h's
+	// struct image comment and this class's image_layer() comment.
 	if (need_transfer)
 	{
 		vk::ImageMemoryBarrier2 barrier{
@@ -407,7 +411,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 		        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 		                             .baseMipLevel = 0,
 		                             .levelCount = 1,
-		                             .baseArrayLayer = 0,
+		                             .baseArrayLayer = image_layer(),
 		                             .layerCount = 1},
 		};
 		cmd.pipelineBarrier2({
@@ -420,7 +424,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	        vk::BufferImageCopy{
 	                .imageSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-	                        .baseArrayLayer = 0,
+	                        .baseArrayLayer = image_layer(),
 	                        .layerCount = 1,
 	                },
 	                .imageExtent = {
@@ -433,7 +437,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	                .bufferOffset = vk::DeviceSize(extent.width) * extent.height,
 	                .imageSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-	                        .baseArrayLayer = 0,
+	                        .baseArrayLayer = image_layer(),
 	                        .layerCount = 1,
 	                },
 	                .imageExtent = {

@@ -462,13 +462,21 @@ wivrn::vk_bundle::vk_bundle() :
 	                  *debug != VK_NULL_HANDLE);
 
 	auto prop = physical_device.getProperties();
+
+	// PowerVR/Imagination Technologies' registered Vulkan vendorID -- see
+	// multi_layer_stream_images's own comment (wivrn_vk_bundle.h).
+	constexpr uint32_t vendor_id_powervr = 0x1010;
+	multi_layer_stream_images = (prop.vendorID != vendor_id_powervr);
+
 	U_LOG_I("Vulkan instance created:\n"
 	        "\tGPU: %s\n"
-	        "\tqueue families: %d %d %d (main, encode, transfer)\n",
+	        "\tqueue families: %d %d %d (main, encode, transfer)\n"
+	        "\tmulti_layer_stream_images: %s\n",
 	        prop.deviceName.data(),
 	        int32_t(queue.family_index),
 	        int32_t(encode_queue_family_index),
-	        int32_t(transfer_queue.family_index));
+	        int32_t(transfer_queue.family_index),
+	        multi_layer_stream_images ? "true" : "false");
 
 }
 
