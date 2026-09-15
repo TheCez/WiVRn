@@ -1839,6 +1839,131 @@ direction already proposed, or accept resource contention as a
 documented platform limitation similar to the closed zero-copy
 investigation.
 
+### HEVC A/B diagnostic: is the black-block corruption AVC-specific?
+
+Added a real, permanent HEVC codepath to `video_encoder_mediacodec` (not a
+throwaway branch) to test whether the still-open black-block corruption
+above is specific to the AVC bitstream/encoder or common to the whole
+input/VPU path. Selectable via the existing, previously-inert-on-Android
+`codec` config key (see below) — no new config mechanism needed, since
+`common/wivrn_packets.h`, `client/decoder/android/android_decoder.cpp`, and
+`server/encoder/encoder_settings.cpp`'s `select_encoder()` already had full
+`h265` plumbing end-to-end; the only gate was
+`video_encoder_mediacodec.cpp`'s hardcoded AVC-only check and MIME string.
+
+**Real hardware HEVC component identified**: `c2.google.hevc.encoder`
+(hardware=true, vendor=true — confirmed via a standalone `MediaCodecInfo`
+enumeration probe, `tools/foveation-pc-test/MediaCodecEnum.java`, same
+non-tracked-tool convention as this doc's other probes). The software
+fallback, `c2.android.hevc.encoder`, is capped at 512×512 and obviously
+unusable. `ensure_codec()` now selects the hardware component explicitly by
+name (`AMediaCodec_createCodecByName`) rather than
+`AMediaCodec_createEncoderByType`, so it can never silently fall back to
+software. HEVC is pinned to 8-bit Main profile explicitly (the component
+also advertises Main10/HDR10/HDR10+, which would defeat a one-variable
+comparison if left to pick its own default).
+
+**Two real, independent bugs found and fixed as a direct result of trying
+to actually run this A/B test** (neither is HEVC-specific in nature, both
+were just never hit before because nothing had ever selected a non-h264
+codec on Android):
+
+1. **`bit_depth` defaulted to 10 for any non-h264/raw codec**
+   (`encoder_settings.cpp`), because that default assumes a vaapi/nvenc-class
+   backend where h265 genuinely can do 10-bit. `video_encoder_mediacodec`
+   is 8-bit-only regardless of codec (its own constructor already asserted
+   this for h264). Selecting `mediacodec`+`h265` with no explicit
+   `bit_depth` fell through to the 10-bit default and threw before a
+   session could even be created. Fixed by also checking for the
+   `mediacodec` encoder name in the same `bit_depth = 8` condition as
+   h264/raw.
+2. **The documented per-encoder `codec` JSON config key
+   (`docs/configuration.md`) was silently unusable on Android at all** —
+   `configuration::set_config_file()` is only ever called from desktop's
+   `main.cpp` (`--config` CLI flag); nothing called it in
+   `wivrn_server_jni.cpp`, so `read_configuration()` fell back to merging
+   `xdg_config_home()/wivrn/config.json`, and `xdg_config_home()` returns
+   `"."` when neither `XDG_CONFIG_HOME` nor `HOME` is set (neither is, on
+   this app process) — resolving relative to this process's real `cwd`,
+   confirmed live via `/proc/<pid>/cwd`, to be `/`, which the app cannot
+   write to. There was no writable path the config loader would ever read.
+   Fixed by calling `configuration::set_config_file()` in `nativeStart()`
+   pointing at this app's own `files/` subdirectory (writable via
+   `run-as`, unlike the app data dir's own root), making
+   `{"encoder":{"encoder":"mediacodec","codec":"h265"}}` (or `h264`) via
+   `adb shell run-as org.meumeu.wivrn.server sh -c 'echo ... >
+   files/config.json'` actually take effect. This is a real, permanent fix
+   independent of the HEVC test — config.json was simply dead code on
+   Android before this.
+
+Also hardened `video_encoder::SendData()`'s network-send `catch(...)`,
+which silently discarded every exception with zero logging (`network_error_logged`
+flag, log once per instance). Found no exception ever fires for the issue
+below — a real gap either way (a genuinely broken connection was
+previously invisible server-side), but ruled out as this bug's cause.
+
+**Corruption result (one run each, HEVC vs AVC, ~90s, dual-stream,
+otherwise-identical config)**: excluding loading-splash frames —
+
+| | Left (stream 0) | Right (stream 1) |
+|---|---|---|
+| AVC | ~1.9% | ~15.0% |
+| HEVC | ~1.8% | ~1.4% |
+
+Right-eye corruption dropped roughly 10× under HEVC in this one comparison.
+Left eye was essentially unchanged. **Not yet confirmed across repeat
+runs** — the existing corruption investigation above already noted
+right-eye rate varies run-to-run even under AVC alone, so this needs at
+least one more repeat before treating it as a real AVC-specific finding
+rather than this run's luck. If it holds up, it's real evidence *for* Case
+A (AVC-specific issue) over the resource-contention hypothesis, though it
+wouldn't fully explain the nonzero single-stream baseline corruption
+either codec still shows.
+
+**A separate, still-unresolved bug blocks live in-headset use of HEVC**:
+the Quest 1 client's decoders negotiate and get created successfully
+(`OMX.qcom.video.decoder.hevc` × 3, `h265` correctly offered/preferred by
+the client), and the server produces a valid, independently-decodable
+H.265 bitstream (confirmed via local dump + `ffprobe`/`ffmpeg`, zero syntax
+errors, unlike the genuinely-malformed AVC captures seen earlier in this
+investigation) — but the client never leaves its own lobby screen
+("Connected... Waiting for an application on the server"), and
+`shard_accumulator.cpp` logs "frame N was not sent because no shard was
+received" for **every single frame**, forever. Ruled out: exception in
+`send_stream`/`send_control` (none ever logged, see above), total network
+failure (`dumpsys netstats` showed real packets — 51k packets/2.7MB —
+actually leaving the Pixel's WiFi interface), and slow HEVC encode latency
+(a strong initial suspect, disproven by direct measurement: AVC's own
+`encode()` total latency, ~20.3ms avg/28.5ms p95, is if anything *higher*
+than HEVC's ~18.1ms avg/24ms p95, yet AVC streams live fine and HEVC never
+does — so raw per-call encode latency isn't the differentiator, since both
+already exceed a naive single-frame real-time budget and the pipeline is
+2-slot-pipelined regardless). Root cause not yet found; next concrete step
+would be comparing actual frame sizes/shard counts per frame between the
+two codecs and instrumenting `shard_accumulator::push_shard`'s `frame_diff`
+directly. Parked for now — does not block the corruption comparison above,
+which only needed the local server-side dump.
+
+**Incidental discovery, worth keeping permanently**: Monado's own logger
+defaults to `XRT_LOG=warn` (`u_logging.c`), silently dropping every
+`U_LOG_I` call before it ever reaches Android's logcat — including the
+`frame_timing_stats` `[timing]` summaries and the `WIVRN_DUMP_NV12`
+per-frame log lines this investigation and the one before it both relied
+on. Neither was actually broken; they were invisible. Like
+`WIVRN_ONLY_STREAM`, this is read via Monado's own `DEBUG_GET_ONCE_LOG_OPTION`,
+which on Android reads an Android system property directly:
+`adb shell setprop debug.xrt.XRT_LOG info` (values: `trace`/`debug`/`info`/
+`warn`/`error`), no rebuild needed. Worth setting at the start of any
+future on-device debugging session on this branch.
+
+**Tooling**: `tools/foveation-pc-test/MediaCodecEnum.java` (not git-tracked,
+same convention as this doc's other probes — see the reproducibility
+warning above) enumerates every `video/avc`/`video/hevc` `MediaCodecInfo`
+with full capabilities; `debugging/scan_corruption.py` (gitignored scratch,
+`/debugging/`) does the per-frame near-black-pixel corruption scan used
+above and in the investigation before it, without requiring numpy
+(`bytes.translate()` threshold count).
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
