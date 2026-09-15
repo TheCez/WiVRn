@@ -379,6 +379,26 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv * env, jobjec
 	// OpenXR client connect at all.
 	android_globals_store_vm_and_context(g_vm, g_service);
 
+	// HEVC A/B diagnostic (docs/ANDROID_PORT.md's perf branch): the desktop
+	// build's --config CLI flag (main.cpp) is how configuration::set_config_file()
+	// normally gets called; nothing on Android ever called it, so
+	// configuration::read_configuration() fell back to its no-config-file
+	// path, merging xdg_config_home()/wivrn/config.json -- but xdg_config_home()
+	// returns "." when neither XDG_CONFIG_HOME nor HOME is set (neither is,
+	// here), and this process's real cwd is "/" (confirmed live via
+	// /proc/<pid>/cwd), which this app cannot write to. Net effect: the
+	// documented per-encoder "codec" config key (docs/configuration.md) was
+	// silently unusable on Android -- there was no writable path the config
+	// loader would ever actually read. Pointing it at this app's own private
+	// data dir's files/ subdir (writable via run-as, unlike the app data
+	// dir's own root -- confirmed live; the dump/timing diagnostics above
+	// use the root only because the app's own process writes those, not
+	// adb/run-as) so `adb shell run-as org.meumeu.wivrn.server sh -c
+	// 'echo {...} > files/config.json'` actually takes effect, e.g. for
+	// forcing {"encoder":{"encoder":"mediacodec","codec":"h265"}} to A/B
+	// against the default (unset -- best of the client's preferred list).
+	wivrn::configuration::set_config_file("/data/data/org.meumeu.wivrn.server/files/config.json");
+
 	apply_debug_dump_property();
 
 	server_thread.emplace([](std::stop_token stop) {
