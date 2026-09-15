@@ -2271,6 +2271,74 @@ third-party apps from earlier in this investigation) are also fixed by
 this same change, since their failure mode was never conclusively
 isolated to this exact cause.
 
+## Milestone 8 (branch `feat/adrenotools-turnip`) — custom Vulkan driver loading (adrenotools/Turnip) for Adreno devices
+
+Confirmed VRChat's black-screen investigation (Milestone 7) wasn't the only
+new device brought into this project: a Samsung Galaxy Tab (SM-X810,
+Snapdragon 778G / Adreno 642L) fails to start the WiVRn server at all --
+`GPU does not support Vulkan synchronization2 feature` ->
+`xrt_instance_create_system failed` -> the process exits immediately, every
+time, before a Quest can even connect. Verified live with a temporary
+diagnostic: `device apiVersion = 1.1.128`, and `VK_KHR_synchronization2`
+genuinely isn't in the device's own extension list -- a real driver
+limitation (this compositor's synchronization2 requirement is load-bearing,
+not something that can be relaxed), not a bug in this codebase.
+
+**Scope note, decided explicitly before building anything**: GameNative/
+Winlator-style apps solve exactly this class of problem on Adreno via
+Turnip (Mesa's open Adreno Vulkan driver) loaded through **adrenotools**
+(a rootless driver-swap library), but their "Mali support" (most Tensor
+chips, including this project's own confirmed Tensor G5 = PowerVR device)
+is an unrelated mechanism (VirGL/Gladio: full software GPU-API translation,
+not a driver swap) that wouldn't fix a missing-Vulkan-feature problem like
+this one anyway. **No equivalent to Turnip exists for Mali, PowerVR, or AMD
+Xclipse (the S22's GPU) today** -- confirmed via research before writing any
+code. Built only the real, working Adreno/Turnip path.
+
+**What landed**:
+- Vendors `libadrenotools` (github.com/bylaws/libadrenotools) via
+  FetchContent, Android-only, including its `lib/linkernsbypass` git
+  submodule -- the first FetchContent'd dependency in this repo that needs
+  one (`GIT_SUBMODULES` in the `FetchContent_Declare`).
+- `server/utils/vulkan_loader.{h,cpp}` (new): resolves the
+  `PFN_vkGetInstanceProcAddr` `vk::raii::Context` bootstraps from. Default
+  path (no custom driver configured -- every device this project runs on
+  today except the tablet): a plain `dlopen("libvulkan.so")` +
+  `dlsym(vkGetInstanceProcAddr)`, functionally identical to what
+  vulkan-hpp's own internal `DynamicLoader` already did. Custom path:
+  `adrenotools_open_libvulkan()`'s isolated, hook-injected driver. Never
+  hard-fails on a bad custom driver selection -- falls back to the system
+  driver and logs a warning instead.
+- `wivrn_vk_bundle.cpp`'s `vk_ctx` construction is now explicit
+  (`VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0`, Android-only, `#if`-guarded so
+  desktop is untouched) instead of relying on `vk::raii::Context`'s
+  implicit default constructor -- **verified live on the S22 that this is
+  a no-op behavior change** for every device that doesn't select a custom
+  driver (identical GPU-name log, identical `multi_layer_stream_images`
+  value, session still reaches `FOCUSED`, before and after).
+- A new settings screen (`SettingsActivity.java`, reached from
+  `MainActivity`'s options menu) imports the same **ADPKG**-format driver
+  `.zip` GameNative/Winlator use (`meta.json` + the driver's `.so` files),
+  extracts it into the app's own internal data dir (adrenotools requires
+  this, not sdcard), and persists the choice via `SharedPreferences` --
+  this app's first use of it, no prior Java-side persistence existed at
+  all. No new dependency: `java.util.zip` and `org.json` are both
+  JDK/platform stdlib.
+- `wivrn_server_jni.cpp`'s `nativeStart()` now takes the app's own
+  `ApplicationInfo.nativeLibraryDir` (a Java-only value adrenotools
+  requires exactly) plus the persisted driver choice (both null = system
+  default).
+
+**Verified on real hardware**: S22 (no driver configured) is provably
+unaffected by every step above -- re-ran the full regression check after
+each change, not just once at the end. Tablet (no driver configured) still
+fails exactly the same pre-existing way, confirming nothing regressed there
+either. **Not yet verified**: actually loading a real Turnip build -- needs
+a real ADPKG package (out of scope to source/host, matching how
+GameNative/Winlator work: the user supplies it) and interaction with the
+picker UI (Storage Access Framework's file-picker dialog needs a real touch
+interaction, not drivable blind over adb) to confirm end-to-end.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
