@@ -32,6 +32,7 @@
 #include <format>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <media/NdkMediaFormat.h>
 #include <stdexcept>
@@ -199,22 +200,46 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 
 	// HEVC A/B diagnostic (docs/ANDROID_PORT.md's perf branch, "is the
 	// Milestone 5 black-block corruption AVC-specific or common to the
-	// input/VPU path"): explicit hardware component name rather than
-	// AMediaCodec_createEncoderByType, so this can never silently fall
-	// back to a software encoder -- see tools/foveation-pc-test's
+	// input/VPU path"): prefer this exact hardware component name over
+	// AMediaCodec_createEncoderByType so this can never silently fall back
+	// to a software encoder on the Pixel -- see tools/foveation-pc-test's
 	// MediaCodecEnum.java probe output (c2.google.hevc.encoder is
 	// hardware=true/vendor=true; c2.android.hevc.encoder is a 512x512-max
-	// software fallback). check_mediacodec() (encoder_settings.cpp)
-	// already probes this constructor up front, so if this component name
-	// ever doesn't exist on a given device, h265 is simply marked
-	// unsupported for mediacodec there -- no special-casing needed here.
+	// software fallback). That exact component name is vendor-specific
+	// (Google/Tensor) though -- confirmed live, hardcoding only this name
+	// with no fallback crashed the whole server process (uncaught
+	// exception in this lazily-deferred function, past the point
+	// check_mediacodec()'s probe could catch it -- see that function's own
+	// comment) the moment a different device's first real frame reached
+	// here. Fall back to createEncoderByType, but still verify the
+	// resulting component isn't a known software-only one (same
+	// name-prefix heuristic client/decoder/android/android_decoder.cpp's
+	// hardware_accelerated() already uses -- the NDK has no
+	// isHardwareAccelerated() query, see that function's own comment).
 	bool hevc = codec_kind == h265;
 	const char * mime = hevc ? "video/hevc" : "video/avc";
-	codec.reset(hevc
-	                    ? AMediaCodec_createCodecByName("c2.google.hevc.encoder")
-	                    : AMediaCodec_createEncoderByType(mime));
+	if (hevc)
+		codec.reset(AMediaCodec_createCodecByName("c2.google.hevc.encoder"));
+	if (not codec)
+		codec.reset(AMediaCodec_createEncoderByType(mime));
 	if (not codec)
 		throw std::runtime_error(std::string("failed to create mediacodec ") + mime + " encoder");
+
+	if (hevc)
+	{
+		char * name = nullptr;
+		if (AMediaCodec_getName(codec.get(), &name) == AMEDIA_OK and name)
+		{
+			bool software = std::string_view(name).starts_with("c2.android.") or
+			                 std::string_view(name).starts_with("OMX.google.");
+			AMediaCodec_releaseName(codec.get(), name);
+			if (software)
+			{
+				codec.reset();
+				throw std::runtime_error("mediacodec video/hevc encoder is software-only on this device");
+			}
+		}
+	}
 
 	AMediaFormat * format = AMediaFormat_new();
 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);

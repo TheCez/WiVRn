@@ -150,6 +150,20 @@ class video_encoder_mediacodec : public video_encoder
 public:
 	video_encoder_mediacodec(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 
+	// For encoder_settings.cpp's check_mediacodec() capability probe only:
+	// the constructor alone does NOT exercise ensure_codec() (it's
+	// deliberately lazy, see that function's own comment), so a probe that
+	// only constructs this class and catches exceptions never actually
+	// tries to create the real underlying MediaCodec -- confirmed the hard
+	// way when a hardcoded HEVC component name (only valid on the one
+	// device it was found on) passed the probe cleanly, then crashed the
+	// whole server process with an uncaught exception the moment a real
+	// session's first present_image() call reached ensure_codec() on a
+	// different device. This gives the probe a way to actually attempt
+	// codec creation up front, where a failure is just "codec unsupported"
+	// instead of a live crash.
+	void probe_ensure_codec() { ensure_codec(); }
+
 	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
 
 	std::optional<data> encode(uint8_t slot, uint64_t frame_id) override;

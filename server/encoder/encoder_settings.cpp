@@ -195,6 +195,12 @@ class prober
 			                .bit_depth = 8,
 			        },
 			        0);
+			// The constructor alone doesn't create the real MediaCodec
+			// (deliberately lazy -- see video_encoder_mediacodec.h). Force
+			// it now so a codec that can't actually be created on this
+			// device is caught here as "unsupported", not as a live crash
+			// the first time a real session reaches present_image().
+			test.probe_ensure_codec();
 			mediacodec_support[codec] = true;
 			return true;
 		}
