@@ -1680,19 +1680,65 @@ turnaround sometimes exceeding what 2 slots of headroom can absorb,
 rather than a straightforward thread-safety bug in the concurrent
 `encode()` design itself.
 
-**Next steps** (not yet started): correlate corrupted frames against the
-existing `frame_timing_stats` GPU fence-wait data (specifically
-`present_image()`'s stale-slot wait — does its wait time spike right
-before/during a corrupted frame?) and the one `ECOServiceStatsProvider`
-asymmetry noted earlier; consider whether `num_slots` genuinely needs to
-be deeper for this device (which would mean the paused pipelined-readback
-work is actually *relevant* to fixing this, not just orthogonal to it —
-worth revisiting once there's clearer evidence). Bitrate/rate-control
-tuning and network/packet analysis remain explicitly out of scope until
-this is resolved — confirmed multiple times now (network ruled out by
-the encoder-side capture; MediaCodec/encoder ruled out by the NV12
-capture; CPU-thread concurrency now argued against by this test) that
-none of those are the cause.
+### Decisive negative result: maximal forced synchronization does NOT fix it either
+
+A third toggle (`WIVRN_FORCE_GPU_WAIT`, commit `04b79152`) makes the
+render thread fully block in `present_image()` until that exact frame's
+GPU copy is 100% complete before returning at all — the most aggressive
+synchronization possible short of a global `vkDeviceWaitIdle()`,
+eliminating any possibility of the render thread moving on to other GPU
+work (the next frame's compute dispatch, the other stream's copy) while
+a copy is still in flight.
+
+| Configuration | Left | Right |
+|---|---|---|
+| Left alone | 0.48% | — |
+| Right alone | — | ~1.6% |
+| Both, normal concurrent | ~8.2% (pooled) | ~8.2% (pooled) |
+| Both, serialized `encode()` | 2.98% | 19.21% |
+| Both, **forced full GPU wait** | 1.40% | **11.36%** |
+
+**Result: forced maximal synchronization did not eliminate or clearly
+reduce the corruption.** This is the decisive negative result that rules
+out "just needs more/better waiting" as the fix — if this were a plain
+timing race closeable with sufficient synchronization, the most
+conservative possible wait should have fixed it or driven it down near
+the single-stream baseline. It didn't.
+
+**Conclusion, updated and more precise**: across every configuration
+tested, the one thing that consistently and dramatically correlates with
+low corruption is simply *whether only one stream is doing real GPU+encode
+work at all* (0.5-1.6% alone vs. 8-19% with both active, regardless of
+how the two streams' work is ordered/synchronized/serialized relative to
+each other). More synchronization didn't help; less overlap (serializing)
+made the worse stream's corruption *increase*, not decrease. This pattern
+fits **genuine resource contention between two concurrent real-time
+GPU-compute + hardware-video-encode pipelines on this SoC** far better
+than an application-level synchronization bug fixable with a wait or a
+mutex — it looks like a platform/driver-level limitation when both
+streams are actively rendering+encoding around the same time, not a
+closeable race window in this project's own code. Not yet proven beyond
+this pattern-matching, but this is now the leading hypothesis, and it
+would put this bug back in the same general territory as the earlier
+array-layer driver bug: a real hardware/driver characteristic to work
+around, not a logic bug to fix outright.
+
+**Next steps** (not yet started): if resource contention under
+concurrent load is correct, a *pacing/scheduling* fix (spreading the two
+streams' GPU work and hardware-encoder submissions further apart in time
+within each frame period, rather than back-to-back on the render thread)
+is a more promising direction than any additional synchronization
+primitive — this is a different kind of change from anything tried so
+far. Also worth doing before any code change: correlate corrupted frames
+against the existing `frame_timing_stats` GPU fence-wait data and the one
+`ECOServiceStatsProvider` asymmetry noted earlier, to see whether
+corruption clusters around moments of measurably higher GPU/VPU load.
+Bitrate/rate-control tuning and network/packet analysis remain
+explicitly out of scope until this is resolved — confirmed multiple
+times now (network ruled out by the encoder-side capture; MediaCodec/
+encoder ruled out by the NV12 capture; CPU-thread concurrency argued
+against; plain synchronization gaps now argued against too) that none of
+those are the cause.
 
 The full pipelined-readback-ring rewrite (Parts C-H of the original
 readback-pipelining plan) remains paused — correctly, per the decision
