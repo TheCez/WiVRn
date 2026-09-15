@@ -24,6 +24,7 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
@@ -352,9 +353,27 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 			else
 				cnx->send_stream(to_headset::video_stream_data_shard{shard});
 		}
+		catch (std::exception & e)
+		{
+			// Milestone 5 HEVC diagnostic: this used to be a bare
+			// catch(...) with no logging at all -- real send failures
+			// (e.g. every single shard failing all session) were
+			// completely invisible server-side. Logged once per
+			// instance so a genuinely broken connection doesn't flood
+			// logcat, but the first occurrence is never silent again.
+			if (not network_error_logged)
+			{
+				U_LOG_E("stream %d: send_%s failed: %s", stream_idx, control ? "control" : "stream", e.what());
+				network_error_logged = true;
+			}
+		}
 		catch (...)
 		{
-			// Ignore network errors
+			if (not network_error_logged)
+			{
+				U_LOG_E("stream %d: send_%s failed with unknown exception", stream_idx, control ? "control" : "stream");
+				network_error_logged = true;
+			}
 		}
 		++shard.shard_idx;
 		shard.view_info.reset();

@@ -107,6 +107,7 @@ private:
 	clock_offset clock;
 
 	std::ofstream video_dump;
+	bool network_error_logged = false;
 
 	std::shared_ptr<sender> shared_sender;
 
