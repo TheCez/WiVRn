@@ -64,7 +64,13 @@ public class WivrnServerService extends Service
 		System.loadLibrary("wivrn-server");
 	}
 
-	private native void nativeStart();
+	// nativeLibDir MUST be getApplicationInfo().nativeLibraryDir exactly --
+	// adrenotools requires it verbatim to load its own hook libraries (see
+	// server/utils/vulkan_loader.cpp). customDriverDir/customDriverLibraryName
+	// are both null for "use the system driver" (the default -- see
+	// DriverSettings/SettingsActivity for the only place either is ever
+	// non-null).
+	private native void nativeStart(String nativeLibDir, String customDriverDir, String customDriverLibraryName);
 
 	private native void nativeStop();
 
@@ -148,7 +154,8 @@ public class WivrnServerService extends Service
 
 		if (!started)
 		{
-			nativeStart();
+			DriverSettings driver = DriverSettings.load(this);
+			nativeStart(getApplicationInfo().nativeLibraryDir, driver.dir, driver.libraryName);
 			started = true;
 		}
 

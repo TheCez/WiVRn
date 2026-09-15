@@ -22,6 +22,8 @@ import android.app.Activity;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.widget.TextView;
 
 import java.util.Set;
@@ -74,5 +76,22 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 	public void onStatusChanged(String headsetName, Set<Integer> connectedClients)
 	{
 		status.setText(WivrnServerService.statusText(headsetName, connectedClients));
+	}
+
+	// Only entry point into SettingsActivity (Turnip/adrenotools custom
+	// Vulkan driver picker) -- a plain options menu, since nothing else in
+	// this minimal UI needs one yet.
+	@Override
+	public boolean onCreateOptionsMenu(Menu menu)
+	{
+		menu.add("Vulkan driver settings");
+		return true;
+	}
+
+	@Override
+	public boolean onOptionsItemSelected(MenuItem item)
+	{
+		startActivity(new Intent(this, SettingsActivity.class));
+		return true;
 	}
 }

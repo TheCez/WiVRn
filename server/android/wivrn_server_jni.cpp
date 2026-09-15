@@ -52,6 +52,7 @@
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_mainloop_android.h"
 #include "target_instance_wivrn.h"
+#include "utils/vulkan_loader.h"
 #include "wivrn_ipc.h"
 #include "wivrn_sockets.h"
 
@@ -356,14 +357,44 @@ void run_server(std::stop_token stop)
 
 } // namespace
 
+// Turns a nullable jstring into a std::string (empty for null) without the
+// caller needing to juggle GetStringUTFChars/ReleaseStringUTFChars itself.
+std::string jstring_to_string(JNIEnv * env, jstring s)
+{
+	if (!s)
+		return {};
+	const char * chars = env->GetStringUTFChars(s, nullptr);
+	std::string result(chars);
+	env->ReleaseStringUTFChars(s, chars);
+	return result;
+}
+
 extern "C" JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(JNIEnv * env, jobject thiz)
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(
+        JNIEnv * env, jobject thiz, jstring native_lib_dir, jstring custom_driver_dir, jstring custom_driver_library_name)
 {
 	if (server_thread)
 		return; // already running
 
 	env->GetJavaVM(&g_vm);
 	g_service = env->NewGlobalRef(thiz);
+
+	// Turnip/adrenotools custom Vulkan driver support (see
+	// server/utils/vulkan_loader.cpp): custom_driver_dir/library_name are
+	// both null unless the user has picked a driver via the app's own
+	// settings UI (WivrnServerService.java reads the persisted choice and
+	// passes it down here), in which case both are set together -- see
+	// SettingsActivity.java for where they're written. This MUST happen
+	// before server_thread starts: it's what wivrn_vk_bundle.cpp's
+	// vk_ctx construction reads the very first time a real session
+	// begins.
+	std::optional<wivrn::custom_vulkan_driver> driver;
+	if (custom_driver_dir && custom_driver_library_name)
+		driver = wivrn::custom_vulkan_driver{
+		        .dir = jstring_to_string(env, custom_driver_dir),
+		        .library_name = jstring_to_string(env, custom_driver_library_name),
+		};
+	wivrn::configure_vulkan_loader(jstring_to_string(env, native_lib_dir), std::move(driver));
 
 	// A Service is itself an android.content.Context (just not an
 	// android.app.Activity), and this is all Monado's own aux_android

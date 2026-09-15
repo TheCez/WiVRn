@@ -62,6 +62,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Turnip/adrenotools custom Vulkan driver picker (see
+             server/utils/vulkan_loader.cpp), reached from MainActivity's
+             options menu only, not exported. -->
+        <activity
+            android:name="org.meumeu.wivrn.server.SettingsActivity"
+            android:exported="false" />
+
         <service
             android:name="org.meumeu.wivrn.server.WivrnServerService"
             android:exported="false"

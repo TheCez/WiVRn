@@ -298,6 +298,24 @@ FetchContent_Declare(monado
     EXCLUDE_FROM_ALL
 )
 
+# Android-only (server/CMakeLists.txt only calls FetchContent_MakeAvailable
+# on this if(ANDROID)): rootless custom Vulkan driver loading (Turnip on
+# Adreno), see docs/ANDROID_PORT.md's adrenotools/Turnip milestone. Declared
+# unconditionally here (matches monado's own declare above -- registering a
+# dependency is free, only FetchContent_MakeAvailable actually fetches/builds
+# it), gated at the actual fetch site instead since desktop builds don't need
+# this at all.
+file(GLOB ADRENOTOOLS_PATCHES CONFIGURE_DEPENDS patches/adrenotools/*)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS adrenotools-rev)
+file(STRINGS adrenotools-rev ADRENOTOOLS_REV)
+FetchContent_Declare(adrenotools
+    GIT_REPOSITORY   https://github.com/bylaws/libadrenotools.git
+    GIT_TAG          ${ADRENOTOOLS_REV}
+    GIT_SUBMODULES   lib/linkernsbypass
+    PATCH_COMMAND    ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${ADRENOTOOLS_PATCHES}
+    EXCLUDE_FROM_ALL
+)
+
 add_custom_target(wivrn-version ALL
     COMMAND ${CMAKE_COMMAND}
         -D GIT_EXECUTABLE=${GIT_EXECUTABLE}

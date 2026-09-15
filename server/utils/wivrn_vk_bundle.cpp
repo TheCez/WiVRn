@@ -21,6 +21,7 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "utils/enumerate_polyfill.h"
+#include "vulkan_loader.h"
 #include "wivrn-server_shaders.h"
 #include "wivrn_config.h"
 
@@ -160,6 +161,18 @@ int get_queue_index(const std::vector<vk::QueueFamilyProperties> & queues, std::
 } // namespace
 
 wivrn::vk_bundle::vk_bundle() :
+#if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
+        // Desktop: unchanged from before this existed, vulkan-hpp's own
+        // internal DynamicLoader (dlopen's the system libvulkan.so itself).
+        vk_ctx(),
+#else
+        // Android: resolve vkGetInstanceProcAddr ourselves, so it can be
+        // redirected to a custom driver (Turnip/adrenotools) instead of the
+        // system one -- see vulkan_loader.cpp's own comment. Falls back to
+        // the exact same system-libvulkan.so behavior as the desktop path
+        // above when no custom driver is configured.
+        vk_ctx(resolve_vk_get_instance_proc_addr()),
+#endif
         instance(nullptr),
         physical_device(nullptr),
         device(nullptr),

@@ -90,6 +90,13 @@ set(XRT_OXR_RUNTIME_SUFFIX        "wivrn"          CACHE STRING "OpenXR client l
 
 FetchContent_MakeAvailable(monado)
 
+# Rootless custom Vulkan driver loading (adrenotools/Turnip) -- Android
+# only, irrelevant on desktop (see top-level CMakeLists.txt's own comment
+# on this FetchContent_Declare).
+if (ANDROID)
+	FetchContent_MakeAvailable(adrenotools)
+endif()
+
 if (WIVRN_BUILD_SERVER)
 	# Shared between both target types below.
 	set(_wivrn_server_sources
@@ -167,6 +174,7 @@ if (WIVRN_BUILD_SERVER)
 		target_sources(wivrn-server PRIVATE
 				driver/wivrn_uinput_android.cpp
 				android/wivrn_ipc_socket_monado_stub.cpp
+				utils/vulkan_loader.cpp
 			)
 		if(WIVRN_ANDROID_JNI)
 			target_sources(wivrn-server PRIVATE android/wivrn_server_jni.cpp)
@@ -197,6 +205,20 @@ if (WIVRN_BUILD_SERVER)
 		# a missing symbol at link time, which is why it wasn't caught
 		# earlier).
 		target_compile_definitions(wivrn-server PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+
+		# Rootless custom Vulkan driver loading (adrenotools/Turnip): see
+		# server/utils/vulkan_loader.cpp's own comment for the mechanism.
+		# VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0 is required to unlock
+		# vk::raii::Context's PFN_vkGetInstanceProcAddr-taking constructor
+		# (the default, =1, only exposes a parameterless constructor that
+		# uses vulkan-hpp's own internal system-libvulkan.so loader, which
+		# can't be redirected to a custom driver) -- this makes the
+		# default (no custom driver configured) path explicit instead of
+		# implicit, but is not a behavior change for it: vulkan_loader.cpp's
+		# own default path does exactly what vulkan-hpp's internal loader
+		# already did (dlopen "libvulkan.so", dlsym "vkGetInstanceProcAddr").
+		target_compile_definitions(wivrn-server PRIVATE VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
+		target_link_libraries(wivrn-server PRIVATE adrenotools)
 	else()
 		target_sources(wivrn-server PRIVATE
 				active_runtime.cpp
