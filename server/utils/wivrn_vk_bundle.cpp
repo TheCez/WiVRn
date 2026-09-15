@@ -31,6 +31,23 @@
 
 DEBUG_GET_ONCE_NUM_OPTION(force_gpu_index, "XRT_COMPOSITOR_FORCE_GPU_INDEX", -1)
 
+// Diagnostic override for vk_bundle::multi_layer_stream_images's own
+// vendorID-based denylist (docs/ANDROID_PORT.md's Milestone 6): -1 (default)
+// = the normal vendorID check; 0 = force the PowerVR-workaround single-layer
+// path regardless of vendor; 1 = force the shared-3-layer fast path
+// regardless of vendor. Added live while diagnosing a real stereo
+// duplication/ghosting bug seen on a Snapdragon tablet's Mesa/Turnip
+// (freedreno) driver -- the first non-PowerVR, non-AMD-Xclipse driver this
+// fast path had ever actually run on. Forcing 0 here reproduced the exact
+// same bug, ruling this path OUT as the cause (see Milestone 8's own
+// entry) -- the real cause turned out to be VRChat's own login-screen
+// rendering on this runtime, confirmed by a clean, symmetric stereo image
+// from this project's own reference Unity app on the same server/driver.
+// Left in permanently: a real, reusable diagnostic for the next time this
+// fast path needs to be A/B'd against a genuinely new GPU/driver.
+// `adb shell setprop debug.xrt.WIVRN_MULTI_LAYER_STREAM_IMAGES 0` (or 1).
+DEBUG_GET_ONCE_NUM_OPTION(multi_layer_stream_images_override, "WIVRN_MULTI_LAYER_STREAM_IMAGES", -1)
+
 // Default 3: left and right eye + alpha
 DEBUG_GET_ONCE_NUM_OPTION(max_vulkan_encoders, "WIVRN_MAX_VULKAN_ENCODERS", 3)
 
@@ -480,6 +497,9 @@ wivrn::vk_bundle::vk_bundle() :
 	// multi_layer_stream_images's own comment (wivrn_vk_bundle.h).
 	constexpr uint32_t vendor_id_powervr = 0x1010;
 	multi_layer_stream_images = (prop.vendorID != vendor_id_powervr);
+
+	if (auto override = debug_get_num_option_multi_layer_stream_images_override(); override >= 0)
+		multi_layer_stream_images = (override != 0);
 
 	U_LOG_I("Vulkan instance created:\n"
 	        "\tGPU: %s\n"
