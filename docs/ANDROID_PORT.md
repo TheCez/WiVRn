@@ -2135,6 +2135,63 @@ hardcoded name isn't present. Verified live: the S22 correctly falls back
 and finds its own real hardware HEVC encoder (`c2.exynos.hevc.encoder`),
 no crash, both streams reach `RUNNING`.
 
+## Milestone 6 — re-enable the shared 3-layer stream image, gated to exclude PowerVR only
+
+Now that the cross-device confirmation above showed the black-block
+corruption doesn't reproduce on a non-PowerVR GPU, the natural follow-up
+was: Milestone 4.5's single-layer-per-stream split was applied
+unconditionally to every device, but the bug it works around is
+PowerVR-specific. Every other vendor has been paying for that workaround
+(3 image allocations + 3 barriers instead of 1) with no benefit.
+
+**Important nuance this needed to respect**: Bug #1 was a *silent*
+compute-write corruption, not a rejected allocation (`AHardwareBuffer_isSupported`
+would never have caught it). That rules out any runtime capability-probe
+approach -- the gate has to be an explicit device check, not
+auto-detection. Went with a vendorID denylist: `vk_bundle::multi_layer_stream_images`,
+computed once from `physical_device.getProperties().vendorID` at Vulkan
+instance creation, `true` for every vendor except PowerVR/Imagination
+Technologies (`0x1010`). Denylist rather than allowlist on purpose: a
+not-yet-tested GPU defaults to the fast path, since an allowlist would
+mean every new device silently keeps the slower workaround forever with
+no way to discover it doesn't need it -- the one GPU actually confirmed
+bad is the only exception carved out.
+
+**Implementation** (`compositor.h`/`.cpp`, `video_encoder_mediacodec.h`/`.cpp`,
+`wivrn_vk_bundle.h`/`.cpp`): `compositor::stream_image::image` changed
+from an owning `image_allocation` to a non-owning `vk::Image` view; the
+owning allocation(s) moved to a new `compositor::image::storage` vector
+(1 shared 3-array-layer allocation when `multi_layer_stream_images`, or 3
+separate single-layer allocations otherwise, unchanged from before).
+`video_encoder_mediacodec::present_image()`'s five previously-hardcoded
+`baseArrayLayer = 0` sites now call a small `image_layer()` helper
+(`stream_idx` when sharing, else `0`) -- it has to compute this
+independently rather than receive it as a parameter, since it only has
+`vk_bundle` + its own `stream_idx` to go on, not the compositor's
+`stream_image` objects. **`foveation.cpp`/`.h`/`.comp` needed zero
+changes**: each stream's Y/CbCr `vk::ImageView`s are already built
+pointing at the correct array layer at creation time (compositor.cpp's
+new `make_stream_view()`), so the compute-shader dispatch side is
+completely unaware of (and unaffected by) whether those views happen to
+alias one shared image or point at 3 separate ones.
+
+**Verified live on both devices** (session reaches `XR_SESSION_STATE_FOCUSED`,
+zero crashes, zero new validation/compositor warnings on either):
+
+| | GPU | `multi_layer_stream_images` |
+|---|---|---|
+| Pixel 10 Pro XL | PowerVR D-Series DXT-48-1536 MC1 | `false` (old safe path, unchanged) |
+| Samsung Galaxy S22 | Samsung Xclipse 920 | `true` (new shared-image fast path) |
+
+Not yet done: a direct corruption-rate comparison (à la the HEVC A/B
+diagnostic) isolating this change's effect on the S22 specifically --
+the S22 was already confirmed corruption-free before this change, so
+there's no regression signal to look for there, and this change makes no
+behavioral difference on the Pixel at all (still takes the exact same
+code path as before). If a third, non-PowerVR device is ever added to
+this investigation, it's worth re-confirming this way rather than
+assuming.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
