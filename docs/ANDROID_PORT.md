@@ -1636,22 +1636,63 @@ right eye) — suggesting **two separate, stackable contributing causes**:
 some inherent stream-0-vs-1 asymmetry, and a much larger
 concurrency-related contribution.
 
-**Next steps** (not yet started): narrow down the concurrency mechanism
-specifically — the concurrent per-stream `encode()` worker threads
-introduced in `89655cd4` are the most direct suspect (temporarily
-serializing them, per the plan's step 4, is the next cheap experiment),
-but the shared render-thread GPU submission path (`layer_commit()`
-submits one compute dispatch feeding both streams' images, then calls
-each encoder's `present_image()` in sequence on the same thread — see
-"Part A" pipeline mapping earlier in this milestone) is also a candidate
-and isn't ruled out by this test alone. Correlate corrupted frames
-against the existing `frame_timing_stats` GPU fence-wait data and the
-one `ECOServiceStatsProvider` asymmetry noted earlier (not yet done).
-Bitrate/rate-control tuning and network/packet analysis remain
-explicitly out of scope until this is resolved — confirmed multiple
-times now (network ruled out by the encoder-side capture; MediaCodec/
-encoder ruled out by the NV12 capture; now further localized to
-concurrency specifically) that none of those are the cause.
+### Follow-up: serializing encode() makes it WORSE, not better — points away from CPU-thread concurrency
+
+Per the plan's step 4, a second toggle (`WIVRN_SERIALIZE_ENCODE`, commit
+`19c3b6d7`) leaves GPU work for both streams completely unchanged (still
+submitted together every frame, same as normal) and only serializes
+`encode()`'s `std::jthread` workers back to sequential calls on
+`encoder_work()`'s own thread — isolating the CPU-thread-concurrency
+variable specifically from the GPU-submission-cadence variable that
+`WIVRN_ONLY_STREAM` couldn't separate.
+
+| Configuration | Left | Right |
+|---|---|---|
+| Left alone | 0.48% | — |
+| Right alone | — | ~1.6% |
+| Both, normal concurrent `encode()` | ~8.2%* | ~8.2%* |
+| Both, **serialized** `encode()` | 2.98% | **19.21%** |
+
+(*both streams pooled in the earlier concurrent-baseline sample, not
+measured per-stream separately at the time)
+
+**Result: serializing made the right stream's corruption more than 2×
+worse, not better.** This argues *against* the concurrent per-stream
+`encode()` worker threads (`89655cd4`) being the direct cause — if a
+CPU-side data race between the two worker threads were responsible,
+removing that concurrency should have helped, not hurt. Instead, this
+points toward a **GPU-submission-cadence / buffer-reuse-timing race**:
+the render thread submits both streams' GPU compute+copy work
+unconditionally every single frame regardless of how fast the CPU side
+is actually consuming it (`present_image()`'s own per-slot fence wait
+only guards against reusing a slot that's still *in flight*, not against
+how much *slower* than the GPU's cadence the CPU has fallen). Serializing
+`encode()` makes each stream's CPU consumption strictly slower (stream 0
+must fully finish, including its own hardware-encoder turnaround, before
+stream 1's call even starts) — apparently *widening*, not closing, the
+window for a stale-buffer/fence race against the next frame's GPU copy.
+
+**Working hypothesis going forward**: this is likely tied to
+`num_slots=2`'s limited headroom (the base `video_encoder` class's
+present/encode ping-pong, shared by every backend — see "Part A" earlier
+in this milestone) combined with this device's real per-frame CPU+GPU
+turnaround sometimes exceeding what 2 slots of headroom can absorb,
+rather than a straightforward thread-safety bug in the concurrent
+`encode()` design itself.
+
+**Next steps** (not yet started): correlate corrupted frames against the
+existing `frame_timing_stats` GPU fence-wait data (specifically
+`present_image()`'s stale-slot wait — does its wait time spike right
+before/during a corrupted frame?) and the one `ECOServiceStatsProvider`
+asymmetry noted earlier; consider whether `num_slots` genuinely needs to
+be deeper for this device (which would mean the paused pipelined-readback
+work is actually *relevant* to fixing this, not just orthogonal to it —
+worth revisiting once there's clearer evidence). Bitrate/rate-control
+tuning and network/packet analysis remain explicitly out of scope until
+this is resolved — confirmed multiple times now (network ruled out by
+the encoder-side capture; MediaCodec/encoder ruled out by the NV12
+capture; CPU-thread concurrency now argued against by this test) that
+none of those are the cause.
 
 The full pipelined-readback-ring rewrite (Parts C-H of the original
 readback-pipelining plan) remains paused — correctly, per the decision
