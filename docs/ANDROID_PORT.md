@@ -1964,6 +1964,85 @@ with full capabilities; `debugging/scan_corruption.py` (gitignored scratch,
 above and in the investigation before it, without requiring numpy
 (`bytes.translate()` threshold count).
 
+### Real Vulkan validation now works on-device — and finds nothing in the corruption-suspect path
+
+Following up on this milestone's "no validation layers available on this
+stock device" limitation (§M of `docs/pixel10-pro-xl-gpu-media-investigation.md`
+was about `app_process`-launched standalone probes specifically — the real
+installed `server-app` is a Gradle debug build, confirmed live via
+`dumpsys package` to be `DEBUGGABLE`, which changes what's possible).
+
+**Android's documented, official no-root mechanism for this
+(`enable_gpu_debug_layers`/`gpu_debug_app`/`gpu_debug_layers` settings,
+pushing the layer to `/data/local/tmp/vulkan/debug/`) does not work on this
+device/OS build at all** — confirmed live: the Vulkan loader's own debug
+trace (`adb logcat`, tag `vulkan`) never once searches that directory
+regardless of those settings, and enabling the mechanism process-wide also
+crashes the app's own hardware-accelerated UI renderer (`libhwui.so`'s
+`VulkanManager::initialize`) before the compositor's own Vulkan instance is
+ever reached (confirmed reproducible, `hardwareAccelerated="false"` avoids
+the crash but the loader still can't find the layer either way —
+`ErrorLayerNotPresent` on the compositor's own `vkCreateInstance`).
+
+**What actually works**: bundling `libVkLayer_khronos_validation.so`
+directly into the (debug-build-only) APK's own native library directory —
+one of the paths the loader *does* search for every app, confirmed live
+(`"searching for layers in '.../lib/arm64'"`) — via a `debug`-build-type
+`jniLibs.srcDirs` entry in `server-app/build.gradle` pointing at
+`tools/vulkan-validation/` (not git-tracked, same `tools/` convention as
+the rest of this project's toolchain; silently contributes nothing if
+absent). `server/utils/wivrn_vk_bundle.cpp` explicitly requests
+`VK_LAYER_KHRONOS_validation` for its own instance only when
+`WIVRN_VK_VALIDATION` is set (`adb shell setprop debug.xrt.WIVRN_VK_VALIDATION 1`,
+no rebuild needed) — confirmed live: `vulkan: Loaded layer
+VK_LAYER_KHRONOS_validation`, routed through the pre-existing
+`message_callback`/`VK_EXT_debug_utils` messenger this file already had.
+
+**Three real, independent Vulkan API-misuse bugs found**, none previously
+known, none related to the corruption investigation:
+
+1. `vkCreateDevice()`: `VK_ANDROID_external_memory_android_hardware_buffer`
+   enabled without its required dependency `VK_EXT_queue_family_foreign`.
+2. `vkGetImageMemoryRequirements()` queried on an
+   `VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID`
+   image before it's bound to memory (spec requires binding first for this
+   handle type).
+3. `vkCreateImageView()`: `VK_FORMAT_R8G8B8A8_SRGB` view on a
+   `VK_FORMAT_R8G8B8A8_UNORM` image without `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`
+   set, repeated across multiple `vk_image_collection` images.
+
+Not yet fixed — flagged here so they aren't lost; worth a follow-up pass.
+
+**Corruption investigation relevance — the actually important result**:
+ran a real session under real dual-stream concurrent GPU-compute+encode
+load, first with plain Core Validation, then with **Synchronization
+Validation** explicitly enabled (`adb shell setprop
+debug.vulkan.khronos_validation.enables
+VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` — a distinct
+opt-in feature, not on by default, specifically checks for missing/incorrect
+barriers and read-after-write/write-after-write/write-after-read hazards,
+i.e. exactly the class of bug the compositor's own compute-write +
+`vkCmdCopyImageToBuffer`-readback path would need to have for this to be
+our own bug rather than a hardware/driver issue). **Zero sync-hazard
+messages over an extended run (~110s combined), only the three unrelated
+issues above.** This doesn't prove the corruption is hardware/driver —
+Synchronization Validation only catches hazards visible to the Vulkan API's
+own synchronization model, not e.g. genuine SoC memory-controller
+contention between concurrent GPU-compute and hardware-video-encode DMA —
+but it's real, direct evidence (not just behavioral inference from the
+force-wait/serialize experiments above) that our own barrier/synchronization
+*code* is spec-compliant. Combined with the existing evidence (force-wait
+didn't help, serializing made it worse), this further narrows the leading
+hypothesis toward genuine hardware/driver resource contention rather than
+a closeable bug in this codebase.
+
+**Next step, not yet done**: re-run this with the actual black-block
+corruption reproducing during the validated session (this run used the
+default AVC path with the same dual-stream load that normally produces the
+corruption, but corruption presence wasn't independently confirmed via
+`WIVRN_DUMP_VIDEO` in the same run) to be certain the validated window
+actually overlapped a corrupted frame, not just similar load conditions.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
