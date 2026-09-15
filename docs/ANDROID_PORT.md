@@ -2074,6 +2074,67 @@ still physically wrong — and the nonzero single-stream baseline (0.5–1.6%
 with zero concurrency) isn't fully explained by anything found so far
 either.
 
+### Cross-device confirmation: identical app/server, different GPU vendor (Samsung Galaxy S22, Exynos 2200 / Xclipse 920) — clean, no glitches
+
+A second physical Android phone (Samsung Galaxy S22, `s5e9925`/Exynos 2200,
+AMD Xclipse 920 GPU — a completely different GPU vendor/architecture from
+the Pixel 10 Pro XL's PowerVR DXT-48-1536) was set up as a second
+`server-app` install, same APK build, same Quest 1 client, same test app
+(`com.UnityTechnologies.com.unity.template.urpblank`). This surfaced one
+real, unrelated bug along the way (see below), but once fixed, a live
+in-headset session — first HEVC (real hardware `c2.exynos.hevc.encoder`),
+then AVC (`c2.exynos.h264.encoder`, forced via a `{"encoder":{"codec":
+"h264"}}` config.json, same `select_encoder`/`configuration::encoder.codec`
+mechanism desktop already uses) — was confirmed **smooth, with no glitches
+and no visible corruption**, direct visual confirmation in-headset, not
+just server-side telemetry.
+
+Note on a red herring hit along the way: the Quest client logged
+`shard_accumulator`'s "frame N was not sent because no shard was received"
+continuously throughout this same clean, glitch-free S22 session — the
+exact message previously associated (Milestone 5's HEVC A/B diagnostic,
+above) with the Pixel's still-unresolved "stuck in lobby, HEVC never
+streams" bug. Since real, smooth video was visibly rendering in the headset
+at the same time this log line was spamming, that message is **not**, by
+itself, evidence of broken streaming — it fires under some normal
+skipped-frame condition too. The Pixel HEVC bug's actual symptom is the
+client visibly stuck on its lobby screen forever; this log line alone
+isn't a reliable signal for that and shouldn't be treated as one in future
+diagnosis.
+
+**This is real, direct cross-hardware evidence for the driver-causation
+hypothesis**: identical WiVRn app code, identical compositor/encoder
+pipeline, run on a second GPU vendor entirely — zero corruption observed.
+Combined with the Synchronization-Validation-clean result above (rules out
+a spec-visible app-level race) and the earlier NV12-already-corrupt-
+before-the-encoder finding (rules out MediaCodec/VPU), this is the
+strongest evidence yet that the black-block corruption is specific to the
+Pixel 10 Pro XL's PowerVR driver rather than this codebase's Vulkan usage.
+Still not textbook-airtight proof (a single comparison device isn't a
+statistical sample, and the nonzero single-stream Pixel baseline is still
+unexplained), but the overall picture now points at PowerVR specifically,
+not "some Android GPU driver" in general.
+
+**Unrelated bug found and fixed during this cross-device setup**: the
+HEVC encoder's hardware component name was hardcoded to
+`c2.google.hevc.encoder` (Tensor-only, added during the Pixel HEVC A/B
+diagnostic above) with no fallback, and `encoder_settings.cpp`'s
+`check_mediacodec()` capability probe didn't exercise
+`video_encoder_mediacodec`'s deliberately-lazy `ensure_codec()` — so the
+probe passed cleanly on the S22 (nothing tried to actually create the
+codec yet) and the server then **crashed the whole process** with an
+uncaught `std::runtime_error` the moment the first real session reached
+`present_image()`/`ensure_codec()`. Fixed (commit `e73f0884`): added
+`video_encoder_mediacodec::probe_ensure_codec()` so the capability probe
+actually attempts real codec creation up front (a failure there is now
+"codec unsupported", not a live crash), and `ensure_codec()` now falls
+back from the hardcoded name to `AMediaCodec_createEncoderByType()` (with
+a software-encoder-name-prefix guard, same heuristic
+`android_decoder.cpp`'s `hardware_accelerated()` already uses) if the
+hardcoded name isn't present. Verified live: the S22 correctly falls back
+and finds its own real hardware HEVC encoder (`c2.exynos.hevc.encoder`),
+no crash, both streams reach `RUNNING`.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
