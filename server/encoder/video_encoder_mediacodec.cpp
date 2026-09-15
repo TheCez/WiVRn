@@ -107,8 +107,8 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 {
 	if (settings.bit_depth != 8)
 		throw std::runtime_error("mediacodec encoder only supports 8-bit encoding");
-	if (settings.codec != h264)
-		throw std::runtime_error("mediacodec encoder only supports h264 for now");
+	if (settings.codec != h264 and settings.codec != h265)
+		throw std::runtime_error("mediacodec encoder only supports h264/h265 for now");
 
 	if (auto dump_nv12 = std::getenv("WIVRN_DUMP_NV12"))
 		nv12_dump.open(std::string(dump_nv12) + "-" + std::to_string(stream_idx) + ".nv12raw", std::ios::binary);
@@ -189,6 +189,7 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 	// own header comment.
 	bitrate = settings.bitrate;
 	fps = settings.fps;
+	codec_kind = settings.codec;
 }
 
 void wivrn::video_encoder_mediacodec::ensure_codec()
@@ -196,15 +197,40 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 	if (codec)
 		return;
 
-	codec.reset(AMediaCodec_createEncoderByType("video/avc"));
+	// HEVC A/B diagnostic (docs/ANDROID_PORT.md's perf branch, "is the
+	// Milestone 5 black-block corruption AVC-specific or common to the
+	// input/VPU path"): explicit hardware component name rather than
+	// AMediaCodec_createEncoderByType, so this can never silently fall
+	// back to a software encoder -- see tools/foveation-pc-test's
+	// MediaCodecEnum.java probe output (c2.google.hevc.encoder is
+	// hardware=true/vendor=true; c2.android.hevc.encoder is a 512x512-max
+	// software fallback). check_mediacodec() (encoder_settings.cpp)
+	// already probes this constructor up front, so if this component name
+	// ever doesn't exist on a given device, h265 is simply marked
+	// unsupported for mediacodec there -- no special-casing needed here.
+	bool hevc = codec_kind == h265;
+	const char * mime = hevc ? "video/hevc" : "video/avc";
+	codec.reset(hevc
+	                    ? AMediaCodec_createCodecByName("c2.google.hevc.encoder")
+	                    : AMediaCodec_createEncoderByType(mime));
 	if (not codec)
-		throw std::runtime_error("failed to create mediacodec h264 encoder");
+		throw std::runtime_error(std::string("failed to create mediacodec ") + mime + " encoder");
 
 	AMediaFormat * format = AMediaFormat_new();
-	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, extent.width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, extent.height);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, color_format_yuv420_semiplanar);
+	// HEVC A/B diagnostic: pin 8-bit Main profile explicitly (numeric
+	// value matches MediaCodecInfo.CodecProfileLevel.HEVCProfileMain --
+	// the NDK has no named constant for it). c2.google.hevc.encoder also
+	// advertises Main10/HDR10/HDR10+ profiles (see MediaCodecEnum.java
+	// probe output); leaving this unset risked the codec silently picking
+	// one of those instead of the one-variable-at-a-time 8-bit comparison
+	// this test needs. Not set for AVC: that path already worked without
+	// it and this experiment changes as little as possible per stream.
+	if (hevc)
+		AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PROFILE, 0x1 /* HEVCProfileMain */);
 	// Byte-buffer input on Android is not guaranteed tightly packed by
 	// default -- some encoders (this Pixel's included, going by the
 	// symptom: green blocky corruption, the textbook sign of the chroma

@@ -116,12 +116,13 @@ class video_encoder_mediacodec : public video_encoder
 	// so this gets prepended by hand before every IDR we send.
 	std::vector<uint8_t> csd;
 
-	// Real per-stream bitrate/fps, cached so the lazily-created codec (see
-	// ensure_codec below) can be configured with the same values the
+	// Real per-stream bitrate/fps/codec, cached so the lazily-created codec
+	// (see ensure_codec below) can be configured with the same values the
 	// constructor would have used, without needing to hold onto the whole
 	// encoder_settings.
 	uint32_t bitrate;
 	float fps;
+	video_codec codec_kind;
 
 	// AMediaCodec_create/configure/start is deferred to the first actual
 	// present_image() call rather than done unconditionally in the
