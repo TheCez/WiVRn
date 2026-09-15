@@ -21,6 +21,7 @@
 #include "encoder/encoder_settings.h"
 #include "encoder/idr_handler.h"
 #include "os/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "utils/wivrn_vk_bundle.h"
 
@@ -34,6 +35,12 @@
 #include <vector>
 #include <media/NdkMediaFormat.h>
 #include <stdexcept>
+
+// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch entry): see
+// present_image()'s own comment at the call site. `adb shell setprop
+// debug.xrt.WIVRN_FORCE_GPU_WAIT 1` on Android; WIVRN_FORCE_GPU_WAIT env
+// var on desktop.
+DEBUG_GET_ONCE_NUM_OPTION(force_gpu_wait, "WIVRN_FORCE_GPU_WAIT", 0)
 
 namespace
 {
@@ -342,6 +349,20 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
 	                       *in[slot].fence);
+
+	// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch): the
+	// decisive brute-force synchronization test. If set, block the
+	// RENDER thread here until THIS copy is fully complete before
+	// returning from present_image() at all -- eliminating any
+	// possibility of the render thread moving on to other GPU work
+	// (the next frame's compute dispatch, the other stream's copy) while
+	// this copy is still in flight, rather than letting encode() wait on
+	// this fence later, asynchronously, on a different thread. If this
+	// eliminates the corruption, it proves a timing/synchronization gap
+	// (ours or the driver's); if it doesn't, timing is not the cause.
+	// `adb shell setprop debug.xrt.WIVRN_FORCE_GPU_WAIT 1`.
+	if (debug_get_num_option_force_gpu_wait())
+		(void) vk.device.waitForFences(*in[slot].fence, true, UINT64_MAX);
 }
 
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encode(uint8_t slot, uint64_t frame_index)
