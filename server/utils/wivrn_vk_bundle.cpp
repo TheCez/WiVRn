@@ -297,6 +297,14 @@ wivrn::vk_bundle::vk_bundle() :
 // coincidence, same underlying AHardwareBuffer<->Vulkan interop either way.
 #ifdef VK_ANDROID_external_memory_android_hardware_buffer
 		        VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+		        // Required by the spec whenever
+		        // VK_ANDROID_external_memory_android_hardware_buffer is
+		        // enabled (queue family ownership transfers to/from a
+		        // foreign entity, e.g. the hardware encoder/decoder, for
+		        // an AHB-imported image) -- was missing here, caught live
+		        // by Vulkan validation (vkCreateDevice
+		        // VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-01387).
+		        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 #endif
 // For FFMPEG
 #ifdef VK_EXT_external_memory_dma_buf
