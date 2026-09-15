@@ -173,6 +173,16 @@ wivrn::compositor::stream_image make_stream_image(
         vk::ImageUsageFlags extra_usage,
         const char * name)
 {
+	// Milestone 5 (docs/ANDROID_PORT.md's perf branch): add HOST_TRANSFER
+	// usage when the device supports VK_EXT_host_image_copy, so
+	// video_encoder_mediacodec.cpp can optionally read this image back
+	// via vkCopyImageToMemory() (no queue submission) instead of
+	// vkCmdCopyImageToBuffer() -- gated at the READ site by
+	// WIVRN_HOST_IMAGE_COPY, but the image itself needs this usage flag
+	// set at creation time regardless of whether that path is active
+	// this run.
+	vk::ImageUsageFlags host_transfer_usage = vk.host_image_copy ? vk::ImageUsageFlagBits::eHostTransfer : vk::ImageUsageFlags{};
+
 	vk::StructureChain image_info{
 	        vk::ImageCreateInfo{
 	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat | extra_flags,
@@ -182,7 +192,7 @@ wivrn::compositor::stream_image make_stream_image(
 	                .mipLevels = 1,
 	                .arrayLayers = 1,
 	                .samples = vk::SampleCountFlagBits::e1,
-	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | extra_usage,
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | host_transfer_usage | extra_usage,
 	        },
 	        vk::ImageFormatListCreateInfo{
 	                .viewFormatCount = uint32_t(formats.size()),

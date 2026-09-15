@@ -134,9 +134,21 @@ struct vk_bundle
 #ifdef VK_KHR_unified_image_layouts
 	        vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
 #endif
+#ifdef VK_EXT_host_image_copy
+	        vk::PhysicalDeviceHostImageCopyFeaturesEXT,
+#endif
 	        vk::PhysicalDeviceVulkan12Features,
 	        vk::PhysicalDeviceVulkan13Features>
 	        feat{};
+
+	// Milestone 5 (docs/ANDROID_PORT.md's perf branch): true if
+	// VK_EXT_host_image_copy (core in Vulkan 1.4) is both present and its
+	// hostImageCopy feature enabled -- lets video_encoder_mediacodec.cpp
+	// use vkCopyImageToMemory() instead of a queue-submitted
+	// vkCmdCopyImageToBuffer(), removing the readback step from GPU
+	// queue scheduling entirely (an experiment to see whether the
+	// concurrent-stream corruption is GPU-queue-contention-related).
+	bool host_image_copy = false;
 
 	std::vector<const char *> instance_extensions;
 	std::vector<const char *> device_extensions;

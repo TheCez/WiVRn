@@ -42,6 +42,19 @@
 // var on desktop.
 DEBUG_GET_ONCE_NUM_OPTION(force_gpu_wait, "WIVRN_FORCE_GPU_WAIT", 0)
 
+// Milestone 5 diagnostic: use vkCopyImageToMemory() (VK_EXT_host_image_copy,
+// core in Vulkan 1.4 -- confirmed present and fully supported for our
+// exact image shape on this device) instead of a queue-submitted
+// vkCmdCopyImageToBuffer() for the readback. Removes this stream's
+// readback entirely from GPU queue scheduling -- a mechanistically
+// different experiment from more/less synchronization or thread
+// staggering, testing whether the concurrent-stream corruption is
+// specifically GPU-queue-contention-related. Requires
+// vk_bundle::host_image_copy (device support, checked at runtime) in
+// addition to this toggle. `adb shell setprop
+// debug.xrt.WIVRN_HOST_IMAGE_COPY 1`.
+DEBUG_GET_ONCE_NUM_OPTION(host_image_copy, "WIVRN_HOST_IMAGE_COPY", 0)
+
 namespace
 {
 // MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar (Java-side
@@ -250,6 +263,57 @@ void wivrn::video_encoder_mediacodec::push_async(std::span<const uint8_t> payloa
 void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
 	ensure_codec();
+
+	// Milestone 5 diagnostic: vkCopyImageToMemory() path (see this file's
+	// own DEBUG_GET_ONCE_NUM_OPTION(host_image_copy, ...) comment above).
+	// Entirely synchronous from the render thread's point of view -- by
+	// the time this returns, in[slot].buffer already has the frame's
+	// bytes, so in[slot].fence is deliberately left untouched (still
+	// signaled from its creation/last real use): encode()'s existing
+	// waitForFences() on it is a harmless immediate-return in this path,
+	// not a code path split. The base class's own present_slot/
+	// encode_slot busy/idle gate (video_encoder.cpp) already guarantees
+	// no slot is reused while encode() is still reading it, independent
+	// of which copy mechanism filled it -- this path relies on exactly
+	// that existing guarantee rather than its own fence dance.
+	if (debug_get_num_option_host_image_copy() and vk.host_image_copy)
+	{
+		auto t_wait_begin = os_monotonic_get_ns();
+		vk::SemaphoreWaitInfo wait_info{
+		        .semaphoreCount = 1,
+		        .pSemaphores = &compositor_sem.semaphore,
+		        .pValues = &compositor_sem.value,
+		};
+		auto wait_result = vk.device.waitSemaphores(wait_info, 1'000'000'000);
+		t_present_fence_wait.sample(os_monotonic_get_ns() - t_wait_begin);
+		if (wait_result == vk::Result::eTimeout)
+		{
+			U_LOG_E("Timeout waiting for compositor semaphore on stream %d", stream_idx);
+			return;
+		}
+
+		std::array regions{
+		        vk::ImageToMemoryCopy{
+		                .pHostPointer = in[slot].buffer.map(),
+		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane0, .baseArrayLayer = 0, .layerCount = 1},
+		                .imageExtent = {.width = extent.width, .height = extent.height, .depth = 1},
+		        },
+		        vk::ImageToMemoryCopy{
+		                .pHostPointer = (uint8_t *) in[slot].buffer.map() + vk::DeviceSize(extent.width) * extent.height,
+		                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::ePlane1, .baseArrayLayer = 0, .layerCount = 1},
+		                .imageExtent = {.width = extent.width / 2, .height = extent.height / 2, .depth = 1},
+		        },
+		};
+		uint32_t region_count = stream_idx < 2 ? 2 : 1;
+		vk::CopyImageToMemoryInfo copy_info{
+		        .srcImage = y_cbcr,
+		        .srcImageLayout = vk::ImageLayout::eGeneral,
+		        .regionCount = region_count,
+		        .pRegions = regions.data(),
+		};
+		vk.device.copyImageToMemory(copy_info);
+		return;
+	}
 
 	// Identical to video_encoder_raw.cpp's present_image(): copy the
 	// compositor's already-NV12 image out to our own host-visible buffer.
