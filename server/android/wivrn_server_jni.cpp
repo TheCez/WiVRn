@@ -103,6 +103,28 @@ void apply_debug_dump_property()
 	setenv("WIVRN_TIMING_LOG", "1", 1);
 }
 
+// Turnip/adrenotools custom Vulkan driver (server/utils/vulkan_loader.cpp,
+// docs/ANDROID_PORT.md's Milestone 8): TU_DEBUG is Mesa's own real Turnip
+// debug env var, read via plain getenv() by the driver itself once loaded
+// -- setenv() here (before configure_vulkan_loader()/any real vk_bundle
+// construction) reaches it fine despite adrenotools loading Turnip into an
+// isolated linker namespace, since environment variables are process-wide,
+// not namespace-scoped. Turnip's own release notes call out
+// "TU_DEBUG=sysmem" specifically for "glitchy" rendering on some chips --
+// used live to test whether a real stereo duplication/ghosting bug seen on
+// a Snapdragon tablet (traced to something other than this project's own
+// compositor code, see Milestone 8) is this same class of issue.
+// `adb shell setprop debug.wivrn.tu_debug sysmem` (any TU_DEBUG value Mesa
+// accepts) before starting the server app.
+void apply_tu_debug_property()
+{
+	char value[PROP_VALUE_MAX] = {};
+	if (__system_property_get("debug.wivrn.tu_debug", value) <= 0 or value[0] == '\0')
+		return;
+
+	setenv("TU_DEBUG", value, 1);
+}
+
 // Mirrors server/ipc_server_cb.cpp's pattern (same method_pointer2 trampoline
 // technique) -- and MUST replicate its mainloop_entering/leaving behavior
 // exactly: instance::create_system() (target_instance_wivrn.cpp) asserts
@@ -371,7 +393,7 @@ std::string jstring_to_string(JNIEnv * env, jstring s)
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(
-        JNIEnv * env, jobject thiz, jstring native_lib_dir, jstring custom_driver_dir, jstring custom_driver_library_name)
+        JNIEnv * env, jobject thiz, jstring native_lib_dir, jstring custom_driver_dir, jstring custom_driver_library_name, jboolean sysmem_compat)
 {
 	if (server_thread)
 		return; // already running
@@ -431,6 +453,13 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(
 	wivrn::configuration::set_config_file("/data/data/org.meumeu.wivrn.server/files/config.json");
 
 	apply_debug_dump_property();
+	// DriverSettings.java's own "Compatibility mode" checkbox (see its
+	// comment): a real, user-facing on/off for the same TU_DEBUG=sysmem
+	// workaround apply_tu_debug_property() also exposes via adb property
+	// -- both set the same env var, so either can turn it on.
+	if (sysmem_compat)
+		setenv("TU_DEBUG", "sysmem", 1);
+	apply_tu_debug_property();
 
 	server_thread.emplace([](std::stop_token stop) {
 		run_server(stop);

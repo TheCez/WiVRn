@@ -70,7 +70,7 @@ public class WivrnServerService extends Service
 	// are both null for "use the system driver" (the default -- see
 	// DriverSettings/SettingsActivity for the only place either is ever
 	// non-null).
-	private native void nativeStart(String nativeLibDir, String customDriverDir, String customDriverLibraryName);
+	private native void nativeStart(String nativeLibDir, String customDriverDir, String customDriverLibraryName, boolean sysmemCompat);
 
 	private native void nativeStop();
 
@@ -155,7 +155,7 @@ public class WivrnServerService extends Service
 		if (!started)
 		{
 			DriverSettings driver = DriverSettings.load(this);
-			nativeStart(getApplicationInfo().nativeLibraryDir, driver.dir, driver.libraryName);
+			nativeStart(getApplicationInfo().nativeLibraryDir, driver.dir, driver.libraryName, driver.sysmemCompat);
 			started = true;
 		}
 

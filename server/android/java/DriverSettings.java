@@ -38,18 +38,30 @@ class DriverSettings
 	private static final String KEY_LIBRARY_NAME = "custom_driver_library_name";
 	private static final String KEY_DISPLAY_NAME = "custom_driver_display_name";
 	private static final String KEY_DRIVER_VERSION = "custom_driver_version";
+	// Turnip's own TU_DEBUG=sysmem: forces system-memory rendering instead
+	// of GMEM tiled rendering. Off by default (GMEM is normally a real
+	// performance win on tile-based Adreno GPUs) -- confirmed live that a
+	// real Turnip build has a GMEM-path stereo duplication/ghosting bug at
+	// least one app (VRChat) triggers, and TU_DEBUG=sysmem is Mesa's own
+	// documented workaround for it. Deliberately a separate, independently
+	// toggleable setting from the driver import itself: it's a per-app,
+	// try-it-if-you-see-artifacts thing, not something that should force
+	// itself on (and cost performance) for every app that doesn't need it.
+	private static final String KEY_SYSMEM_COMPAT = "custom_driver_sysmem_compat";
 
 	final String dir; // null == system default driver
 	final String libraryName;
 	final String displayName;
 	final String driverVersion;
+	final boolean sysmemCompat;
 
-	private DriverSettings(String dir, String libraryName, String displayName, String driverVersion)
+	private DriverSettings(String dir, String libraryName, String displayName, String driverVersion, boolean sysmemCompat)
 	{
 		this.dir = dir;
 		this.libraryName = libraryName;
 		this.displayName = displayName;
 		this.driverVersion = driverVersion;
+		this.sysmemCompat = sysmemCompat;
 	}
 
 	static DriverSettings load(Context context)
@@ -59,7 +71,16 @@ class DriverSettings
 		        prefs.getString(KEY_DIR, null),
 		        prefs.getString(KEY_LIBRARY_NAME, null),
 		        prefs.getString(KEY_DISPLAY_NAME, null),
-		        prefs.getString(KEY_DRIVER_VERSION, null));
+		        prefs.getString(KEY_DRIVER_VERSION, null),
+		        prefs.getBoolean(KEY_SYSMEM_COMPAT, false));
+	}
+
+	static void setSysmemCompat(Context context, boolean enabled)
+	{
+		context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+		        .edit()
+		        .putBoolean(KEY_SYSMEM_COMPAT, enabled)
+		        .apply();
 	}
 
 	static void save(Context context, String dir, String libraryName, String displayName, String driverVersion)
@@ -73,9 +94,18 @@ class DriverSettings
 		        .apply();
 	}
 
+	// Only the driver import itself -- deliberately leaves sysmemCompat
+	// alone (see its own field comment: an independent, per-app toggle,
+	// not something "reset driver" should silently flip back off).
 	static void clear(Context context)
 	{
-		context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
+		context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+		        .edit()
+		        .remove(KEY_DIR)
+		        .remove(KEY_LIBRARY_NAME)
+		        .remove(KEY_DISPLAY_NAME)
+		        .remove(KEY_DRIVER_VERSION)
+		        .apply();
 	}
 
 	boolean isCustom()

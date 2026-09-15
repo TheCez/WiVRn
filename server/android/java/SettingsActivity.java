@@ -25,6 +25,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -82,6 +83,21 @@ public class SettingsActivity extends Activity
 		resetButton.setText("Reset to system default");
 		resetButton.setOnClickListener(v -> resetToSystemDefault());
 		layout.addView(resetButton);
+
+		// Turnip's own TU_DEBUG=sysmem workaround for a real GMEM-path
+		// stereo duplication/ghosting bug confirmed live (at least one
+		// app, VRChat, triggers it; this project's own reference app does
+		// not) -- see DriverSettings.KEY_SYSMEM_COMPAT's own comment for
+		// why this is a separate, independently-toggleable setting rather
+		// than something forced on for every custom driver.
+		CheckBox sysmemCheckbox = new CheckBox(this);
+		sysmemCheckbox.setText("Compatibility mode (fixes some apps' stereo rendering, may reduce performance)");
+		sysmemCheckbox.setChecked(DriverSettings.load(this).sysmemCompat);
+		sysmemCheckbox.setOnCheckedChangeListener((buttonView, isChecked) -> {
+			DriverSettings.setSysmemCompat(this, isChecked);
+			Toast.makeText(this, "Restart the server for this to take effect", Toast.LENGTH_SHORT).show();
+		});
+		layout.addView(sysmemCheckbox);
 
 		setContentView(layout);
 		updateStatus();
