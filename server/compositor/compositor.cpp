@@ -85,6 +85,21 @@ DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 // reads the WIVRN_ONLY_STREAM env var normally.
 DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
 
+// Milestone 5 diagnostic, step 4 of the investigation plan: the
+// WIVRN_ONLY_STREAM isolation test (above) disables BOTH a stream's GPU
+// work (compute+copy, submitted unconditionally from the render thread
+// every frame) AND its CPU-side encode() call at once, so it can't tell
+// concurrent GPU dispatch/copy apart from concurrent encode() worker
+// threads (introduced in 89655cd4) as the actual locus of the
+// corruption. This toggle leaves GPU work for BOTH streams completely
+// unchanged (still submitted together, every frame) and only serializes
+// encode()'s std::jthread workers back to sequential calls on
+// encoder_work()'s own thread, exactly as they ran before 89655cd4. 0
+// (default) = current concurrent behavior; 1 = serialized. Same
+// property mechanism as WIVRN_ONLY_STREAM on Android: `adb shell setprop
+// debug.xrt.WIVRN_SERIALIZE_ENCODE 1`.
+DEBUG_GET_ONCE_NUM_OPTION(serialize_encode, "WIVRN_SERIALIZE_ENCODE", 0)
+
 namespace details
 {
 template <auto Method, typename Result, typename... Args>
@@ -716,6 +731,17 @@ void compositor::encoder_work(std::stop_token tok)
 		// concurrent encode() calls can now genuinely race on the same
 		// underlying socket where they never could before.
 		{
+			auto do_encode = [&](video_encoder * e) {
+				try
+				{
+					e->encode(session, image.view_info, image.frame_index);
+				}
+				catch (std::exception & ex)
+				{
+					U_LOG_W("encode error: %s", ex.what());
+				}
+			};
+
 			beman::inplace_vector::inplace_vector<std::jthread, 3> workers;
 			for (auto & encoder: encoders)
 			{
@@ -723,16 +749,10 @@ void compositor::encoder_work(std::stop_token tok)
 					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
 				{
-					workers.emplace_back([&, e = encoder.get()] {
-						try
-						{
-							e->encode(session, image.view_info, image.frame_index);
-						}
-						catch (std::exception & ex)
-						{
-							U_LOG_W("encode error: %s", ex.what());
-						}
-					});
+					if (debug_get_num_option_serialize_encode())
+						do_encode(encoder.get());
+					else
+						workers.emplace_back([&, e = encoder.get()] { do_encode(e); });
 				}
 			}
 			// workers' jthreads join here as it goes out of scope, before
