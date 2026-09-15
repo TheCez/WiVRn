@@ -2011,7 +2011,20 @@ known, none related to the corruption investigation:
    `VK_FORMAT_R8G8B8A8_UNORM` image without `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`
    set, repeated across multiple `vk_image_collection` images.
 
-Not yet fixed — flagged here so they aren't lost; worth a follow-up pass.
+**All three fixed.** #1 was our own device extension list
+(`wivrn_vk_bundle.cpp`, add `VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME`
+alongside the AHB extension it's required by). #2 and #3 were both in
+Monado's own vendored `vk_helpers.c`'s `vk_create_image_from_native()` —
+its sibling allocating function (`vk_image_allocator.c`'s `create_image()`)
+already handled both cases correctly (skips querying memory requirements
+for AHB images, forces `MUTABLE_FORMAT_BIT` on the same SRGB→UNORM
+downgrade), so the import path was brought in line with it via
+`patches/monado/0013-...patch` (this project's existing patch mechanism,
+see 0012 for precedent — not hand-edited, since it's re-fetched vendored
+source). Re-ran the validated session after all three fixes: session
+establishes normally, both encoders open, **zero validation messages at
+all** over an extended dual-stream run (confirmed clean, not just
+"no new ones" — these three were the entire prior list).
 
 **Corruption investigation relevance — the actually important result**:
 ran a real session under real dual-stream concurrent GPU-compute+encode
@@ -2042,6 +2055,24 @@ default AVC path with the same dual-stream load that normally produces the
 corruption, but corruption presence wasn't independently confirmed via
 `WIVRN_DUMP_VIDEO` in the same run) to be certain the validated window
 actually overlapped a corrupted frame, not just similar load conditions.
+
+**Calibrated answer to "is the corruption 100% confirmed to be the GPU
+driver's fault"**: no, not 100% — but the evidence strongly points that
+way. NV12 input is already corrupt before the encoder ever sees it (rules
+out MediaCodec/VPU-as-encoder); corruption scales sharply with concurrent
+GPU-compute+encode load (0.5–1.6% single-stream → 8–19% dual-stream);
+forcing maximum synchronization didn't help and serializing made it
+*worse* (the opposite of what fixing a real app-level race would do); and
+now Synchronization Validation — which specifically catches missing/
+incorrect barriers and hazards — found nothing over an extended real
+dual-stream run. That's a consistent picture pointing at genuine
+hardware/driver resource contention rather than a bug in this codebase's
+Vulkan usage. It's not airtight: Sync Validation only sees what the
+Vulkan API's own synchronization model can see, not e.g. a real SoC
+DRAM/L2 race or a driver scheduling bug that's "legal" per the API but
+still physically wrong — and the nonzero single-stream baseline (0.5–1.6%
+with zero concurrency) isn't fully explained by anything found so far
+either.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
