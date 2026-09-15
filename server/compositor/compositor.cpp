@@ -40,6 +40,8 @@
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 
+#include <chrono>
+
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -99,6 +101,22 @@ DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
 // property mechanism as WIVRN_ONLY_STREAM on Android: `adb shell setprop
 // debug.xrt.WIVRN_SERIALIZE_ENCODE 1`.
 DEBUG_GET_ONCE_NUM_OPTION(serialize_encode, "WIVRN_SERIALIZE_ENCODE", 0)
+
+// Milestone 5 diagnostic, next step after ruling out both CPU-thread
+// concurrency and plain synchronization gaps as the cause (neither
+// serializing encode() nor forcing maximal GPU-copy synchronization
+// reduced the corruption -- see docs/ANDROID_PORT.md): the leading
+// hypothesis is now genuine GPU/VPU resource contention between the two
+// streams' back-to-back GPU work and hardware-encoder submissions, not
+// a closeable race. This staggers (rather than serializes or
+// desynchronizes) the second stream's present_image() call and its
+// encode() worker-thread start by this many microseconds relative to
+// the first -- spreading the two streams' real GPU/VPU work apart in
+// time within the same frame period, instead of launching both at
+// once, while still updating both eyes every frame (no visual eye-lag
+// from skipping frames). 0 (default) = no change. `adb shell setprop
+// debug.xrt.WIVRN_STAGGER_US <microseconds>`.
+DEBUG_GET_ONCE_NUM_OPTION(stagger_us, "WIVRN_STAGGER_US", 0)
 
 namespace details
 {
@@ -568,12 +586,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
+	bool first_present = true;
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
 			continue;
+		if (auto us = debug_get_num_option_stagger_us(); us > 0 and not first_present)
+			std::this_thread::sleep_for(std::chrono::microseconds(us));
+		first_present = false;
 		encoder->present_image(
 		        stream_vk_image(encoder->stream_idx),
 		        sem_info,
@@ -743,12 +765,16 @@ void compositor::encoder_work(std::stop_token tok)
 			};
 
 			beman::inplace_vector::inplace_vector<std::jthread, 3> workers;
+			bool first_encode = true;
 			for (auto & encoder: encoders)
 			{
 				if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
 					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
 				{
+					if (auto us = debug_get_num_option_stagger_us(); us > 0 and not first_encode)
+						std::this_thread::sleep_for(std::chrono::microseconds(us));
+					first_encode = false;
 					if (debug_get_num_option_serialize_encode())
 						do_encode(encoder.get());
 					else
