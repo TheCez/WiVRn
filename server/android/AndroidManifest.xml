@@ -33,8 +33,25 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- extractNativeLibs=true: forces AGP to extract libopenxr_wivrn.so
+         to a real file (/data/app/.../lib/arm64/libopenxr_wivrn.so)
+         instead of the modern default of leaving it uncompressed inside
+         the APK and reporting a virtual "base.apk!/lib/arm64-v8a" path
+         via ApplicationInfo.nativeLibraryDir. Our own locally-built test
+         apps (this project's Unity template) resolve and dlopen that
+         virtual path fine via the org.khronos.openxr.runtime_broker
+         cross-process convention, but VRChat's bundled OpenXR-Loader logs
+         "library .../base.apk!/lib/arm64-v8a/libopenxr_wivrn.so does not
+         appear to exist" and falls back to XR_ERROR_RUNTIME_UNAVAILABLE;
+         its loader build appears not to support the in-APK "!"-path
+         convention. A real extracted path is the more universally-
+         compatible form (this is exactly what every runtime shipped before
+         uncompressed-native-lib packaging became AGP's default already
+         did), so this is the safer default for a runtime broker
+         specifically, regardless of which client loader version queries it. -->
     <application
-        android:label="WiVRn Server">
+        android:label="WiVRn Server"
+        android:extractNativeLibs="true">
 
         <activity
             android:name="org.meumeu.wivrn.server.MainActivity"

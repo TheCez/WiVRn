@@ -171,6 +171,16 @@ android {
         }
     }
 
+    // AGP wants this explicitly set to match AndroidManifest.xml's
+    // android:extractNativeLibs="true" (see that attribute's own comment) --
+    // otherwise it just warns and infers it, but stating it directly avoids
+    // relying on that inference.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
