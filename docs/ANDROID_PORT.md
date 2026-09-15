@@ -2339,6 +2339,392 @@ GameNative/Winlator work: the user supplies it) and interaction with the
 picker UI (Storage Access Framework's file-picker dialog needs a real touch
 interaction, not drivable blind over adb) to confirm end-to-end.
 
+## Milestone 8 follow-up — Turnip verified working on real hardware, HEVC lobby bug repeats, sysmem compat toggle added
+
+Closed the "not yet verified" gap above: got a real Turnip build for the
+tablet's Adreno 642L (`The412Banner/Banners-Turnip`, an automated bleeding-edge
+Mesa CI packager — picked over the more curated `K11MCH1/AdrenoToolsDrivers`
+repo purely because it was tested first; see below for why the K11MCH1 R8
+line turned out to be a worse choice for this device), imported it through
+the Milestone 8 settings UI, and confirmed: `synchronization2` now present,
+GPU-name log shows Turnip/Mesa instead of the Qualcomm proprietary string, no
+`XRT_FEATURE`-level regression on the Pixel/S22 (unchanged, re-verified),
+session reaches `XR_SESSION_STATE_FOCUSED` with a real Quest connected, both
+hardware encoders reach `RUNNING`.
+
+Two more real, on-device findings from that first successful run:
+
+- **The already-documented Milestone 5 HEVC "stuck in lobby, no shard
+  received" transport bug reproduces on this device too** — same fix as the
+  S22 (`config.json`: `{"encoder":{"codec":"h264"}}` to force AVC). Not a new
+  bug, just confirmation it's driver/device-independent.
+- **`TU_DEBUG=sysmem`** (Mesa's own documented Turnip env var, forces
+  system-memory rendering instead of GMEM tile-based rendering; Turnip's own
+  release notes call it out for "glitchy" rendering on some chips) visibly
+  fixed a *static* stereo duplication/ghosting artifact seen in one early
+  screenshot. Exposed as a real, persisted, opt-in toggle rather than an
+  always-on env var: `DriverSettings.java` gained a `sysmemCompat` boolean
+  (`SettingsActivity.java`'s "Compatibility mode" checkbox), threaded all the
+  way through `WivrnServerService.nativeStart()` → `wivrn_server_jni.cpp` →
+  `setenv("TU_DEBUG", "sysmem", 1)`. Deliberately opt-in, not default-on:
+  GMEM tiling is a real performance win on tile-based Adreno GPUs, and this
+  session's own testing later found a real Adreno-vs-Xclipse latency gap the
+  user could feel, so forcing sysmem for every app regardless of need isn't
+  free. (There is also an independent `debug.wivrn.tu_debug` adb property
+  path into the same `setenv()` call, for testing arbitrary `TU_DEBUG` values
+  without rebuilding — both paths set the same env var, either can turn it
+  on.)
+
+**Important correction found later in the same investigation**: the
+"duplication" artifact `sysmem` fixed turned out to be a *different*, milder
+bug than the actual VRChat-specific stereo problem described below — fixing
+one static-screenshot artifact does not mean the underlying issue is solved.
+Don't treat `sysmemCompat` as a real fix for the Milestone 9 investigation;
+it's a real, narrower workaround for a real, narrower symptom.
+
+## Milestone 9 — Steam Frame's OpenXR interaction profile (`XR_VALVE_frame_controller_interaction`): VRChat's controllers were completely unbound, not just unrendered
+
+**Root cause, confirmed with real log evidence, not assumption**: VRChat's
+Android build makes exactly one `xrSuggestInteractionProfileBindings` call
+covering the *entire session* — for `/interaction_profiles/valve/frame_controller_valve`
+— and never falls back to any other profile if it fails. Confirmed by
+grepping a full clean session's log for every `SuggestInteractionProfileBindings`
+call: only ever the one, for Valve's profile, failing with
+`XR_ERROR_PATH_UNSUPPORTED`. This means whatever profiles this driver already
+supported (plain Oculus Touch, Touch Pro, Touch Plus, all already enabled —
+see Milestone list of `XRT_FEATURE_OPENXR_INTERACTION_*` flags in
+`server/CMakeLists.txt`) were **entirely irrelevant** to this bug: VRChat
+never asked for any of them.
+
+Separately, VRChat's own `SteamFrameControllerModel` subsystem (visible/
+render-model fetching specifically, not input) depends on
+`XR_EXT_uuid`/`XR_EXT_render_model`/`XR_EXT_interaction_render_model`, none of
+which Monado implements (`xrEnumerateInteractionRenderModelIdsEXT` etc. all
+fail to resolve, `result=-7` = `XR_ERROR_FUNCTION_UNSUPPORTED`) — this affects
+only the visual controller *mesh*, and is a separate, still-open gap from the
+input-binding fix below.
+
+**Why this extension exists at all and why we can't just make VRChat ask for
+Oculus Touch instead**: per Valve's own published `com.valvesoftware.openxr.utils`
+Unity package docs (`github.com/ValveSoftware/Unity`) — the only real,
+first-party source found for this extension, since it is not yet in the
+public Khronos registry — *"Without this profile, Steam Frame controllers
+are presented to your application as emulated Oculus Touch controllers."*
+VRChat's Android build has this Unity feature compiled in and enabled, so it
+unconditionally suggests bindings only for the Frame profile; there is no
+app-side fallback behavior we can influence from the runtime side. The only
+real fix is implementing the profile.
+
+**What landed** (all in `patches/monado/0015-*.patch`, applied through the
+existing `patches/monado/` + `apply.sh` mechanism used for every other Monado
+patch in this repo — regenerated via a real clone of Monado at the pinned
+`monado-rev` commit, with every existing patch reapplied first, then
+`git format-patch`, not a hand-written diff):
+
+- `XRT_DEVICE_VALVE_FRAME_CONTROLLER` — new `xrt_device_name` enum value
+  (`xrt_defines.h`; this one enum is hand-maintained, unlike `XRT_INPUT_*`/
+  `XRT_OUTPUT_*` which are too, it turns out — see below).
+- ~35 new `XRT_INPUT_VALVE_FRAME_CONTROLLER_*` / one
+  `XRT_OUTPUT_NAME_VALVE_FRAME_CONTROLLER_HAPTIC` enum values, at the next
+  free hex block (`0x16`, `0x0D00`) — confirmed the true next-free block by
+  scanning all existing `XRT_INPUT_NAME(0x.., ...)` values case-insensitively
+  first (a first pass using only lowercase `0x` missed the `0X15` block
+  already used by `MAGNETRA2`, giving a wrong answer — case-insensitive scan
+  caught it).
+- The actual `/interaction_profiles/valve/frame_controller_valve` profile
+  entry in `bindings.json` (Monado's own interaction-profile source of
+  truth, code-generates the binding tables from this one file) — component
+  paths (trigger/squeeze/thumbstick/bumper/menu/view/system/a/b/x/y/dpad_up/
+  dpad_left/dpad_down/dpad_right/grip/aim/haptic, including which are
+  `"side"`-restricted to one hand) verified against Valve's own published
+  doc table, **including every `click`+`touch` component**, not a trimmed
+  subset — a first attempt that dropped `touch` components to save effort
+  failed live (`xrSuggestInteractionProfileBindings` rejected a real
+  VRChat-requested binding for `/user/hand/left/input/squeeze/touch` because
+  that subpath didn't exist in our trimmed schema) and had to be redone in
+  full.
+- `oxr_extension_support.py`: registers `XR_VALVE_frame_controller_interaction`
+  the same way every other vendor extension is, one line, alphabetically
+  sorted with the rest.
+- Root `CMakeLists.txt`: new `XRT_FEATURE_OPENXR_INTERACTION_VALVE_FRAME_CONTROLLER`
+  option (default `OFF`, matching the pattern for other niche/new vendor
+  extensions like `LOGITECH_MX_INK`); turned `ON` in *this project's*
+  `server/CMakeLists.txt`, not upstream Monado's default.
+- **The one non-obvious, easy-to-miss piece**: adding the CMake `option()`
+  alone does nothing — `xrt_config_build.h.cmake_in` needs its own explicit
+  `#cmakedefine XRT_FEATURE_OPENXR_INTERACTION_VALVE_FRAME_CONTROLLER` line,
+  or the option's value never becomes an actual compiler-visible `#define`
+  anywhere. Missing this produced a very specific, confusing intermediate
+  symptom worth remembering: the interaction profile *path* got recognized
+  (bindings.json/xrt_defines.h changes were live), but Monado still rejected
+  the app's call with a *different* error — `"used but
+  XR_VALVE_frame_controller_interaction not supported by runtime"` — because
+  the extension-support macro was never actually compiled in. Two visibly
+  different Monado error strings for "profile path unknown at all" vs.
+  "profile known but extension not enabled" turned out to be the key clue.
+- `openxr.h` (vendored inside Monado's own `external/` tree) needed the
+  extension's name/version macros hand-added — confirmed first via grep that
+  this extension genuinely isn't in the currently-vendored public OpenXR
+  headers at all (only the older, unrelated `XR_VALVE_analog_threshold`
+  exists), so there was nothing to pick up automatically.
+- `server/driver/wivrn_controller.cpp`: a new `frame_controller_input_binding[]`
+  / `frame_controller_output_binding[]` table plus a
+  `.name = XRT_DEVICE_VALVE_FRAME_CONTROLLER` entry in
+  `make_binding_profiles()` — the exact same "remap this profile's abstract
+  inputs onto whatever real inputs this device actually has" mechanism
+  already used for Touch Pro/Touch Plus/Vive Focus 3, just for a fifth
+  profile. Real Quest Touch controllers have no bumper, no system button, no
+  dpad, no second per-hand menu button, and no discrete trigger/squeeze
+  *click* (analog value only) — those components stay declared in the
+  profile (so the app's binding call still succeeds) but simply unbound in
+  this table, which is legal and harmless (the app just never receives input
+  for them). One asymmetry worth remembering: Frame's own controller has a
+  menu-equivalent on *both* hands (`menu` on right, `view` on left); real
+  Quest Touch has only one, on the left — only `view` (left) gets bound to
+  our real menu input, `menu` (right) stays unbound.
+
+**Verified live**: with this patch, VRChat's `xrSuggestInteractionProfileBindings`
+call for the Frame profile succeeds with no error at all (previously failed
+every time), and the user confirmed controllers work in-session
+(pointing/aiming, button input) after this landed. The
+`XR_EXT_render_model`-family gap (visible controller *mesh*) remains open —
+VRChat's own `SteamFrameControllerModel` still logs "Feature not ready" for
+that specific piece, separately from input, which now works.
+
+**Real supporting research, not guessed**: fetched the actual, current
+`xrt_device_name`/`xrt_input_name` enum, `bindings.json` schema
+(`bindings.schema.json`), and `oxr_extension_support.py` list from a live
+clone of Monado at the exact pinned commit before writing anything — same
+standing rule as every other patch in this repo. Component paths came from
+Valve's own real published Unity package docs (raw file, not an AI-summarized
+version — a first pass at this specific doc via a summarizing fetch produced
+a subtly different, less precise component layout than the raw source; only
+the raw doc gave the real per-hand path table used above). Also checked (and
+ruled out) Monado's own upstream `master` branch and this device's SteamVR
+install for any existing implementation of this extension before starting —
+neither had anything; this is a real, from-scratch first implementation.
+
+## Milestone 10 (still open) — VRChat stereo-fusion / right-eye desync investigation on Adreno/Turnip
+
+A separate, harder problem from Milestone 9, on the same Adreno tablet:
+VRChat's stereo image doesn't fuse correctly through the headset — reported
+as overlapping/cross-eyed, "wobbly"/curved UI panel edges, a vertical
+up/down mismatch between eyes, and edge content disappearing/reappearing
+when turning the head. This project's own reference test app (Unity URP
+blank template) shows none of this on the same server/driver setup, isolating
+it to VRChat specifically (or to VRChat's interaction with this specific
+Adreno/Turnip combination — see below, not fully resolved either way).
+
+**Ruled out, with real on-device evidence, not assumption, in this order**:
+
+1. **Server-side per-view pose/FOV/array-index extraction**
+   (`compositor.cpp`'s `layer_commit()` fast path) — a temporary per-frame
+   diagnostic (kept, gated behind `debug.xrt.WIVRN_LOG_VIEW_POSE`, see
+   `log_view_pose` in `compositor.cpp`) proved both views get correct,
+   symmetric pose data every single frame: only X differs, by a constant IPD
+   offset; orientation is identical between eyes every frame, evolving
+   smoothly and correctly with real head motion. This rules out our own
+   view-extraction code.
+2. **`multi_layer_stream_images`'s shared 3-layer fast path** (Milestone 6) —
+   a runtime override (`WIVRN_MULTI_LAYER_STREAM_IMAGES` debug property,
+   already committed in `wivrn_vk_bundle.cpp`) reproduced the identical bug
+   with the fast path forced off, ruling out our own layer-squashing/packing
+   code.
+3. **The compositor's write path into its own internal stream image** —
+   traced `layer_commit()`'s fast-path view extraction →
+   `foveation::foveate()`'s per-eye compute dispatch (binds `src[0]`/`src[1]`,
+   writes `content[0]`/`content[1]` via a per-eye push constant, `eye=0`
+   writes from `src[0]`, `eye=1` from `src[1]`) → the `foveation.comp` shader
+   itself (`iz = pc.eye`, reads `source[iz]`, writes to that eye's own
+   dedicated destination image) end-to-end. Every stage is self-consistent
+   and matches standard OpenXR view-0-is-left convention; no swap or
+   cross-wiring found anywhere by reading the code.
+4. **Server-side foveation index-table math** (`fill_ubo()`/`compute_params()`
+   in `foveation.cpp`) — a real, well-founded suspicion (an unsigned
+   underflow producing huge/wrapped index values, matching the
+   user's own "content from the right edge reappears at the left edge"
+   description almost exactly) was directly disproven with real captured
+   data: added logging (gated behind `debug.xrt.WIVRN_LOG_FOVEATION_UBO`,
+   see `log_foveation_ubo`) of the actual per-eye source rect and the first/
+   last 5 entries of each eye's UBO index table. Both eyes' tables are
+   clean, monotonic, and correctly bounded to the real source extent (1728px)
+   — no underflow, no huge values. The two eyes' tables differ only in
+   *density distribution* (a legitimate, expected difference from
+   per-eye foveation-center placement), not in correctness.
+5. **A pure gaze/eye-position-driven asymmetry in the foveation center**
+   specifically — `debug.xrt.WIVRN_DISABLE_FOVEATION` (misleadingly named;
+   it does *not* disable foveation/compression — doing that outright
+   crashes, `fill_ubo()` asserts `count>0`, confirmed live, since this
+   device's actual encode resolution is genuinely smaller than VRChat's real
+   render resolution and the "no compression" code path assumes the
+   opposite) forces the foveation *center* to dead-ahead (angle 0) for both
+   eyes symmetrically, leaving the real compression ratio/math untouched.
+   The wobble/seam persisted with this active, ruling out gaze-driven
+   center asymmetry as the (sole) cause.
+
+**Confirmed real and reproducible, with hard evidence**:
+
+- **A genuine content-association issue exists somewhere upstream of the
+  final encoder read.** Swapping which array layer each MediaCodec encoder
+  instance reads from (`WIVRN_SWAP_EYE_LAYERS` debug property,
+  `video_encoder_mediacodec.cpp`'s `image_layer()` — deliberately only the
+  encoder's own *read* side, not `compositor.cpp`'s `image_layer()`, which
+  also governs where the compositor *renders/writes* each eye and would
+  change actual rendering, not just which content ends up on which
+  channel) measurably reduced the overlapping/cross-eyed sensation. This is
+  real signal, **not yet root-caused** — the compositor's own write path was
+  independently verified correct in step 3 above, so either VRChat itself
+  submits its two stereo views in a non-standard order for this specific
+  runtime/profile combination, or the actual association error is
+  client-side (decoder-to-eye texture/array-layer mapping on the Quest,
+  never directly tested — see below). **Do not treat the encoder-side swap
+  as a fix**: it defaults off, and the user's own follow-up testing showed a
+  *different*, still-unexplained symptom (right-eye horizontal
+  wrap-around/seam, described below) persists regardless of this swap,
+  meaning it papers over one symptom without addressing the actual cause.
+- **A separate, later, much more specific symptom, found by decoding the raw
+  H.264 the server actually sent (before any client/network/decoder
+  involvement) frame-by-frame**: the right eye shows a sharp, consistent
+  vertical seam around x≈143 of 896px, described by the user as content
+  from the right edge appearing to wrap to the left edge. **Proven to
+  originate before encoding, not after**: extracted a single clean raw NV12
+  frame directly from the pre-MediaCodec buffer dump (`WIVRN_DUMP_VIDEO`/
+  `WIVRN_DUMP_NV12`, gated behind `debug.wivrn.dump`, both already existing
+  Milestone 5 mechanisms) for both eyes at the same frame index, decoded via
+  `ffmpeg -f rawvideo -pixel_format nv12`, and the seam is already visibly
+  present in the right eye's raw pre-encode buffer, absent from the left's.
+  This rules out MediaCodec, H.264, the network, and the client decoder —
+  the corruption is server-side, before encoding.
+- **This is genuinely correlated with the Turnip driver specifically, not
+  our own compositor code, based on the evidence gathered so far**: steps
+  1–4 above independently verified every piece of *our own* compositor code
+  in this path (pose/view extraction, layer packing, the write dispatch
+  itself, the foveation index math) is correct. That leaves either a Turnip/
+  Adreno GPU synchronization or execution bug in this exact compute dispatch
+  (candidates not yet directly tested: the per-eye descriptor-set caching in
+  `foveation::foveate()`, which only rewrites bindings 1–5 "when they
+  haven't changed since last time" while binding 0 — the source images — is
+  rewritten unconditionally every frame; or a missing/incorrect barrier
+  between VRChat's own render of its right-eye view and this compute
+  shader's read of it), or VRChat's own view submission order being
+  non-standard for this specific runtime — **not yet distinguished between
+  the two**.
+
+**A real technical side-finding from this investigation, independent of the
+stereo bug itself**: got the WiVRn *client* (the Quest-side app, root Gradle
+project — previously undocumented as unbuildable from this from-scratch
+toolchain, see the Toolchain table) to compile successfully for the first
+time, all the way to the final link step, by resolving three more missing
+host tools the same documented way as `gettext`/`rsvg-convert`/`ktx`:
+- `glslang-tools` (provides `glslangValidator`, the actual shader compiler
+  `CompileGLSL.cmake`'s `Vulkan::glslangValidator` target needs) — obtained
+  via `apt-get download glslang-tools` + `dpkg-deb -x`, same no-root pattern
+  as every other host tool in this project.
+- `gettext`'s own `msgfmt` additionally needed its runtime shared library
+  (`libgettextsrc-0.21.so`, under the same extracted package's `lib/`
+  directory) on `LD_LIBRARY_PATH` — present in the extracted package all
+  along, just never linked into the environment before.
+- CMake's `find_program`/`find_package(Vulkan)` results get cached at
+  configure time — adding a tool to `PATH` after a previous failed configure
+  requires actually deleting the stale `.cxx` build directory to force a
+  real reconfigure, not just re-running Gradle.
+
+Build stopped one step short of a working APK: the final link fails with
+`ld.lld: error: undefined symbol: vkGetDeviceBufferMemoryRequirements` (and
+`vkGetDeviceImageMemoryRequirements`) — VMA (`external/vk_mem_alloc.h`,
+`VMA_VULKAN_VERSION=1003000` set in `common/CMakeLists.txt`) statically links
+against these Vulkan 1.3 core-promoted symbols by default
+(`VMA_STATIC_VULKAN_FUNCTIONS`), and the NDK's build-time stub `libvulkan.so`
+(used only for link-time symbol resolution, not the real on-device driver)
+doesn't export them. The known, standard fix — `VMA_STATIC_VULKAN_FUNCTIONS=0`
++ populating a `VmaVulkanFunctions` struct with at least
+`vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` so VMA fetches the rest
+dynamically — was identified but not yet applied (`common/vk/vk_allocator.cpp`
+doesn't populate `pVulkanFunctions` at all today, and this macro is set at
+the shared `wivrn-common` target level, used by both client and server, so
+the fix should be scoped to avoid any server-side behavior change). **A
+real, live client build (with the `debug_swap_eyes()` diagnostic already
+added in `client/scenes/stream.cpp`, gated behind
+`debug.wivrn.swap_eyes`) is the most direct remaining way to test whether
+this is a client-side eye/texture-association bug** rather than continuing
+to reason about it from server-side evidence alone — this is the natural
+next step if this investigation continues.
+
+**A related, separate, still-open observation from the same testing**:
+edge content disappearing/reappearing when turning the head, and "curling"
+of straight lines during head motion, look like a distinct reprojection/
+FOV-overscan-margin symptom (the runtime timewarping to a newer head pose
+than what was actually rendered, revealing the edge of a render that has no
+extra margin past its own FOV) rather than a left/right association problem
+— raised late in this investigation and not yet chased down.
+
+**Driver testing matrix, for the record (all real, on-device tests, not
+guesses)** — every alternative to the originally-working
+`The412Banner/Banners-Turnip` build made things *worse*, not better, on this
+device:
+
+| Driver | Source | Result |
+|---|---|---|
+| `Turnip-v26.3.0-20260915-r4.zip` | The412Banner/Banners-Turnip | **Working baseline** — runs VRChat, has the stereo bug above |
+| `Turnip_v26.0.0_R8.zip` | K11MCH1/AdrenoToolsDrivers | Crashes: `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` importing VRChat's own AHardwareBuffer swapchain |
+| `Turnip_v26.0.0_R8_Sysmem.zip` | K11MCH1/AdrenoToolsDrivers | Same crash — confirms it's the DRM-modifier/tiled-layout import path, not GMEM tiling, since sysmem forcing doesn't touch it |
+| `Turnip 22.3.6` (user-sourced) | unknown | Loads, `synchronization2` present, but this build predates Mesa's AHardwareBuffer/external-memory Vulkan support — `VkExternalMemoryTypeFlagBits(0x400) unsupported`, segfaults in the compositor thread |
+| 4 proprietary Qualcomm driver blobs (`v819.2`, `v837`, `v840`, `v849`) | K11MCH1/AdrenoToolsDrivers | All extracted from 2024–2025 flagship devices (Quest 3, Meta Ray-Ban Display, a Vivo iQOO phone) — all Adreno 7xx/8xx, a real architecture mismatch with this A6xx tablet. All fail with the exact original blocker: `GPU does not support Vulkan synchronization2 feature` |
+
+No proprietary/vendor driver update path exists for this exact GPU
+generation (Adreno 642L, Snapdragon 778G, A6xx) — every available package is
+sourced from a materially newer chip family. Turnip remains the only route
+to a working `synchronization2`-capable driver on this hardware.
+
+## Milestone 11 (new device, still open) — Galaxy S22 (Exynos 2200 / Xclipse 920): MdiEx driver test, VRChat renders nothing
+
+Separate device, separate investigation, prompted by testing whether
+`avavo/MdiEx` (a Samsung Xclipse driver package, bundled for Winlator/DXVK
+game-compatibility use, not built for this project) could help or hurt
+anything here. **Key finding: our own existing adrenotools-based custom
+driver mechanism needed zero code changes to work on this non-Adreno
+device** — confirmed from adrenotools' own real hook source
+(`bylaws/libadrenotools`, `hook_impl.cpp`): its `hook_android_dlopen_ext`
+only checks `strstr(filename, "vulkan.")`, the generic Android HAL driver
+naming convention (`vulkan.<ro.hardware.vulkan>.so`, `vulkan.samsung.so` on
+this device) used by every GPU vendor, not anything Adreno-specific. The one
+real Adreno-only piece (GSL memory-mapping hooks, `ADRENOTOOLS_DRIVER_GPU_MAPPING_IMPORT`)
+is a separate opt-in feature flag this project's own `vulkan_loader.cpp`
+never sets. Repackaged MdiEx's raw `vulkan.xclipse2.0.0.so` (extracted
+Samsung driver, no Vortek/Wine-compat layer — that's irrelevant for a native
+Vulkan app) with a hand-written ADPKG-compatible `meta.json`, and it loaded
+and ran successfully through the existing Settings UI with no new code.
+
+**What was ruled out**: an initial theory (zero AHardwareBuffer-exportable
+depth formats reported: `VK_FORMAT_D32_SFLOAT`/`D16_UNORM`/`D24_UNORM_S8_UINT`/
+etc. all "not supported") was directly disproven — the identical pattern
+appears with the *stock* system driver too, confirmed by resetting to system
+default and re-testing. Not a MdiEx regression; very likely unrelated to
+normal (non-AHardwareBuffer-export) rendering entirely.
+
+**Confirmed, with real evidence**: VRChat has never successfully rendered on
+this device (unlike the Adreno tablet) — audio and world logic run fine
+(confirmed: ambient audio plays, session stays connected), but the headset
+receives solid black frames, and — using the same pre-encode NV12 dump
+technique from Milestone 10 — the frame is **already solid black before our
+compositor/encoder/driver choice ever touches it**, identically on both the
+stock driver and MdiEx. This rules out our server code, the encoder, and the
+driver choice entirely: VRChat's own Vulkan rendering successfully creates
+and imports its swapchain (correct format `VK_FORMAT_R8G8B8A8_SRGB`, correct
+1728x1910 size, logged via `comp_swapchain_import_init`) but never actually
+draws real content into it.
+
+A related but likely-separate symptom found in the same session: VRChat's
+`AVProVideo` plugin (its in-world video player) continuously throws
+`GL_INVALID_FRAMEBUFFER_OPERATION` from an **ANGLE-on-Vulkan** OpenGL ES
+context (`glRenderer: ANGLE ((Samsung Xclipse 920) on Vulkan 1.3.279)`) — a
+separate rendering subsystem from VRChat's main scene, which uses native
+Vulkan directly. Not yet confirmed whether this is the actual cause of the
+blank main render or an unrelated broken subsystem; not chased further this
+session. This looks like a VRChat/Unity-on-Xclipse compatibility problem
+specific to VRChat's own rendering, not something fixable by changing our
+Vulkan driver — no proprietary or open driver swap changed the outcome.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
