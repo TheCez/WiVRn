@@ -2192,6 +2192,85 @@ code path as before). If a third, non-PowerVR device is ever added to
 this investigation, it's worth re-confirming this way rather than
 assuming.
 
+## Milestone 7 — VRChat fell back to flat 2D: a native-lib-extraction bug, not a Monado version issue
+
+Third-party OpenXR apps installed on the S22 had a spotty history in this
+project (per earlier investigation: only this project's own locally-built
+Unity template app reliably worked; `somar`/`openxrdemo` did not). VRChat
+specifically launched but silently fell back to flat 2D on the phone's own
+screen instead of ever entering VR -- prompted by a report that the
+latest Monado master branch fixes this class of problem for Valve's
+Steam Frame headset. Rather than assume that report applied here and
+blindly bump Monado's vendored revision, captured VRChat's own
+`OpenXR-Loader` log on-device first (`adb logcat --pid=<vrchat pid>`) to
+see the actual failure, per the plan to test and read logs before
+changing anything.
+
+**The real cause, found directly in the log**: VRChat's loader queries
+the standard `content://org.khronos.openxr.runtime_broker` provider,
+correctly resolves our package and `libopenxr_wivrn.so`, then fails:
+
+```
+Got runtime: package: org.meumeu.wivrn.server, so filename: libopenxr_wivrn.so,
+    native lib dir: .../base.apk!/lib/arm64-v8a, has functions: no
+Error: library .../base.apk!/lib/arm64-v8a/libopenxr_wivrn.so does not appear to exist
+Error: RuntimeInterface::LoadRuntimes - failed to load a runtime
+[XR] xrCreateInstance: XR_ERROR_RUNTIME_UNAVAILABLE
+```
+
+Modern AGP defaults to `android:extractNativeLibs=false`: native `.so`
+files are stored **uncompressed inside the APK** rather than extracted
+to real files, and `ApplicationInfo.nativeLibraryDir` reports a virtual
+`base.apk!/lib/arm64-v8a`-style path (Android's dynamic linker supports
+`dlopen()`-ing directly from an uncompressed APK entry since API 23).
+Confirmed via `unzip -lv` that our APK's `.so` files were indeed stored
+this way (`Stored`, 0% compression). This project's own locally-built
+Unity template app's `OpenXR-Loader` build handles that virtual path
+fine (confirmed working throughout this whole investigation); VRChat's
+bundled `OpenXR-Loader` build apparently doesn't -- it tries something
+like a plain `access()`/`open()` on that literal `!`-containing string,
+which isn't a real filesystem path.
+
+**Checked whether this was actually a Monado-version issue before
+concluding it wasn't**: cloned upstream Monado
+(`https://gitlab.freedesktop.org/monado/monado.git`, network access to
+which does work in this environment) and diffed all 117 commits between
+our pinned `monado-rev` and `origin/main`. None touch anything
+Android/native-lib/runtime-broker/Steam-Frame related. Whatever the
+Reddit report was describing, it isn't in Monado's own commit history in
+a way that would explain this specific symptom -- this bug lives
+entirely in the Android APK packaging (WiVRn-Android's own
+`server-app/build.gradle`/`AndroidManifest.xml`), not in Monado at all.
+**Did not bump Monado's vendored revision** -- would have changed
+nothing for this bug and adds real risk (all of `patches/monado/*.patch`
+are pinned against the current rev).
+
+**Fix**: `android:extractNativeLibs="true"` in
+`server/android/AndroidManifest.xml` (plus the matching
+`packagingOptions.jniLibs.useLegacyPackaging = true` AGP wants set
+alongside it, in `server-app/build.gradle`) forces Android to actually
+extract the native libs to a real file at install time
+(`legacyNativeLibraryDir`, confirmed via `dumpsys package` and a direct
+`ls` on-device: a real, world-readable `-rwxr-xr-x` file). This is a
+strictly more compatible default for a *runtime broker* specifically,
+regardless of which client loader version ends up querying it -- every
+runtime shipped before uncompressed-native-lib packaging became AGP's
+default already worked exactly this way.
+
+**Verified live on the S22**: VRChat's `OpenXR-Loader` now successfully
+resolves and loads `libopenxr_wivrn.so`, `xrCreateInstance` succeeds, and
+the session reaches `XR_SESSION_STATE_FOCUSED` -- VRChat genuinely
+enters VR instead of falling back to flat 2D. No crash on either process.
+One remaining, unrelated, non-fatal item: `XR_ERROR_PATH_UNSUPPORTED` for
+Valve's Steam-Frame-specific interaction profile
+(`/interaction_profiles/valve/frame_controller_valve`), which this
+Monado build doesn't implement -- VRChat falls back to its other
+supported interaction profiles for this and it isn't a blocker. Worth
+re-testing whether `somar`/`openxrdemo` (the other previously-failing
+third-party apps from earlier in this investigation) are also fixed by
+this same change, since their failure mode was never conclusively
+isolated to this exact cause.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
