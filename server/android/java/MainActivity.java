@@ -18,8 +18,11 @@
 
 package org.meumeu.wivrn.server;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Menu;
@@ -42,6 +45,9 @@ import java.util.Set;
 // can't drift apart.
 public class MainActivity extends Activity implements WivrnServerService.ConnectionListener
 {
+	private static final int REQUEST_RECORD_AUDIO = 1;
+	private static final int REQUEST_MEDIA_PROJECTION = 2;
+
 	private TextView status;
 
 	@Override
@@ -55,6 +61,8 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 		else
 			startService(intent);
 
+		requestAudioStreamingPermissions();
+
 		status = new TextView(this);
 		status.setTextSize(20);
 		status.setPadding(48, 96, 48, 48);
@@ -62,6 +70,60 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 		setContentView(status);
 
 		WivrnServerService.setConnectionListener(this);
+	}
+
+	// Speaker audio (game -> headset) needs both RECORD_AUDIO (runtime
+	// permission, dangerous group) and a MediaProjection consent grant --
+	// there is no audio-only variant of that system dialog, it's the same
+	// "Start recording or casting?" prompt used for screen capture (see
+	// docs/building.md). Requested once here at server start rather than
+	// lazily on first headset connect, so the prompt doesn't interrupt an
+	// already-streaming session.
+	private void requestAudioStreamingPermissions()
+	{
+		if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+			requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+		else
+			requestMediaProjection();
+	}
+
+	@Override
+	public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults)
+	{
+		if (requestCode == REQUEST_RECORD_AUDIO)
+		{
+			if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED)
+				requestMediaProjection();
+			// Denied: no speaker audio this session (WivrnServerService's
+			// startAudioCapture already handles a null/failed AudioRecord
+			// gracefully -- streaming itself is unaffected).
+		}
+	}
+
+	private void requestMediaProjection()
+	{
+		MediaProjectionManager manager = getSystemService(MediaProjectionManager.class);
+		startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION);
+	}
+
+	@Override
+	protected void onActivityResult(int requestCode, int resultCode, Intent data)
+	{
+		super.onActivityResult(requestCode, resultCode, data);
+		if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null)
+		{
+			// Must happen before getMediaProjection() below -- that call
+			// itself throws SecurityException ("Media projections require a
+			// foreground service of type
+			// ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION") unless
+			// the service is already running with that type active. Found
+			// live, not obvious from the API surface alone.
+			WivrnServerService.upgradeForMediaProjection();
+			MediaProjectionManager manager = getSystemService(MediaProjectionManager.class);
+			WivrnServerService.setMediaProjection(manager.getMediaProjection(resultCode, data));
+		}
+		// Denied/cancelled: same as a RECORD_AUDIO denial above, streaming
+		// still works, just without speaker audio.
 	}
 
 	@Override

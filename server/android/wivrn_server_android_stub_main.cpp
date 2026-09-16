@@ -40,3 +40,19 @@ int main()
 {
 	return 0;
 }
+
+#include "audio/audio_setup.h"
+
+// audio_setup.cpp calls this unconditionally on __ANDROID__; the real
+// implementation (android/wivrn_server_jni.cpp) only builds with
+// WIVRN_ANDROID_JNI=ON, so this plain-executable variant needs its own
+// no-op so both configurations still link.
+namespace wivrn
+{
+std::unique_ptr<audio_device> create_android_audio_handle(
+        const from_headset::headset_info_packet &,
+        wivrn_session &)
+{
+	return nullptr;
+}
+} // namespace wivrn
