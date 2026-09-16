@@ -38,6 +38,10 @@ std::unique_ptr<wivrn::audio_device> wivrn::audio_device::create(
 	if (auto res = create_pipewire_handle(source_name, source_description, sink_name, sink_description, info, session))
 		return res;
 #endif
+#ifdef __ANDROID__
+	if (auto res = create_android_audio_handle(info, session))
+		return res;
+#endif
 	U_LOG_W("No audio backend available");
 	return nullptr;
 }

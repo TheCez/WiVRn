@@ -1,0 +1,20 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -49,9 +49,17 @@
+ # See https://gitlab.kitware.com/ben.boeckel/cmake/-/blob/cxxmodules-docs/Help/manual/cmake-cxxmodules.7.rst?ref_type=heads&plain=1#L398
+ 
+ # set up Vulkan-Headers
++# WiVRn: guard against a target name collision with CMake's own bundled
++# FindVulkan.cmake module (which, as of newer CMake releases, creates its
++# own Vulkan::Headers imported target from a plain find_package(Vulkan)
++# call) -- this project's build already does that elsewhere, so vendoring
++# this repo unconditionally re-defining the same alias name hard-errors
++# ("another target with the same name already exists") without this guard.
++if (NOT TARGET Vulkan::Headers)
+ add_library(Vulkan-Headers INTERFACE)
+ add_library(Vulkan::Headers ALIAS Vulkan-Headers)
+ target_include_directories(Vulkan-Headers INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
++endif()
+ 
+ if (VULKAN_HEADERS_ENABLE_MODULE)
+     add_library(Vulkan-HppModule OBJECT)

@@ -46,4 +46,14 @@ struct audio_device
 	        const wivrn::from_headset::headset_info_packet & info,
 	        wivrn::wivrn_session & session);
 };
+
+#ifdef __ANDROID__
+// Implemented in android/wivrn_server_jni.cpp (WIVRN_ANDROID_JNI=ON) or
+// stubbed out in android/wivrn_server_android_stub_main.cpp (OFF) -- see
+// either file's own comment. Speaker-only (captures the local OpenXR app's
+// audio via AudioPlaybackCaptureConfiguration); no microphone forwarding yet.
+std::unique_ptr<audio_device> create_android_audio_handle(
+        const from_headset::headset_info_packet & info,
+        wivrn_session & session);
+#endif
 } // namespace wivrn
