@@ -1,0 +1,149 @@
+// Android-phone-as-server app module: packages libwivrn-server.so and its
+// Service wrapper into an installable APK. Companion to the root project
+// (the existing Quest client), not a replacement -- both build from the
+// same top-level CMakeLists.txt with different -D arguments.
+apply plugin: 'com.android.application'
+
+// Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11: normally
+// resolved from system packages (CMAKE_FIND_ROOT_PATH_MODE_*=BOTH below
+// lets find_package/find_program see host-installed packages despite the
+// Android NDK cross-compile sysroot, same as the client build). Only
+// overridden with this pinned local copy when the system packages are too
+// old/incompatible for this codebase's requirements -- populate
+// `../tools` (sibling of this checkout) with the layout documented in
+// docs/building.md#server-android-phone if you hit that.
+def toolsDir = "${rootDir}/../tools"
+def hasLocalVulkanHeaders = new File(toolsDir, 'vulkan-headers/include').exists()
+def localGlslangValidator = new File(toolsDir, 'glslang/extracted/usr/bin/glslangValidator')
+def hasLocalPrefix = new File(toolsDir, 'prefix').exists()
+def hasLocalSpirvTools = new File(toolsDir, 'spirv-tools/extracted/usr/bin').isDirectory()
+
+android {
+    namespace 'org.meumeu.wivrn.server'
+    ndkVersion = "29.0.14206865"
+
+    defaultConfig {
+        applicationId "org.meumeu.wivrn.server"
+        // 33 is the first NDK API level whose libvulkan.so stub exports the
+        // Vulkan 1.3 symbols VMA needs (vkGetDevice{Buffer,Image}MemoryRequirements) --
+        // confirmed via `nm -D`, absent through 32.
+        minSdkVersion 33
+        compileSdkVersion 34
+        targetSdkVersion 34
+
+        versionName = project.hasProperty('wivrn_version') ? wivrn_version : "1.0"
+        versionCode = project.hasProperty('wivrn_versionCode') ? wivrn_versionCode.toInteger() : 1
+
+        externalNativeBuild {
+            cmake {
+                def args = [
+                    '-DANDROID_TOOLCHAIN=clang',
+                    '-DANDROID_STL=c++_static',
+                    '-DCMAKE_ANDROID_NDK_VERSION=' + ndkVersion,
+                    '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+                ]
+                if (hasLocalVulkanHeaders)
+                    args += '-DVulkan_INCLUDE_DIR=' + toolsDir + '/vulkan-headers/include'
+                if (localGlslangValidator.exists()) {
+                    args += '-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=' + localGlslangValidator.path
+                    args += '-DGLSLANGVALIDATOR_COMMAND=' + localGlslangValidator.path
+                }
+                if (hasLocalPrefix)
+                    args += '-DCMAKE_PREFIX_PATH=' + toolsDir + '/prefix'
+                args += [
+                    '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH',
+                    '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH',
+                    '-DWIVRN_ANDROID_JNI=ON',
+                    '-DWIVRN_BUILD_SERVER=ON',
+                    '-DWIVRN_BUILD_SERVER_LIBRARY=OFF',
+                    '-DWIVRN_BUILD_CLIENT=OFF',
+                    '-DWIVRN_BUILD_DASHBOARD=OFF',
+                    '-DWIVRN_BUILD_WIVRNCTL=OFF',
+                    '-DWIVRN_BUILD_DISSECTOR=OFF',
+                    '-DWIVRN_BUILD_TEST=OFF',
+                    '-DWIVRN_USE_SYSTEM_BOOST=OFF',
+                    '-DWIVRN_USE_SYSTEM_FREETYPE=OFF',
+                    '-DWIVRN_USE_NVENC=OFF',
+                    '-DWIVRN_USE_VAAPI=OFF',
+                    '-DWIVRN_USE_VULKAN_ENCODE=OFF',
+                    '-DWIVRN_USE_X264=OFF',
+                    '-DWIVRN_USE_PIPEWIRE=OFF',
+                    '-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF',
+                    '-DWIVRN_FEATURE_SOLARXR=OFF',
+                    // spirv-opt ships in the NDK's shader-tools dir; the local
+                    // copy below (if present) is only an extra search location.
+                    '-DWIVRN_OPTIMIZE_SHADERS=ON',
+                    // Binds Monado's targets/openxr build (openxr_wivrn) to this
+                    // app's package instead of Monado's default out-of-process
+                    // runtime package (see Client.java).
+                    '-DXRT_ANDROID_PACKAGE=org.meumeu.wivrn.server',
+                ]
+                if (hasLocalSpirvTools)
+                    args += '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin'
+                arguments = args
+                // hook_impl/main_hook/file_redirect_hook/gsl_alloc_hook: adrenotools'
+                // shared libraries, dlopen()'d by filename from this app's own
+                // nativeLibraryDir at runtime, so they must be packaged into the APK.
+                targets 'wivrn-server', 'openxr_wivrn', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook'
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            // Same top-level CMakeLists.txt the client (root project)
+            // already builds from, just with the arguments above.
+            path "../CMakeLists.txt"
+            version "3.31.6"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['../server/android/java']
+            aidl.srcDirs = ['../server/android/aidl']
+            manifest.srcFile '../server/android/AndroidManifest.xml'
+        }
+        // Debug-only: bundles the Khronos Vulkan validation layer into the APK's
+        // own native lib dir, one of the paths the Android Vulkan loader searches
+        // for every app -- what makes WIVRN_VK_VALIDATION (wivrn_vk_bundle.cpp)
+        // work. Android's system-wide GPU debug layer setting doesn't work on
+        // this device/OS build. No-op if the directory is absent.
+        debug {
+            jniLibs.srcDirs += ["${toolsDir}/vulkan-validation/android-binaries-1.4.357.0"]
+        }
+    }
+
+    buildFeatures {
+        // Off by default since AGP 8 -- needed for IMonado.aidl.
+        aidl true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    // AGP wants this explicitly set to match AndroidManifest.xml's
+    // android:extractNativeLibs="true" (see that attribute's own comment) --
+    // otherwise it just warns and infers it, but stating it directly avoids
+    // relying on that inference.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // Needed by the vendored Monado Java helper classes under
+    // server/android/java/org/freedesktop/monado/{ipc,auxiliary} (@Keep, @NonNull, etc.)
+    implementation 'androidx.annotation:annotation:1.7.1'
+}

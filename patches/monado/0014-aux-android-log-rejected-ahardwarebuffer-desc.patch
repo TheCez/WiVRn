@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WiVRn Android port <noreply@invalid>
+Date: Tue, 15 Sep 2026 00:00:00 +0200
+Subject: [PATCH] aux/android: log the rejected AHardwareBuffer_Desc's actual
+ fields
+
+'Computed AHardwareBuffer_Desc is not supported' gave no way to tell what
+was actually rejected -- found live while diagnosing why a Godot/GLES
+OpenXR client's very first xrCreateSwapchain call fails on this device
+(wivrn-android's docs/ANDROID_PORT.md). Log the width/height/layers/
+format/usage that was actually computed and rejected.
+---
+ .../android/android_ahardwarebuffer_allocator.c        | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/auxiliary/android/android_ahardwarebuffer_allocator.c b/src/xrt/auxiliary/android/android_ahardwarebuffer_allocator.c
+index d6178be40..a7ee51594 100644
+--- a/src/xrt/auxiliary/android/android_ahardwarebuffer_allocator.c
++++ b/src/xrt/auxiliary/android/android_ahardwarebuffer_allocator.c
+@@ -136,7 +136,10 @@ ahardwarebuffer_image_allocate(const struct xrt_swapchain_create_info *xsci, xrt
+ 
+ #if __ANDROID_API__ >= 29
+ 	if (0 == AHardwareBuffer_isSupported(&desc)) {
+-		AHB_ERROR("Computed AHardwareBuffer_Desc is not supported.");
++		AHB_ERROR(
++		    "Computed AHardwareBuffer_Desc is not supported: %ux%u layers=%u vk_format=%04" PRIx64
++		    " ahb_format=%d ahb_usage=%" PRIx64,
++		    desc.width, desc.height, desc.layers, (uint64_t)xsci->format, ahb_format, (uint64_t)desc.usage);
+ 		return XRT_ERROR_ALLOCATION;
+ 	}
+ #endif
+@@ -182,7 +185,10 @@ ahardwarebuffer_images_allocate(struct xrt_image_native_allocator *xina,
+ 
+ #if __ANDROID_API__ >= 29
+ 	if (0 == AHardwareBuffer_isSupported(&desc)) {
+-		AHB_ERROR("Computed AHardwareBuffer_Desc is not supported.");
++		AHB_ERROR(
++		    "Computed AHardwareBuffer_Desc is not supported: %ux%u layers=%u vk_format=%04" PRIx64
++		    " ahb_format=%d ahb_usage=%" PRIx64,
++		    desc.width, desc.height, desc.layers, (uint64_t)xsci->format, ahb_format, (uint64_t)desc.usage);
+ 		return XRT_ERROR_ALLOCATION;
+ 	}
+ #endif

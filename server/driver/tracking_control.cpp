@@ -19,6 +19,7 @@
 #include "tracking_control.h"
 
 #include "driver/wivrn_connection.h"
+#include "utils/enumerate_polyfill.h"
 #include "wivrn_config.h"
 #include <magic_enum_containers.hpp>
 #include <ranges>

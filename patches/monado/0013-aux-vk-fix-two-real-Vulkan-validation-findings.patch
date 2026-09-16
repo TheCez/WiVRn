@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WiVRn Android port <noreply@invalid>
+Date: Tue, 15 Sep 2026 00:00:00 +0200
+Subject: [PATCH] aux/vk: fix two real Vulkan validation findings in
+ vk_create_image_from_native
+
+Both caught live via Vulkan validation while getting real validation
+working for the first time on the Android port's server-app
+(wivrn-android's docs/ANDROID_PORT.md, HEVC A/B diagnostic milestone):
+
+1. vkGetImageMemoryRequirements() was called unconditionally on the
+   freshly-created image, even for AHardwareBuffer-imported images --
+   invalid per VUID-vkGetImageMemoryRequirements-image-04004 (must be
+   bound to memory first for that handle type), and the result was
+   discarded anyway since the AHARDWAREBUFFER branch right below
+   overwrites requirements.size/memoryTypeBits from
+   vkGetAndroidHardwareBufferPropertiesANDROID. Skip the call for that
+   handle type, matching vk_image_allocator.c's create_image(), which
+   already does this correctly for its own (allocate rather than
+   import) path.
+
+2. When downgrading VK_FORMAT_R8G8B8A8_SRGB to _UNORM for AHardwareBuffer
+   import compatibility, the image was not created with
+   VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT -- required by
+   VUID-VkImageViewCreateInfo-image-01019 whenever an image view's format
+   differs from the image's own format. create_image() (the allocating
+   counterpart in vk_image_allocator.c) already sets this flag correctly
+   when doing the identical downgrade; this path did not.
+---
+ src/xrt/auxiliary/vk/vk_helpers.c | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/auxiliary/vk/vk_helpers.c b/src/xrt/auxiliary/vk/vk_helpers.c
+index 023b8dd89..44d1b2d1c 100644
+--- a/src/xrt/auxiliary/vk/vk_helpers.c
++++ b/src/xrt/auxiliary/vk/vk_helpers.c
+@@ -367,6 +367,8 @@ vk_create_image_from_native(struct vk_bundle *vk,
+ 	// This is the format we allocate the image in, can be changed further down.
+ 	VkFormat image_format = (VkFormat)info->format;
+ 
++	bool force_mutable_for_srgb_downgrade = false;
++
+ #ifdef XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER
+ 	/*
+ 	 * Some Vulkan drivers will natively support importing and exporting
+@@ -375,11 +377,16 @@ vk_create_image_from_native(struct vk_bundle *vk,
+ 	 * While others (arm Mali) does not support importing and exporting
+ 	 * sRGB formats. So we need to create the image without sRGB and
+ 	 * then create the image views with sRGB which is allowed by the
+-	 * Vulkan spec. It seems to be safe to do with on all drivers,
+-	 * so to reduce the logic do that instead.
++	 * Vulkan spec -- but only if VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT was
++	 * set on the image at creation time (VUID-VkImageViewCreateInfo-image-01019),
++	 * which this path was not doing (caught live by Vulkan validation:
++	 * "Formats must be identical unless VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
++	 * was set on image creation"). It seems to be safe to do with on all
++	 * drivers, so to reduce the logic do that instead.
+ 	 */
+ 	if (image_format == VK_FORMAT_R8G8B8A8_SRGB) {
+ 		image_format = VK_FORMAT_R8G8B8A8_UNORM;
++		force_mutable_for_srgb_downgrade = true;
+ 	}
+ #endif
+ 
+@@ -403,8 +410,10 @@ vk_create_image_from_native(struct vk_bundle *vk,
+ 	}
+ 
+ 	VkImageCreateFlags image_create_flags = 0;
+-	// Set the image create mutable flag if usage mutable is given.
+-	const bool has_mutable_usage = (info->bits & XRT_SWAPCHAIN_USAGE_MUTABLE_FORMAT) != 0;
++	// Set the image create mutable flag if usage mutable is given, or if
++	// the sRGB->UNORM downgrade above needs it.
++	const bool has_mutable_usage =
++	    ((info->bits & XRT_SWAPCHAIN_USAGE_MUTABLE_FORMAT) != 0) || force_mutable_for_srgb_downgrade;
+ 	if (has_mutable_usage) {
+ 		image_create_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+ 	}
+@@ -464,7 +473,17 @@ vk_create_image_from_native(struct vk_bundle *vk,
+ 	}
+ 
+ 	VkMemoryRequirements requirements = {0};
++#if !defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
++	// For AHardwareBuffer handles this queries requirements on an image
++	// that isn't bound to memory yet (VUID-vkGetImageMemoryRequirements-image-04004,
++	// caught live by Vulkan validation), and the AHARDWAREBUFFER branch
++	// below overwrites requirements.size/memoryTypeBits from
++	// vkGetAndroidHardwareBufferPropertiesANDROID anyway -- this call's
++	// result was unused in that case. Matches vk_image_allocator.c's
++	// create_image(), which already skips the equivalent call for the
++	// same reason.
+ 	vk->vkGetImageMemoryRequirements(vk->device, image, &requirements);
++#endif
+ 
+ #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+ 	VkImportMemoryFdInfoKHR import_memory_info = {

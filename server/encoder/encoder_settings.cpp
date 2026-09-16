@@ -21,6 +21,7 @@
 #include "driver/configuration.h"
 #include "driver/wivrn_session.h"
 #include "util/u_logging.h"
+#include "utils/enumerate_polyfill.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "video_encoder.h"
 #include "wivrn_packets.h"
@@ -37,6 +38,9 @@
 #if WIVRN_USE_VAAPI
 #include "ffmpeg/video_encoder_va.h"
 #include <libavutil/ffversion.h>
+#endif
+#if WIVRN_USE_MEDIACODEC
+#include "video_encoder_mediacodec.h"
 #endif
 
 namespace wivrn
@@ -171,6 +175,42 @@ class prober
 	}
 #endif
 
+#if WIVRN_USE_MEDIACODEC
+	std::unordered_map<video_codec, bool> mediacodec_support;
+
+	bool check_mediacodec(video_codec codec)
+	{
+		if (auto it = mediacodec_support.find(codec); it != mediacodec_support.end())
+			return it->second;
+		try
+		{
+			video_encoder_mediacodec test(
+			        vk,
+			        encoder_settings{
+			                .width = 800,
+			                .height = 800,
+			                .codec = codec,
+			                .fps = 60,
+			                .bitrate = 50'000'000,
+			                .bit_depth = 8,
+			        },
+			        0);
+			// Constructor alone doesn't create the real MediaCodec (lazy --
+			// see video_encoder_mediacodec.h); force it now so an
+			// unsupported codec is caught here, not on first present_image().
+			test.probe_ensure_codec();
+			mediacodec_support[codec] = true;
+			return true;
+		}
+		catch (std::exception & e)
+		{
+			mediacodec_support[codec] = false;
+			U_LOG_I("mediacodec not supported for %s: %s", std::string(magic_enum::enum_name(codec)).c_str(), e.what());
+			return false;
+		}
+	}
+#endif
+
 	static bool is_nvidia(vk::raii::PhysicalDevice & physical_device)
 	{
 		auto props = physical_device.getProperties();
@@ -223,17 +263,6 @@ public:
 		if (config.codec == video_codec::raw or config.name == encoder_raw)
 			return {encoder_raw, video_codec::raw};
 
-#if WIVRN_USE_NVENC
-		if ((nvidia and config.name.empty()) or config.name == encoder_nvenc)
-		{
-			for (auto codec: config.codec ? std::vector{*config.codec} : info.supported_codecs)
-			{
-				if (check_nvenc(codec))
-					return {encoder_nvenc, codec};
-			}
-		}
-#endif
-
 #if WIVRN_USE_VULKAN_ENCODE
 		if (config.name.empty() or config.name == encoder_vulkan)
 		{
@@ -245,6 +274,17 @@ public:
 		}
 #endif
 
+#if WIVRN_USE_NVENC
+		if ((nvidia and config.name.empty()) or config.name == encoder_nvenc)
+		{
+			for (auto codec: config.codec ? std::vector{*config.codec} : info.supported_codecs)
+			{
+				if (check_nvenc(codec))
+					return {encoder_nvenc, codec};
+			}
+		}
+#endif
+
 #if WIVRN_USE_VAAPI
 		if (config.name.empty() or config.name == encoder_vaapi)
 		{
@@ -252,6 +292,17 @@ public:
 			{
 				if (check_vaapi(codec))
 					return {encoder_vaapi, codec};
+			}
+		}
+#endif
+
+#if WIVRN_USE_MEDIACODEC
+		if (config.name.empty() or config.name == encoder_mediacodec)
+		{
+			for (auto codec: config.codec ? std::vector{*config.codec} : info.supported_codecs)
+			{
+				if (check_mediacodec(codec))
+					return {encoder_mediacodec, codec};
 			}
 		}
 #endif
@@ -309,8 +360,12 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
+	// video_encoder_mediacodec only ever supports 8-bit, unlike vaapi/nvenc's
+	// h265/av1 backends -- without this, an implicit bit_depth falls through
+	// to the 10-bit default below and the constructor throws.
 	if (std::ranges::contains(res, video_codec::h264, &encoder_settings::codec) or
-	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec))
+	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec) or
+	    std::ranges::contains(res, std::string(encoder_mediacodec), &encoder_settings::encoder_name))
 		bit_depth = 8;
 	else if (not bit_depth)
 		bit_depth = 10;

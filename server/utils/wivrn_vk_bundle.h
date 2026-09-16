@@ -134,9 +134,25 @@ struct vk_bundle
 #ifdef VK_KHR_unified_image_layouts
 	        vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
 #endif
+#ifdef VK_EXT_host_image_copy
+	        vk::PhysicalDeviceHostImageCopyFeaturesEXT,
+#endif
 	        vk::PhysicalDeviceVulkan12Features,
 	        vk::PhysicalDeviceVulkan13Features>
 	        feat{};
+
+	// True if VK_EXT_host_image_copy is present and enabled -- lets
+	// video_encoder_mediacodec.cpp use vkCopyImageToMemory() instead of a
+	// queue-submitted vkCmdCopyImageToBuffer().
+	bool host_image_copy = false;
+
+	// Shared 3-array-layer stream image (one allocation, fewer barriers) on
+	// every GPU vendor except PowerVR (vendorID 0x1010), where a real driver
+	// bug corrupts compute-shader writes to array layer >=1 of a multi-planar
+	// image -- see compositor.h's struct image. Denylist, not allowlist: an
+	// allowlist would mean every untested device silently keeps the slower
+	// workaround forever with no way to discover it doesn't need it.
+	bool multi_layer_stream_images = true;
 
 	std::vector<const char *> instance_extensions;
 	std::vector<const char *> device_extensions;

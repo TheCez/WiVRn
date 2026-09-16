@@ -291,11 +291,13 @@ std::string to_iso8601(std::chrono::system_clock::time_point timestamp)
 #endif
 }
 
+#if __cpp_lib_chrono >= 201907L
 template <typename T>
 std::string to_iso8601(std::chrono::zoned_time<T> timestamp)
 {
 	return std::format("{:%FT%H:%M:%S%z}", timestamp);
 }
+#endif
 
 std::optional<std::chrono::system_clock::time_point> from_iso8601(const std::string & timestamp)
 {

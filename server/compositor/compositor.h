@@ -28,6 +28,7 @@
 #include "foveation.h"
 #include "layer_squasher.h"
 #include "pacer.h"
+#include "utils/frame_timing_stats.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include "main/comp_compositor.h"
@@ -46,12 +47,30 @@ class video_encoder;
 class compositor : public comp_base
 {
 public:
+	// PowerVR (Imagination Technologies) GPUs: real driver bug -- a compute
+	// shader write to array layer >=1 of a multi-planar 2-plane-420 image is
+	// corrupted (confirmed clean on NVIDIA/Mesa llvmpipe with identical
+	// shader/data; confirmed corrupted only with arrayLayers>=2 on-device).
+	// DO NOT widen multi_layer_stream_images's denylist away from
+	// PowerVR-only without re-verifying this. Every other vendor shares one
+	// 3-array-layer image instead (fewer allocations/barriers/dispatches) --
+	// see vk_bundle::multi_layer_stream_images.
+	//
+	// `content`/`alpha` are non-owning views; the backing memory is owned by
+	// `image::storage` (3 single-layer allocations, or 1 shared 3-layer one).
+	struct stream_image
+	{
+		vk::Image image;
+		vk::raii::ImageView view_y;
+		vk::raii::ImageView view_cbcr;
+	};
 	struct image
 	{
 		std::atomic<bool> busy = false;
-		image_allocation image;
-		vk::raii::ImageView view_y;
-		vk::raii::ImageView view_cbcr;
+		std::vector<image_allocation> storage;
+		vk::Extent3D extent;
+		std::array<stream_image, 2> content; // left, right
+		stream_image alpha;                   // shared, both eyes packed by x-offset (unchanged from before)
 		to_headset::video_stream_data_shard::view_info_t view_info{};
 		uint64_t frame_index;
 	};
@@ -78,6 +97,12 @@ private:
 	const u_logging_level log_level;
 	timings squasher_times;
 	timings foveation_times;
+
+	// Same GPU timestamps as squasher_times/foveation_times, but logged via
+	// frame_timing_stats (logcat) since Monado's u_var debug UI isn't
+	// reachable on this Android build (no SDL2 GUI).
+	frame_timing_stats squasher_gpu_time_log{"compositor squasher GPU time"};
+	frame_timing_stats foveation_gpu_time_log{"compositor foveation GPU time"};
 	wivrn_session & session;
 	vk_bundle vk;
 	vk::raii::CommandPool cmd_pool;

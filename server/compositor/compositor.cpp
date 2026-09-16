@@ -34,10 +34,16 @@
 #include "driver/wivrn_session.h"
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
+#include "utils/enumerate_polyfill.h"
 #include "utils/method.h"
 #include "utils/wivrn_trace.h"
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
+
+#include <chrono>
+#include <format>
+#include <fstream>
+
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -64,6 +70,27 @@ static auto renderdoc()
 
 DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 
+// Diagnostic: -1 (default) both streams run normally; 0 or 1 restricts real
+// present_image()/encode() calls to that stream_idx only, to isolate
+// per-stream vs. concurrent-operation corruption.
+// Android: `adb shell setprop debug.xrt.WIVRN_ONLY_STREAM 0` (env var forwarding
+// doesn't reach this macro's Android backend, must use setprop).
+DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
+
+// Diagnostic: forces encode() calls back to sequential (pre-concurrent-encode
+// behavior) without changing GPU submission concurrency, to isolate CPU-thread
+// races from GPU/VPU contention. `adb shell setprop debug.xrt.WIVRN_SERIALIZE_ENCODE 1`.
+DEBUG_GET_ONCE_NUM_OPTION(serialize_encode, "WIVRN_SERIALIZE_ENCODE", 0)
+
+// Diagnostic: delays the second stream's present_image()/encode() start by this
+// many microseconds relative to the first, to spread GPU/VPU work apart in time
+// without dropping frames. `adb shell setprop debug.xrt.WIVRN_STAGGER_US <us>`.
+DEBUG_GET_ONCE_NUM_OPTION(stagger_us, "WIVRN_STAGGER_US", 0)
+
+// Diagnostic: logs per-view pose/array_index/image_index every frame on the fast
+// path, to check for view-extraction bugs. `adb shell setprop debug.xrt.WIVRN_LOG_VIEW_POSE 1`.
+DEBUG_GET_ONCE_NUM_OPTION(log_view_pose, "WIVRN_LOG_VIEW_POSE", 0)
+
 namespace details
 {
 template <auto Method, typename Result, typename... Args>
@@ -87,6 +114,101 @@ const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t 
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
+// Diagnostic: dumps the app's own swapchain image (before our foveation
+// shader touches it) to a raw RGBA file, one-shot per view, to check whether
+// corruption is already present in what Monado handed us.
+// `adb shell setprop debug.xrt.WIVRN_DUMP_APP_IMAGE 1`. Not DEBUG_GET_ONCE_NUM_OPTION:
+// that macro latches its value for the process lifetime, so it wouldn't work
+// as a live toggle flipped mid-session.
+void dump_app_image_once(wivrn::vk_bundle & vk, vk::raii::CommandPool & cmd_pool, const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index, uint32_t array_index, int view)
+{
+	static std::array<bool, 2> dumped{false, false};
+	if (view < 0 or view > 1 or dumped[view] or not debug_get_num_option("WIVRN_DUMP_APP_IMAGE", 0))
+		return;
+	dumped[view] = true;
+
+	auto * sc = reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index));
+	vk::Image image = sc->vkic.images[image_index].handle;
+	vk::Extent2D extent{sc->vkic.info.width, sc->vkic.info.height};
+
+	vk::DeviceSize size = vk::DeviceSize(extent.width) * extent.height * 4;
+	buffer_allocation staging(
+	        vk.device,
+	        {
+	                .size = size,
+	                .usage = vk::BufferUsageFlagBits::eTransferDst,
+	        },
+	        {
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+	        },
+	        std::format("dump_app_image staging {}", view));
+
+	auto cmd_buffers = vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1});
+	vk::raii::CommandBuffer cmd{std::move(cmd_buffers[0])};
+	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+	vk::ImageSubresourceRange range{
+	        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	        .baseMipLevel = 0,
+	        .levelCount = 1,
+	        .baseArrayLayer = array_index,
+	        .layerCount = 1,
+	};
+	cmd.pipelineBarrier(
+	        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+	                .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+	                .image = image,
+	                .subresourceRange = range,
+	        });
+	cmd.copyImageToBuffer(
+	        image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(staging),
+	        vk::BufferImageCopy{
+	                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = array_index, .layerCount = 1},
+	                .imageExtent = {extent.width, extent.height, 1},
+	        });
+	cmd.pipelineBarrier(
+	        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .image = image,
+	                .subresourceRange = range,
+	        });
+	cmd.end();
+
+	vk::raii::Fence fence(vk.device, vk::FenceCreateInfo{});
+	{
+		vk::CommandBufferSubmitInfo cmd_info{.commandBuffer = *cmd};
+		std::unique_lock lock{vk.queue.mutex};
+		vk.queue.queue.submit2(vk::SubmitInfo2{.commandBufferInfoCount = 1, .pCommandBufferInfos = &cmd_info}, *fence);
+	}
+	if (vk.device.waitForFences(*fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	{
+		U_LOG_E("dump_app_image_once: timeout waiting for GPU, view=%d", view);
+		return;
+	}
+	staging.invalidate();
+
+	auto path = std::format("/data/data/org.meumeu.wivrn.server/files/dump_app_image_view{}.rgba", view);
+	std::ofstream f(path, std::ios::binary);
+	f.write(staging.data<char>(), size);
+	U_LOG_E("dump_app_image_once: wrote %s (%ux%u, array_layer=%u)", path.c_str(), extent.width, extent.height, array_index);
+}
+
+// Array layer for stream_idx (0=left, 1=right, 2=alpha): 0 on the PowerVR
+// single-layer workaround, else stream_idx -- see compositor.h's struct image.
+uint32_t image_layer(const wivrn::vk_bundle & vk, uint8_t stream_idx)
+{
+	return vk.multi_layer_stream_images ? stream_idx : 0;
+}
+
 std::array<vk::Format, 3> image_formats(int bit_depth)
 {
 	switch (bit_depth)
@@ -107,30 +229,97 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
+// Backing allocation for one or more stream images: array_layers=1 (PowerVR
+// workaround, one call per stream) or =3 (shared left+right+alpha elsewhere).
+image_allocation make_stream_storage(
+        wivrn::vk_bundle & vk,
+        std::span<const vk::Format, 3> formats,
+        vk::Extent3D extent,
+        vk::ImageCreateFlags extra_flags,
+        vk::ImageUsageFlags extra_usage,
+        uint32_t array_layers,
+        const char * name)
+{
+	// Needed at creation time so video_encoder_mediacodec.cpp can optionally
+	// read back via vkCopyImageToMemory() instead of vkCmdCopyImageToBuffer().
+	vk::ImageUsageFlags host_transfer_usage = vk.host_image_copy ? vk::ImageUsageFlagBits::eHostTransfer : vk::ImageUsageFlags{};
+
+	vk::StructureChain image_info{
+	        vk::ImageCreateInfo{
+	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat | extra_flags,
+	                .imageType = vk::ImageType::e2D,
+	                .format = formats.back(),
+	                .extent = extent,
+	                .mipLevels = 1,
+	                .arrayLayers = array_layers,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | host_transfer_usage | extra_usage,
+	        },
+	        vk::ImageFormatListCreateInfo{
+	                .viewFormatCount = uint32_t(formats.size()),
+	                .pViewFormats = formats.data(),
+	        },
+	};
+
+	return image_allocation{
+	        vk.device,
+	        image_info.get(),
+	        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+	        name,
+	};
+}
+
+// Y/CbCr views into array_layer of vk_image (0, or 0/1/2 for left/right/alpha
+// depending on the PowerVR workaround -- see make_stream_storage above).
+wivrn::compositor::stream_image make_stream_view(
+        wivrn::vk_bundle & vk,
+        vk::Image vk_image,
+        std::span<const vk::Format, 3> formats,
+        uint32_t array_layer)
+{
+	vk::ImageViewUsageCreateInfo usage{
+	        .usage = vk::ImageUsageFlagBits::eStorage,
+	};
+	return wivrn::compositor::stream_image{
+	        .image = vk_image,
+	        .view_y{
+	                vk.device,
+	                {
+	                        .pNext = &usage,
+	                        .image = vk_image,
+	                        .viewType = vk::ImageViewType::e2DArray,
+	                        .format = formats[0],
+	                        .subresourceRange = {
+	                                .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+	                                .levelCount = 1,
+	                                .baseArrayLayer = array_layer,
+	                                .layerCount = 1,
+	                        },
+	                },
+	        },
+	        .view_cbcr{
+	                vk.device,
+	                {
+	                        .pNext = &usage,
+	                        .image = vk_image,
+	                        .viewType = vk::ImageViewType::e2DArray,
+	                        .format = formats[1],
+	                        .subresourceRange = {
+	                                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+	                                .levelCount = 1,
+	                                .baseArrayLayer = array_layer,
+	                                .layerCount = 1,
+	                        },
+	                },
+	        }};
+}
+
 std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
 {
 	auto formats = image_formats(encoders[0].bit_depth);
 
-	vk::StructureChain image_info{
-	        vk::ImageCreateInfo{
-	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
-	                .imageType = vk::ImageType::e2D,
-	                .format = formats.back(),
-	                .extent = {
-	                        .width = encoders[0].width,
-	                        .height = encoders[0].height,
-	                        .depth = 1,
-	                },
-	                .mipLevels = 1,
-	                .arrayLayers = 3, // left, right then alpha
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
-	        },
-	        vk::ImageFormatListCreateInfo{
-	                .viewFormatCount = formats.size(),
-	                .pViewFormats = formats.data(),
-	        },
-	};
+	vk::ImageCreateFlags extra_flags{};
+	vk::ImageUsageFlags extra_usage{};
 #if WIVRN_USE_VULKAN_ENCODE
 	if (
 	        std::get<vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>(vk.feat).videoMaintenance1 and
@@ -139,55 +328,57 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::C
 	                wivrn::encoder_vulkan,
 	                &wivrn::encoder_settings::encoder_name))
 	{
-		image_info.get().flags |= vk::ImageCreateFlagBits::eVideoProfileIndependentKHR;
-		image_info.get().usage |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
+		extra_flags |= vk::ImageCreateFlagBits::eVideoProfileIndependentKHR;
+		extra_usage |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
 	}
 #endif
 
-	auto make_image = [&](int i) {
-		vk::ImageViewUsageCreateInfo usage{
-		        .usage = vk::ImageUsageFlagBits::eStorage,
-		};
-		image_allocation image{
-		        vk.device,
-		        image_info.get(),
-		        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
-		        std::format("compositor YCbCr image {}", i),
-		};
-		vk::Image vk_image{image};
+	vk::Extent3D extent{.width = encoders[0].width, .height = encoders[0].height, .depth = 1};
+
+	auto make_slot = [&](int i) -> wivrn::compositor::image {
+		if (vk.multi_layer_stream_images)
+		{
+			image_allocation combined = make_stream_storage(vk, formats, extent, extra_flags, extra_usage, 3, std::format("compositor YCbCr image {}", i).c_str());
+			vk::Image handle = combined;
+
+			std::vector<image_allocation> storage;
+			storage.push_back(std::move(combined));
+
+			return wivrn::compositor::image{
+			        .storage = std::move(storage),
+			        .extent = extent,
+			        .content = {
+			                make_stream_view(vk, handle, formats, 0),
+			                make_stream_view(vk, handle, formats, 1),
+			        },
+			        .alpha = make_stream_view(vk, handle, formats, 2),
+			};
+		}
+
+		image_allocation left = make_stream_storage(vk, formats, extent, extra_flags, extra_usage, 1, std::format("compositor YCbCr image {} left", i).c_str());
+		image_allocation right = make_stream_storage(vk, formats, extent, extra_flags, extra_usage, 1, std::format("compositor YCbCr image {} right", i).c_str());
+		image_allocation alpha_storage = make_stream_storage(vk, formats, extent, extra_flags, extra_usage, 1, std::format("compositor YCbCr image {} alpha", i).c_str());
+
+		vk::Image left_handle = left, right_handle = right, alpha_handle = alpha_storage;
+
+		std::vector<image_allocation> storage;
+		storage.reserve(3);
+		storage.push_back(std::move(left));
+		storage.push_back(std::move(right));
+		storage.push_back(std::move(alpha_storage));
+
 		return wivrn::compositor::image{
-		        .image{std::move(image)},
-		        .view_y{
-		                vk.device,
-		                {
-		                        .pNext = &usage,
-		                        .image = vk_image,
-		                        .viewType = vk::ImageViewType::e2DArray,
-		                        .format = formats[0],
-		                        .subresourceRange = {
-		                                .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-		                                .levelCount = 1,
-		                                .layerCount = image_info.get().arrayLayers,
-		                        },
-		                },
+		        .storage = std::move(storage),
+		        .extent = extent,
+		        .content = {
+		                make_stream_view(vk, left_handle, formats, 0),
+		                make_stream_view(vk, right_handle, formats, 0),
 		        },
-		        .view_cbcr{
-		                vk.device,
-		                {
-		                        .pNext = &usage,
-		                        .image = vk_image,
-		                        .viewType = vk::ImageViewType::e2DArray,
-		                        .format = formats[1],
-		                        .subresourceRange = {
-		                                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-		                                .levelCount = 1,
-		                                .layerCount = image_info.get().arrayLayers,
-		                        },
-		                },
-		        }};
+		        .alpha = make_stream_view(vk, alpha_handle, formats, 0),
+		};
 	};
 
-	return {make_image(0), make_image(1)};
+	return {make_slot(0), make_slot(1)};
 }
 
 vk::raii::Semaphore make_semaphore(wivrn::vk_bundle & vk)
@@ -321,7 +512,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<xrt_rect, 2> src_rect;
 	std::array<xrt_fov, 2> src_fov;
 
-	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
+	// Capacity 5 = 1 squasher barrier + 3 per-stream barriers + margin.
+	// inplace_vector doesn't grow -- it throws when full, not silently reallocates.
+	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 5> image_barriers;
 
 	// Check if we can pass a layer directly to foveation
 	if (layer_accum.layer_count == 1 and
@@ -332,8 +525,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
+			auto & img = get_layer_image(layer, view, data.sub.image_index);
+
+			dump_app_image_once(vk, cmd_pool, layer, view, data.sub.image_index, data.sub.array_index, view);
+
+			if (debug_get_num_option_log_view_pose())
+				U_LOG_E("view=%d image_index=%u array_index=%u pose_pos=(%f,%f,%f) pose_orient=(%f,%f,%f,%f)",
+				        view,
+				        data.sub.image_index,
+				        data.sub.array_index,
+				        data.pose.position.x, data.pose.position.y, data.pose.position.z,
+				        data.pose.orientation.x, data.pose.orientation.y, data.pose.orientation.z, data.pose.orientation.w);
+
 			src[view] = get_image_view(
-			        &get_layer_image(layer, view, data.sub.image_index),
+			        &img,
 			        layer.data.flags,
 			        data.sub.array_index);
 			src_rect[view] = data.sub.rect;
@@ -347,7 +552,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		// no fast-path, squash layers
 		std::array<xrt_pose, 2> poses;
-		const auto extent = images[0].image.info().extent;
+		const auto extent = images[0].extent;
 		std::tie(poses, src_fov, src_rect) = squasher.do_layers(
 		        vk.device,
 		        cmd,
@@ -382,19 +587,33 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        });
 	}
 
-	image_barriers.push_back(
-	        vk::ImageMemoryBarrier2{
-	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-	                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-	                .oldLayout = vk::ImageLayout::eUndefined,
-	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = images[i].image,
-	                .subresourceRange = {
-	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-	                        .levelCount = 1,
-	                        .layerCount = images[i].image.info().arrayLayers,
-	                },
-	        });
+	// One barrier per stream image/layer -- see compositor.h's struct image.
+	struct
+	{
+		vk::Image image;
+		uint32_t layer;
+	} stream_targets[3] = {
+	        {images[i].content[0].image, 0},
+	        {images[i].content[1].image, image_layer(vk, 1)},
+	        {images[i].alpha.image, image_layer(vk, 2)},
+	};
+	for (auto & target: stream_targets)
+	{
+		image_barriers.push_back(
+		        vk::ImageMemoryBarrier2{
+		                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+		                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+		                .oldLayout = vk::ImageLayout::eUndefined,
+		                .newLayout = vk::ImageLayout::eGeneral,
+		                .image = target.image,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = target.layer,
+		                        .layerCount = 1,
+		                },
+		        });
+	}
 
 	cmd.pipelineBarrier2({
 	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
@@ -412,17 +631,26 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	view_info.foveation = foveation.foveate(
 	        vk.device,
 	        cmd,
-	        images[i].view_y,
-	        images[i].view_cbcr,
+	        {*images[i].content[0].view_y, *images[i].content[1].view_y},
+	        {*images[i].content[0].view_cbcr, *images[i].content[1].view_cbcr},
+	        *images[i].alpha.view_y,
+	        *images[i].alpha.view_cbcr,
 	        flip_y,
 	        src,
 	        src_rect,
 	        src_fov,
 	        view_info.alpha);
 
+	// See compositor.h's struct image for the dedicated-image-vs-shared-layer split.
+	auto stream_vk_image = [&](uint8_t stream_idx) -> vk::Image {
+		return stream_idx < 2 ? vk::Image(images[i].content[stream_idx].image) : vk::Image(images[i].alpha.image);
+	};
+
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
+			continue;
+		else if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
 			continue;
 		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
 		{
@@ -444,11 +672,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			                .newLayout = encoder->target_layout,
 			                .srcQueueFamilyIndex = vk.queue.family_index,
 			                .dstQueueFamilyIndex = encoder->target_queue,
-			                .image = images[i].image,
+			                .image = stream_vk_image(encoder->stream_idx),
 			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 			                                     .baseMipLevel = 0,
 			                                     .levelCount = 1,
-			                                     .baseArrayLayer = encoder->stream_idx,
+			                                     .baseArrayLayer = image_layer(vk, encoder->stream_idx),
 			                                     .layerCount = 1},
 			        });
 		}
@@ -484,12 +712,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
+	bool first_present = true;
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
+		if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
+			continue;
+		if (auto us = debug_get_num_option_stagger_us(); us > 0 and not first_present)
+			std::this_thread::sleep_for(std::chrono::microseconds(us));
+		first_present = false;
 		encoder->present_image(
-		        images[i].image,
+		        stream_vk_image(encoder->stream_idx),
 		        sem_info,
 		        info.frame_id);
 	}
@@ -528,6 +762,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
 			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
 			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
+			squasher_gpu_time_log.sample(int64_t((ts[1] - ts[0]) * period));
+			foveation_gpu_time_log.sample(int64_t((ts[2] - ts[1]) * period));
 		}
 	}
 
@@ -629,17 +865,42 @@ void compositor::encoder_work(std::stop_token tok)
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
-		try
+		// Concurrent per-stream encode: AMediaCodec's per-call JNI/Binder
+		// overhead means sequential calls starve whichever stream goes second,
+		// every frame. wivrn_connection::send_control/send_stream gained a
+		// mutex for this since concurrent encode() calls can now race on the
+		// same socket.
 		{
+			auto do_encode = [&](video_encoder * e) {
+				try
+				{
+					e->encode(session, image.view_info, image.frame_index);
+				}
+				catch (std::exception & ex)
+				{
+					U_LOG_W("encode error: %s", ex.what());
+				}
+			};
+
+			beman::inplace_vector::inplace_vector<std::jthread, 3> workers;
+			bool first_encode = true;
 			for (auto & encoder: encoders)
 			{
+				if (auto only = debug_get_num_option_only_stream(); only >= 0 and encoder->stream_idx != only)
+					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
-					encoder->encode(session, image.view_info, image.frame_index);
+				{
+					if (auto us = debug_get_num_option_stagger_us(); us > 0 and not first_encode)
+						std::this_thread::sleep_for(std::chrono::microseconds(us));
+					first_encode = false;
+					if (debug_get_num_option_serialize_encode())
+						do_encode(encoder.get());
+					else
+						workers.emplace_back([&, e = encoder.get()] { do_encode(e); });
+				}
 			}
-		}
-		catch (std::exception & e)
-		{
-			U_LOG_W("encode error: %s", e.what());
+			// workers' jthreads join here as it goes out of scope, before
+			// this image is marked free for reuse.
 		}
 		image.busy = false;
 	}
@@ -649,8 +910,8 @@ void compositor::send_video_stream_description()
 
 {
 	to_headset::video_stream_description desc{
-	        .width = uint16_t(images[0].image.info().extent.width),
-	        .height = uint16_t(images[0].image.info().extent.height),
+	        .width = uint16_t(images[0].extent.width),
+	        .height = uint16_t(images[0].extent.height),
 	        .frame_rate = settings[0].fps,
 	};
 	get_display_refresh_rate(&desc.refresh_rate);
@@ -694,7 +955,7 @@ compositor::compositor(wivrn_session & session) :
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
-        foveation(vk, images[0].image.info().extent)
+        foveation(vk, images[0].extent)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers

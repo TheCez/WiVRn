@@ -20,15 +20,28 @@
 #include "foveation.h"
 
 #include "driver/xrt_cast.h"
+#include "utils/enumerate_polyfill.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "vk/specialization_constants.h"
 #include "wivrn_packets.h"
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_limits.h"
+#include "util/u_debug.h"
+#include "util/u_logging.h"
+
+// Diagnostic: forces the foveation center to dead-ahead for both eyes
+// (compression math untouched -- "no compression" outright crashes fill_ubo()'s
+// count>0 assert), to isolate a gaze-dependent per-eye asymmetry.
+// `adb shell setprop debug.xrt.WIVRN_DISABLE_FOVEATION 1` (or the env var on desktop).
+DEBUG_GET_ONCE_NUM_OPTION(disable_foveation, "WIVRN_DISABLE_FOVEATION", 0)
+
+// See its own call site's comment, below.
+DEBUG_GET_ONCE_NUM_OPTION(log_foveation_ubo, "WIVRN_LOG_FOVEATION_UBO", 0)
 
 #include <array>
 #include <cmath>
+#include <format>
 #include <ranges>
 #include <vulkan/vulkan_raii.hpp>
 #include <vulkan/vulkan_structs.hpp>
@@ -88,6 +101,18 @@ vk::raii::DescriptorSetLayout make_ds_layout(wivrn::vk_bundle & vk)
 	                .descriptorCount = 1,
 	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
 	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 4,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 5,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
 	};
 	vk::raii::DescriptorSetLayout res{
 	        vk.device,
@@ -102,10 +127,18 @@ vk::raii::DescriptorSetLayout make_ds_layout(wivrn::vk_bundle & vk)
 
 vk::raii::PipelineLayout make_layout(wivrn::vk_bundle & vk, vk::DescriptorSetLayout ds_layout)
 {
+	// Which eye's ubo/source-array slot this dispatch targets -- see foveation.comp.
+	vk::PushConstantRange push_constant{
+	        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        .offset = 0,
+	        .size = sizeof(int32_t),
+	};
 	vk::raii::PipelineLayout res(vk.device,
 	                             vk::PipelineLayoutCreateInfo{
 	                                     .setLayoutCount = 1,
 	                                     .pSetLayouts = &ds_layout,
+	                                     .pushConstantRangeCount = 1,
+	                                     .pPushConstantRanges = &push_constant,
 	                             });
 	vk.name(*res, "foveation pipeline layout");
 	return res;
@@ -149,18 +182,21 @@ std::array<vk::raii::Pipeline, 2> make_pipelines(wivrn::vk_bundle & vk, vk::Pipe
 
 vk::raii::DescriptorPool make_ds_pool(wivrn::vk_bundle & vk)
 {
+	// One descriptor set per eye: a set's contents can't be safely rewritten
+	// between two dispatches already recorded into the same not-yet-submitted
+	// command buffer (the GPU reads current contents at execution time).
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 2,
+	                .descriptorCount = 2 * 2,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = 2,
+	                .descriptorCount = 4 * 2,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageBuffer,
-	                .descriptorCount = 1,
+	                .descriptorCount = 1 * 2,
 	        },
 	};
 	vk::raii::DescriptorPool res{
@@ -366,11 +402,13 @@ void foveation::compute_params()
 	{
 		const auto & fov = last.fovs[i];
 
+		bool neutral = debug_get_num_option_disable_foveation();
+
 		size_t extent_w = std::abs(last.src[i].extent.w);
 		if (foveated_size.width < extent_w)
 		{
 			auto distance = manual_foveation.enabled ? manual_foveation.distance : convergence_distance;
-			auto angle_x = convergence_angle(distance, eye_x[i], -e.x);
+			auto angle_x = neutral ? 0.0 : convergence_angle(distance, eye_x[i], -e.x);
 			auto center = angles_to_center(angle_x, fov.angle_left, fov.angle_right);
 			fill_param_2d(center, foveated_size.width, extent_w, params[i].x);
 		}
@@ -380,8 +418,8 @@ void foveation::compute_params()
 		size_t extent_h = std::abs(last.src[i].extent.h);
 		if (foveated_size.height < extent_h)
 		{
-			auto angle_y = -e.y;
-			if (is_zero_quat(gaze) and not manual_foveation.enabled)
+			auto angle_y = neutral ? 0.0 : -e.y;
+			if (not neutral and is_zero_quat(gaze) and not manual_foveation.enabled)
 			{
 				// Natural gaze is not straight forward, adjust the angle
 				angle_y += angle_offset;
@@ -416,15 +454,19 @@ foveation::foveation(wivrn::vk_bundle & bundle, vk::Extent3D foveated_size) :
         ds_layout(make_ds_layout(bundle)),
         layout(make_layout(bundle, ds_layout)),
         pipeline(make_pipelines(bundle, layout, foveated_size.width / 2)),
-        descriptor_pool(make_ds_pool(bundle)),
-        descriptor_set(bundle.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
-                .descriptorPool = descriptor_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &*ds_layout,
-        })[0]
-                               .release())
+        descriptor_pool(make_ds_pool(bundle))
 {
-	bundle.name(descriptor_set, "foveation descriptor set");
+	std::array<vk::DescriptorSetLayout, 2> layouts{*ds_layout, *ds_layout};
+	auto sets = bundle.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+	        .descriptorPool = descriptor_pool,
+	        .descriptorSetCount = uint32_t(layouts.size()),
+	        .pSetLayouts = layouts.data(),
+	});
+	for (size_t i = 0; i < descriptor_sets.size(); ++i)
+	{
+		descriptor_sets[i] = sets[i].release();
+		bundle.name(descriptor_sets[i], std::format("foveation descriptor set {}", i));
+	}
 }
 
 void foveation::update_tracking(const from_headset::tracking & tracking)
@@ -578,6 +620,29 @@ void foveation::update_ubo(
 		         extent,
 		         foveated_size.height);
 	}
+	// Diagnostic: logs per-eye source rect and the UBO's first/last x-index
+	// table entries, to catch an unsigned underflow at the edge buckets.
+	// `adb shell setprop debug.xrt.WIVRN_LOG_FOVEATION_UBO 1`.
+	if (debug_get_num_option_log_foveation_ubo())
+	{
+	for (size_t view = 0; view < 2; ++view)
+	{
+		auto xspan = std::span(ubo.x + view * RENDER_FOVEATION_BUFFER_DIMENSIONS, RENDER_FOVEATION_BUFFER_DIMENSIONS);
+		U_LOG_E("DIAG3 view=%zu src_rect offset=(%d,%d) extent=(%d,%d) foveated_size=(%u,%u) params.x.size=%zu params.y.size=%zu",
+		        view,
+		        src_rect[view].offset.w, src_rect[view].offset.h,
+		        src_rect[view].extent.w, src_rect[view].extent.h,
+		        foveated_size.width, foveated_size.height,
+		        params[view].x.size(), params[view].y.size());
+		U_LOG_E("DIAG3 view=%zu ubo.x[0..4]=%u,%u,%u,%u,%u ubo.x[last-4..last]=%u,%u,%u,%u,%u",
+		        view,
+		        xspan[0], xspan[1], xspan[2], xspan[3], xspan[4],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 5], xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 4],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 3], xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 2],
+		        xspan[RENDER_FOVEATION_BUFFER_DIMENSIONS - 1]);
+	}
+	}
+
 	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffer, 0, sizeof(ubo));
 	std::memcpy(gpu_buffer.data<ubo_data>(), &ubo, sizeof(ubo));
 }
@@ -585,8 +650,10 @@ void foveation::update_ubo(
 std::array<to_headset::foveation_parameter, 2> foveation::foveate(
         vk::raii::Device & device,
         vk::raii::CommandBuffer & cmd,
-        vk::ImageView y,
-        vk::ImageView cbcr,
+        std::array<vk::ImageView, 2> y,
+        std::array<vk::ImageView, 2> cbcr,
+        vk::ImageView alpha_y,
+        vk::ImageView alpha_cbcr,
         bool flip_y,
         std::array<vk::ImageView, 2> src,
         std::array<xrt_rect, 2> src_rect,
@@ -594,73 +661,116 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
         bool alpha)
 {
 	update_ubo(cmd, flip_y, src_rect, src_fov);
-	auto ubo = gpu_buffer.data<ubo_data>();
-
-	std::array src_image_info{
-	        vk::DescriptorImageInfo{
-	                .sampler = *sampler,
-	                .imageView = src[0],
-	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        },
-	        vk::DescriptorImageInfo{
-	                .sampler = *sampler,
-	                .imageView = src[1],
-	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        },
-	};
 
 	vk::DescriptorBufferInfo ubo_info{
 	        .buffer = gpu_buffer,
 	        .range = vk::WholeSize,
 	};
 
-	vk::DescriptorImageInfo y_info{
-	        .imageView = y,
-	        .imageLayout = vk::ImageLayout::eGeneral,
-	};
-	vk::DescriptorImageInfo cbcr_info{
-	        .imageView = cbcr,
-	        .imageLayout = vk::ImageLayout::eGeneral,
-	};
-
-	std::array writes = {
-	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
-	                .dstBinding = 0,
-	                .descriptorCount = src_image_info.size(),
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = src_image_info.data(),
-	        },
-	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
-	                .dstBinding = 1,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eStorageBuffer,
-	                .pBufferInfo = &ubo_info,
-	        },
-	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
-	                .dstBinding = 2,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eStorageImage,
-	                .pImageInfo = &y_info,
-	        },
-	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
-	                .dstBinding = 3,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eStorageImage,
-	                .pImageInfo = &cbcr_info,
-	        },
-	};
-
-	device.updateDescriptorSets(writes, {});
-
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline[alpha]);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_set, {});
-	cmd.dispatch(divide_and_round_up(foveated_size.width, 8),
-	             divide_and_round_up(foveated_size.height, 8),
-	             2);
+
+	// Real GPU driver bug (see compositor.h's struct image): a compute write
+	// to array layer >=1 of a multi-planar image is corrupted, so each eye
+	// gets its own dedicated single-layer image, dispatched separately
+	// (groupCountZ=1; which eye is a push constant, not gl_GlobalInvocationID.z).
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		// src (Monado's swapchain image view) genuinely changes every
+		// frame -- real double/triple buffering upstream -- so binding 0
+		// always needs rewriting. y/cbcr/alpha_y/alpha_cbcr/ubo, by
+		// contrast, only ever take on 2 distinct values each for the
+		// lifetime of the session (the compositor's 2 fixed image slots),
+		// alternating every other frame: skip rewriting bindings 1-5 when
+		// they haven't actually changed since last time.
+		std::array src_image_info{
+		        vk::DescriptorImageInfo{
+		                .sampler = *sampler,
+		                .imageView = src[0],
+		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		        },
+		        vk::DescriptorImageInfo{
+		                .sampler = *sampler,
+		                .imageView = src[1],
+		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		        },
+		};
+		vk::WriteDescriptorSet src_write{
+		        .dstSet = descriptor_sets[eye],
+		        .dstBinding = 0,
+		        .descriptorCount = src_image_info.size(),
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .pImageInfo = src_image_info.data(),
+		};
+		device.updateDescriptorSets(src_write, {});
+
+		bound_views current{.y = y[eye], .cbcr = cbcr[eye], .alpha_y = alpha_y, .alpha_cbcr = alpha_cbcr};
+		if (current != last_bound[eye])
+		{
+			last_bound[eye] = current;
+
+			vk::DescriptorImageInfo y_info{
+			        .imageView = y[eye],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo cbcr_info{
+			        .imageView = cbcr[eye],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo alpha_y_info{
+			        .imageView = alpha_y,
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo alpha_cbcr_info{
+			        .imageView = alpha_cbcr,
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+
+			std::array writes = {
+			        vk::WriteDescriptorSet{
+			                .dstSet = descriptor_sets[eye],
+			                .dstBinding = 1,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageBuffer,
+			                .pBufferInfo = &ubo_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = descriptor_sets[eye],
+			                .dstBinding = 2,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &y_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = descriptor_sets[eye],
+			                .dstBinding = 3,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &cbcr_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = descriptor_sets[eye],
+			                .dstBinding = 4,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &alpha_y_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = descriptor_sets[eye],
+			                .dstBinding = 5,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &alpha_cbcr_info,
+			        },
+			};
+			device.updateDescriptorSets(writes, {});
+		}
+
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[eye], {});
+		cmd.pushConstants<int32_t>(*layout, vk::ShaderStageFlagBits::eCompute, 0, eye);
+		cmd.dispatch(divide_and_round_up(foveated_size.width, 8),
+		             divide_and_round_up(foveated_size.height, 8),
+		             1);
+	}
 
 	return params;
 }

@@ -4,10 +4,13 @@
 
 #include "util/u_logging.h"
 
+#ifndef __ANDROID__
 #include <gio/gio.h>
+#endif
 
 static std::string _hostname()
 {
+#ifndef __ANDROID__
 	GError * error = NULL;
 	GDBusConnection * con = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
 
@@ -58,6 +61,7 @@ static std::string _hostname()
 
 		g_object_unref(con);
 	}
+#endif
 
 	char buf[HOST_NAME_MAX];
 	int code = gethostname(buf, sizeof(buf));

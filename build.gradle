@@ -145,6 +145,12 @@ android {
                           '-DWIVRN_CSS=' + css,
                           '-DWIVRN_COMPRESS_GLB=' + compressGlb,
                           '-DWIVRN_ADDRESS_SANITIZER=' + asan,
+                          // spirv-opt (NDK's own shader-tools dir) and
+                          // msgfmt/msgmerge (gettext, for locale generation)
+                          // aren't on PATH for Gradle's cmake invocation; hint
+                          // find_program() at them. Harmless if already found
+                          // elsewhere.
+                          '-DCMAKE_PROGRAM_PATH=' + "${rootDir}/../tools/spirv-tools/extracted/usr/bin;${rootDir}/../tools/gettext/extracted/usr/bin;${rootDir}/../tools/rsvg/extracted/usr/bin",
                           ] +
                           fetchcontentBaseDir
                 resValue "string", "app_name", project.hasProperty('wivrn_app_name') ? project.wivrn_app_name : "WiVRn Local"

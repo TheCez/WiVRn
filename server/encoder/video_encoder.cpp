@@ -24,6 +24,7 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
@@ -41,6 +42,9 @@
 #if WIVRN_USE_VULKAN_ENCODE
 #include "video_encoder_vulkan_h264.h"
 #include "video_encoder_vulkan_h265.h"
+#endif
+#if WIVRN_USE_MEDIACODEC
+#include "video_encoder_mediacodec.h"
 #endif
 #include "video_encoder_raw.h"
 
@@ -150,6 +154,15 @@ std::unique_ptr<video_encoder> video_encoder::create(
 		res = std::make_unique<video_encoder_va>(wivrn_vk, settings, stream_idx);
 #else
 		throw std::runtime_error("vaapi support not enabled");
+#endif
+	}
+
+	if (settings.encoder_name == encoder_mediacodec)
+	{
+#if WIVRN_USE_MEDIACODEC
+		res = std::make_unique<video_encoder_mediacodec>(wivrn_vk, settings, stream_idx);
+#else
+		throw std::runtime_error("mediacodec support not enabled");
 #endif
 	}
 
@@ -295,6 +308,12 @@ void video_encoder::encode(wivrn_session & cnx,
 	}
 }
 
+void video_encoder::push_async(data && d)
+{
+	assert(shared_sender);
+	shared_sender->push(std::move(d));
+}
+
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
 {
 	std::lock_guard lock(mutex);
@@ -334,9 +353,22 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 			else
 				cnx->send_stream(to_headset::video_stream_data_shard{shard});
 		}
+		catch (std::exception & e)
+		{
+			// Logged once per instance so a broken connection doesn't flood logcat.
+			if (not network_error_logged)
+			{
+				U_LOG_E("stream %d: send_%s failed: %s", stream_idx, control ? "control" : "stream", e.what());
+				network_error_logged = true;
+			}
+		}
 		catch (...)
 		{
-			// Ignore network errors
+			if (not network_error_logged)
+			{
+				U_LOG_E("stream %d: send_%s failed with unknown exception", stream_idx, control ? "control" : "stream");
+				network_error_logged = true;
+			}
 		}
 		++shard.shard_idx;
 		shard.view_info.reset();

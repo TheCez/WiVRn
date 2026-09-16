@@ -26,7 +26,10 @@ add_library(wivrn-common STATIC EXCLUDE_FROM_ALL
     vk/vk_mem_alloc.cpp
 )
 
-if (WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER)
+if ((WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER) AND NOT ANDROID)
+    # Desktop app discovery/launch (Steam/Flatpak/XDG): not linked by the
+    # Android build of wivrn-server -- see server/CMakeLists.txt and
+    # driver/wivrn_session.cpp's get_application_list handler.
     add_library(wivrn-common-server STATIC EXCLUDE_FROM_ALL
         application.cpp
         utils/flatpak.cpp
@@ -70,7 +73,11 @@ if(ANDROID)
     file(ARCHIVE_EXTRACT INPUT ${FETCHCONTENT_BASE_DIR}/vulkan-sdk-${VULKAN_VERSION}.tar.gz DESTINATION ${CMAKE_BINARY_DIR})
 
     target_include_directories(wivrn-common SYSTEM PUBLIC ${CMAKE_BINARY_DIR}/Vulkan-Headers-vulkan-sdk-${VULKAN_VERSION}/include)
-    target_compile_definitions(wivrn-common PUBLIC VMA_VULKAN_VERSION=1001000)
+    # Was 1001000: the Android server requests VK_API_VERSION_1_3 unconditionally
+    # (wivrn_vk_bundle.cpp), and VMA asserts if the runtime vulkanApiVersion exceeds
+    # this compile-time ceiling -- crashed wivrn-server (SIGABRT) on first connect.
+    # Raising it costs nothing on the Quest client (VMA just compiles in unused codepaths).
+    target_compile_definitions(wivrn-common PUBLIC VMA_VULKAN_VERSION=1003000)
 else()
     target_link_libraries(wivrn-common PUBLIC Vulkan::Headers)
 endif()

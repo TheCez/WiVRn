@@ -24,6 +24,7 @@
 #include "wivrn_sockets.h"
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <stdexcept>
@@ -57,6 +58,11 @@ private:
 
 	from_headset::headset_info_packet info_packet;
 
+	// Guards socket writes in send_control/send_stream: streams now encode
+	// concurrently (compositor.cpp's encoder_work()), so their sends can
+	// genuinely race on the same socket without this.
+	std::mutex send_mutex;
+
 	void init(std::stop_token stop_token, std::function<void()> tick = []() {});
 
 public:
@@ -79,6 +85,7 @@ public:
 	template <typename T>
 	void send_control(T && packet)
 	{
+		std::lock_guard lock(send_mutex);
 		try
 		{
 			if (active)
@@ -94,6 +101,7 @@ public:
 	template <typename T>
 	void send_stream(T && packet)
 	{
+		std::lock_guard lock(send_mutex);
 		try
 		{
 			if (active)

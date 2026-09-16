@@ -45,6 +45,7 @@ inline const char * encoder_vaapi = "vaapi";
 inline const char * encoder_x264 = "x264";
 inline const char * encoder_vulkan = "vulkan";
 inline const char * encoder_raw = "raw";
+inline const char * encoder_mediacodec = "mediacodec";
 
 class video_encoder
 {
@@ -106,6 +107,7 @@ private:
 	clock_offset clock;
 
 	std::ofstream video_dump;
+	bool network_error_logged = false;
 
 	std::shared_ptr<sender> shared_sender;
 
@@ -151,6 +153,14 @@ protected:
 	virtual std::optional<data> encode(uint8_t slot, uint64_t frame_index) = 0;
 
 	void SendData(std::span<uint8_t> data, bool end_of_frame, bool control = false);
+
+	// For a backend (async_send=true) that needs to send more than one
+	// payload per encode() call (e.g. codec config data ahead of a real
+	// frame) instead of returning a single `data` for the base class to
+	// push automatically: hands off to the same shared background sender
+	// thread `data` returned from encode() itself uses. Requires
+	// async_send=true (shared_sender != nullptr).
+	void push_async(data &&);
 };
 
 } // namespace wivrn

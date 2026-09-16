@@ -36,6 +36,7 @@
 #include <ranges>
 
 #include "openxr/openxr.h"
+#include "utils/enumerate_polyfill.h"
 #include "wivrn_config.h"
 
 template <int N, bool quaternion = false, int polynomial_order = 2, int stored_samples = 30>

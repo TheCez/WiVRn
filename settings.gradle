@@ -1,0 +1,6 @@
+rootProject.name = 'WiVRn'
+
+// Root project is the existing Quest client app, unchanged. server-app is
+// the new Android-phone-as-server module (libwivrn-server.so + a Service
+// wrapper) packaged as its own installable APK.
+include ':server-app'

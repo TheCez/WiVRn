@@ -38,6 +38,7 @@ option(WIVRN_USE_SYSTEM_LIBKTX "Use system KTX-Software library" ON)
 option(WIVRN_COMPRESS_GLB "Compress textures in GLB files with gltf-transform" OFF)
 option(WIVRN_USE_ANDROID_VALIDATION_LAYER "Download the android version of the Vulkan validation layer" OFF)
 option(WIVRN_USE_ANDROID_BIN_LIBKTX "Download the prebuilt libktx for android" OFF)
+option(WIVRN_ANDROID_JNI "Build wivrn-server as a JNI-loadable shared library instead of a plain executable (Android only)" OFF)
 option(WIVRN_BUILD_CLIENT "Build WiVRn client" OFF)
 option(WIVRN_BUILD_SERVER "Build WiVRn server" ON)
 option(WIVRN_BUILD_SERVER_LIBRARY "Build OpenXR library for WiVRn server" ${WIVRN_BUILD_SERVER})
@@ -58,6 +59,8 @@ option(WIVRN_USE_NVENC "Enable nvenc (Nvidia) hardware encoder" ON)
 option(WIVRN_USE_VAAPI "Enable vaapi (AMD/Intel) hardware encoder" ON)
 option(WIVRN_USE_VULKAN_ENCODE "Enable vulkan video encoder" ON)
 option(WIVRN_USE_X264 "Enable x264 software encoder" ON)
+# Android's hardware encoder; the other four backends above are desktop-only APIs.
+option(WIVRN_USE_MEDIACODEC "Enable Android MediaCodec hardware encoder" ${ANDROID})
 
 option(WIVRN_USE_PERFETTO "Enable Perfetto tracing via the Perfetto SDK (server only)" OFF)
 option(WIVRN_TRACE_MONADO "Also instrument Monado (percetto) under the same WIVRN_TRACING switch; pulls in a second Perfetto runtime, system backend only. Requires WIVRN_USE_PERFETTO" OFF)
@@ -122,12 +125,15 @@ if (WIVRN_USE_SYSTEM_BOOST AND NEED_COMMON)
 endif()
 
 if (WIVRN_BUILD_SERVER)
-    find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
+    if (NOT ANDROID)
+        find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
+    endif()
     if (Vulkan_VERSION  VERSION_LESS "1.4.304")
         message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
     endif()
 
-    if (NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
+    # Android has none of these; encoder_settings.cpp falls back to MediaCodec there.
+    if (NOT ANDROID AND NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
         message(FATAL_ERROR "No encoder selected, use at least one of WIVRN_USE_NVENC, WIVRN_USE_VAAPI, WIVRN_USE_VULKAN_ENCODE or WIVRN_USE_X264")
     endif()
 
@@ -144,17 +150,19 @@ if (WIVRN_BUILD_SERVER)
         pkg_check_modules(libpipewire REQUIRED IMPORTED_TARGET libpipewire-0.3)
     endif()
 
-    pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
     find_package(Eigen3 REQUIRED)
     find_package(nlohmann_json REQUIRED)
     find_package(CLI11 REQUIRED)
 
-    pkg_check_modules(glib2 REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2.0)
-
-    pkg_check_modules(libnotify REQUIRED IMPORTED_TARGET libnotify)
+    # Avahi (mDNS publish) and the D-Bus dashboard IPC are desktop-only.
+    if (NOT ANDROID)
+        pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
+        pkg_check_modules(glib2 REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2.0)
+        pkg_check_modules(libnotify REQUIRED IMPORTED_TARGET libnotify)
+    endif()
 endif()
 
-if (WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER)
+if ((WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_SERVER) AND NOT ANDROID)
     pkg_check_modules(librsvg-2.0 REQUIRED IMPORTED_TARGET librsvg-2.0)
     find_package(LibArchive REQUIRED)
     find_package(PNG REQUIRED)
@@ -208,7 +216,8 @@ if (WIVRN_BUILD_CLIENT AND NOT ANDROID)
     endif()
 endif()
 
-if(ANDROID)
+# native_app_glue is only needed by the client (a NativeActivity app), not the server.
+if(ANDROID AND WIVRN_BUILD_CLIENT)
     set(ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
     set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
     include(AndroidNdkModules)
@@ -274,6 +283,19 @@ FetchContent_Declare(monado
     # The flatpak manifest is updated automatically
     GIT_TAG          ${MONADO_REV}
     PATCH_COMMAND    ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${MONADO_PATCHES}
+    EXCLUDE_FROM_ALL
+)
+
+# Rootless custom Vulkan driver loading (Turnip on Adreno), Android-only --
+# fetched only if(ANDROID) in server/CMakeLists.txt; declaring it here is free.
+file(GLOB ADRENOTOOLS_PATCHES CONFIGURE_DEPENDS patches/adrenotools/*)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS adrenotools-rev)
+file(STRINGS adrenotools-rev ADRENOTOOLS_REV)
+FetchContent_Declare(adrenotools
+    GIT_REPOSITORY   https://github.com/bylaws/libadrenotools.git
+    GIT_TAG          ${ADRENOTOOLS_REV}
+    GIT_SUBMODULES   lib/linkernsbypass
+    PATCH_COMMAND    ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${ADRENOTOOLS_PATCHES}
     EXCLUDE_FROM_ALL
 )
 

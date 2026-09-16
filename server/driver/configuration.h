@@ -51,7 +51,10 @@ struct configuration
 		std::optional<std::string> device;
 	};
 
-	std::array<encoder, 3> encoders; // left, right, alpha
+	// Left, right, alpha. Default-constructed means "auto-detect a hardware
+	// encoder" (encoder_settings.cpp's select_encoder), same on Android and
+	// desktop. A config file's "encoder" key overrides this.
+	std::array<encoder, 3> encoders;
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;

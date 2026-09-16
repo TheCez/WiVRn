@@ -33,6 +33,9 @@ struct basic_allocation_traits_base
 {
 	static void * map(VmaAllocation allocation);
 	static void unmap(VmaAllocation allocation);
+	// No-op if already HOST_COHERENT (VMA checks internally) -- safe to
+	// call unconditionally before a CPU read of a GPU write.
+	static void invalidate(VmaAllocation allocation, vk::DeviceSize offset, vk::DeviceSize size);
 };
 
 template <>
@@ -240,6 +243,15 @@ public:
 
 		traits::unmap(allocation);
 		mapped = nullptr;
+	}
+
+	// Call before a CPU read of mapped memory a GPU write may have landed
+	// in: on HOST_VISIBLE-but-not-HOST_COHERENT memory (e.g.
+	// VMA_MEMORY_USAGE_AUTO_PREFER_HOST on some Android devices), the
+	// write isn't visible to the CPU without this. No-op if already coherent.
+	void invalidate(vk::DeviceSize offset = 0, vk::DeviceSize size = VK_WHOLE_SIZE)
+	{
+		traits::invalidate(allocation, offset, size);
 	}
 
 	vk::DeviceSize size() const

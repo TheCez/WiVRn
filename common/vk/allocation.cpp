@@ -69,6 +69,13 @@ void basic_allocation_traits_base::unmap(VmaAllocation allocation)
 	vmaUnmapMemory(allocator, allocation);
 }
 
+void basic_allocation_traits_base::invalidate(VmaAllocation allocation, vk::DeviceSize offset, vk::DeviceSize size)
+{
+	VmaAllocator allocator = vk_allocator::instance();
+
+	CHECK_VK(vmaInvalidateAllocation(allocator, allocation, offset, size));
+}
+
 std::pair<vk::raii::Image, VmaAllocation> basic_allocation_traits<vk::Image>::create(
         vk::raii::Device & device,
         const CreateInfo & image_info,

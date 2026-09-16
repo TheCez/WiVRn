@@ -452,6 +452,41 @@ xrt_binding_output_pair touch_plus_output_binding[] = {
         {XRT_OUTPUT_NAME_TOUCH_PLUS_HAPTIC, XRT_OUTPUT_NAME_TOUCH_HAPTIC},
 };
 
+// XR_VALVE_frame_controller_interaction (Steam Frame). Real physical Quest
+// Touch controllers have no bumper, view/menu-on-both-hands, dpad or system
+// button, and no discrete trigger/squeeze click (analog value only) -- those
+// components are left unbound below, same as any other profile mapped onto
+// a device that doesn't have every input it defines. menu (right hand, per
+// the profile) and view (left hand) both map to our one real menu button,
+// which only ever exists on the left hand instance -- the right-hand
+// binding is inert there, matching how touch_pro/touch_plus's own
+// menu/system split already behaves per hand.
+xrt_binding_input_pair frame_controller_input_binding[] = {
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_TOUCH, XRT_INPUT_TOUCH_TRIGGER_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_SQUEEZE_VALUE, XRT_INPUT_TOUCH_SQUEEZE_VALUE},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK_CLICK, XRT_INPUT_TOUCH_THUMBSTICK_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK_TOUCH, XRT_INPUT_TOUCH_THUMBSTICK_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK, XRT_INPUT_TOUCH_THUMBSTICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_MENU_CLICK, XRT_INPUT_TOUCH_MENU_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_VIEW_CLICK, XRT_INPUT_TOUCH_MENU_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_SYSTEM_CLICK, XRT_INPUT_TOUCH_SYSTEM_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_A_CLICK, XRT_INPUT_TOUCH_A_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_A_TOUCH, XRT_INPUT_TOUCH_A_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_B_CLICK, XRT_INPUT_TOUCH_B_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_B_TOUCH, XRT_INPUT_TOUCH_B_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_X_CLICK, XRT_INPUT_TOUCH_X_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_X_TOUCH, XRT_INPUT_TOUCH_X_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_CLICK, XRT_INPUT_TOUCH_Y_CLICK},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_TOUCH, XRT_INPUT_TOUCH_Y_TOUCH},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_GRIP_POSE, XRT_INPUT_TOUCH_GRIP_POSE},
+        {XRT_INPUT_VALVE_FRAME_CONTROLLER_AIM_POSE, XRT_INPUT_TOUCH_AIM_POSE},
+};
+
+xrt_binding_output_pair frame_controller_output_binding[] = {
+        {XRT_OUTPUT_NAME_VALVE_FRAME_CONTROLLER_HAPTIC, XRT_OUTPUT_NAME_TOUCH_HAPTIC},
+};
+
 xrt_binding_input_pair pico_neo3_input_binding[] = {
         {XRT_INPUT_PICO_NEO3_X_CLICK, XRT_INPUT_TOUCH_X_CLICK},
         {XRT_INPUT_PICO_NEO3_X_TOUCH, XRT_INPUT_TOUCH_X_TOUCH},
@@ -551,6 +586,13 @@ make_binding_profiles()
 	                .input_count = std::size(touch_plus_input_binding),
 	                .outputs = touch_plus_output_binding,
 	                .output_count = std::size(touch_plus_output_binding),
+	        },
+	        {
+	                .name = XRT_DEVICE_VALVE_FRAME_CONTROLLER,
+	                .inputs = frame_controller_input_binding,
+	                .input_count = std::size(frame_controller_input_binding),
+	                .outputs = frame_controller_output_binding,
+	                .output_count = std::size(frame_controller_output_binding),
 	        },
 	        {
 	                .name = XRT_DEVICE_PICO_NEO3_CONTROLLER,

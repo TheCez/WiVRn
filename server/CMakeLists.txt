@@ -48,6 +48,9 @@ set(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3   ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS    ON)
+# VRChat's Android build only suggests bindings for Steam Frame's profile
+# (never falls back to Oculus Touch), so without this its controllers are unbound.
+set(XRT_FEATURE_OPENXR_INTERACTION_VALVE_FRAME_CONTROLLER ON)
 set(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS    ON)
 set(XRT_FEATURE_OPENXR_LAYER_DEPTH              OFF)
 set(XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS         OFF)
@@ -90,16 +93,16 @@ set(XRT_OXR_RUNTIME_SUFFIX        "wivrn"          CACHE STRING "OpenXR client l
 
 FetchContent_MakeAvailable(monado)
 
+# Rootless custom Vulkan driver loading (adrenotools/Turnip) -- Android only.
+if (ANDROID)
+	FetchContent_MakeAvailable(adrenotools)
+endif()
+
 if (WIVRN_BUILD_SERVER)
-	add_executable(wivrn-server
+	# Shared between both target types below.
+	set(_wivrn_server_sources
 			accept_connection.cpp
-			active_runtime.cpp
-			avahi_publisher.cpp
 			hostname.cpp
-			main.cpp
-			sleep_inhibitor.cpp
-			start_application.cpp
-			start_systemd_unit.cpp
 			ipc_server_cb.cpp
 			target_instance_wivrn.cpp
 			wivrn_ipc.cpp
@@ -132,7 +135,6 @@ if (WIVRN_BUILD_SERVER)
 			driver/wivrn_fb_face2_tracker.cpp
 			driver/wivrn_htc_face_tracker.cpp
 			driver/wivrn_generic_tracker.cpp
-			driver/wivrn_uinput.cpp
 			driver/wivrn_session.cpp
 			driver/wivrn_connection.cpp
 			driver/xrt_cast.cpp
@@ -140,7 +142,61 @@ if (WIVRN_BUILD_SERVER)
 			utils/wivrn_vk_bundle.cpp
 			utils/wivrn_trace.cpp
 			utils/gpu_timestamp_pool.cpp
+			utils/frame_timing_stats.cpp
 		)
+
+	# WIVRN_ANDROID_JNI builds a shared library instead of an executable, for
+	# System.loadLibrary() from the Service wrapper (android/wivrn_server_jni.cpp).
+	if(ANDROID AND WIVRN_ANDROID_JNI)
+		add_library(wivrn-server SHARED ${_wivrn_server_sources})
+	else()
+		add_executable(wivrn-server ${_wivrn_server_sources})
+	endif()
+
+	# main.cpp and its desktop-only support files (D-Bus dashboard IPC,
+	# avahi, sleep_inhibitor, start_application/systemd_unit) have no Android
+	# equivalent. wivrn_uinput.cpp opens /dev/uinput directly, which an
+	# unprivileged Android app can't do, so it gets a no-op implementation instead.
+	if(ANDROID)
+		target_sources(wivrn-server PRIVATE
+				driver/wivrn_uinput_android.cpp
+				android/wivrn_ipc_socket_monado_stub.cpp
+				utils/vulkan_loader.cpp
+			)
+		if(WIVRN_ANDROID_JNI)
+			target_sources(wivrn-server PRIVATE android/wivrn_server_jni.cpp)
+		else()
+			target_sources(wivrn-server PRIVATE android/wivrn_server_android_stub_main.cpp)
+		endif()
+		# NDK libc++ only has std::jthread/stop_token behind this flag
+		# (checked against NDK r28b/Clang 19). zoned_time/enumerate_view
+		# aren't available at all -- see driver/configuration.cpp and
+		# utils/enumerate_polyfill.h.
+		target_compile_options(wivrn-server PRIVATE -fexperimental-library)
+		# Without this, vulkan_core.h doesn't declare the Android platform
+		# Vulkan extensions/structs at all; the AHardwareBuffer import
+		# extension then silently never gets requested at device creation,
+		# so the driver never populates its function pointer -- a null-pointer
+		# call at the callsite, not a link error, which is why this was missed.
+		target_compile_definitions(wivrn-server PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+
+		# Required to unlock vk::raii::Context's PFN_vkGetInstanceProcAddr
+		# constructor -- the default only exposes vulkan-hpp's own internal
+		# loader, which can't be redirected to a custom driver (adrenotools/Turnip,
+		# see utils/vulkan_loader.cpp).
+		target_compile_definitions(wivrn-server PRIVATE VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
+		target_link_libraries(wivrn-server PRIVATE adrenotools)
+	else()
+		target_sources(wivrn-server PRIVATE
+				active_runtime.cpp
+				avahi_publisher.cpp
+				main.cpp
+				sleep_inhibitor.cpp
+				start_application.cpp
+				start_systemd_unit.cpp
+				driver/wivrn_uinput.cpp
+			)
+	endif()
 	target_compile_features(wivrn-server PRIVATE cxx_std_20)
 	target_compile_definitions(wivrn-server PRIVATE VULKAN_HPP_NO_CONSTRUCTORS)
 
@@ -190,6 +246,12 @@ if (WIVRN_BUILD_SERVER)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::X264)
 	endif()
 
+	if(WIVRN_USE_MEDIACODEC)
+		target_sources(wivrn-server PRIVATE encoder/video_encoder_mediacodec.cpp)
+		find_library(MEDIANDK_LIBRARY NAMES mediandk REQUIRED)
+		target_link_libraries(wivrn-server PRIVATE ${MEDIANDK_LIBRARY})
+	endif()
+
 	if(WIVRN_USE_PERFETTO)
 		find_path(PERFETTO_SDK_DIR
 			NAMES perfetto.h
@@ -217,6 +279,9 @@ if (WIVRN_BUILD_SERVER)
 		target_link_libraries(wivrn-server PRIVATE PkgConfig::libpipewire)
 	endif()
 
+	# D-Bus dashboard IPC (GDBus codegen + glib + libnotify): desktop-only,
+	# only used by main.cpp, which itself is excluded on Android above.
+	if(NOT ANDROID)
 	# Generate dbus interface code as a separate target to avoid warnings in generated code
 	add_custom_command(OUTPUT wivrn_server_dbus.c wivrn_server_dbus.h
 			   COMMAND ${GDBUS_CODEGEN} ${CMAKE_CURRENT_SOURCE_DIR}/../dbus/io.github.wivrn.Server.xml --interface-prefix io.github.wivrn --generate-c-code wivrn_server_dbus --c-namespace Wivrn
@@ -241,6 +306,7 @@ if (WIVRN_BUILD_SERVER)
 	target_sources(wivrn-server-dbus PRIVATE
 		${CMAKE_CURRENT_BINARY_DIR}/systemd_manager.c ${CMAKE_CURRENT_BINARY_DIR}/systemd_manager.h
 		${CMAKE_CURRENT_BINARY_DIR}/systemd_unit.c ${CMAKE_CURRENT_BINARY_DIR}/systemd_unit.h)
+	endif()
 
 	target_link_libraries(
 		wivrn-server
@@ -257,13 +323,19 @@ if (WIVRN_BUILD_SERVER)
 			xrt-external-openxr
 			xrt-interfaces
 
-			PkgConfig::AVAHI
 			Eigen3::Eigen
 			wivrn-common
-			wivrn-common-server
 			wivrn-external
 			nlohmann_json::nlohmann_json
 		)
+
+	if(NOT ANDROID)
+		# wivrn-common-server (Steam/Flatpak/XDG desktop app discovery and
+		# launch): only used by main.cpp and the get_application_list
+		# handler in driver/wivrn_session.cpp, both desktop-only paths --
+		# see common/CMakeLists.txt.
+		target_link_libraries(wivrn-server PRIVATE wivrn-common-server PkgConfig::AVAHI)
+	endif()
 
 	include(CompileGLSL)
 	FetchContent_GetProperties(monado SOURCE_DIR _monado_src)

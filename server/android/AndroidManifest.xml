@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manifest for the server-app Gradle module (see ../../../server-app/build.gradle,
+  which points sourceSets.main.manifest.srcFile at this file). Written
+  against the same Vulkan feature requirements as the root (client)
+  manifest, since wivrn-server needs the same Vulkan capability the
+  client does.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- No package= attribute: the module's namespace comes from
+         server-app/build.gradle's android.namespace (modern AGP). -->
+
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400000" android:required="true"/>
+    <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="true"/>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- CHANGE_WIFI_MULTICAST_STATE is for the future NsdManager-based
+         Avahi replacement (mDNS needs multicast); not used yet. -->
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Streaming to a headset is squarely what Android's "connectedDevice"
+         foreground service type is for: already confirmed working on
+         this exact device for org.freedesktop.monado.openxr_runtime's own
+         out-of-process runtime broker service (observed in adb logcat
+         during earlier device testing), so reusing the same category here
+         rather than guessing. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- extractNativeLibs=true: forces AGP to extract libopenxr_wivrn.so
+         to a real file (/data/app/.../lib/arm64/libopenxr_wivrn.so)
+         instead of the modern default of leaving it uncompressed inside
+         the APK and reporting a virtual "base.apk!/lib/arm64-v8a" path
+         via ApplicationInfo.nativeLibraryDir. Our own locally-built test
+         apps (this project's Unity template) resolve and dlopen that
+         virtual path fine via the org.khronos.openxr.runtime_broker
+         cross-process convention, but VRChat's bundled OpenXR-Loader logs
+         "library .../base.apk!/lib/arm64-v8a/libopenxr_wivrn.so does not
+         appear to exist" and falls back to XR_ERROR_RUNTIME_UNAVAILABLE;
+         its loader build appears not to support the in-APK "!"-path
+         convention. A real extracted path is the more universally-
+         compatible form (this is exactly what every runtime shipped before
+         uncompressed-native-lib packaging became AGP's default already
+         did), so this is the safer default for a runtime broker
+         specifically, regardless of which client loader version queries it. -->
+    <application
+        android:label="WiVRn Server"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name="org.meumeu.wivrn.server.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Turnip/adrenotools custom Vulkan driver picker (see
+             server/utils/vulkan_loader.cpp), reached from MainActivity's
+             options menu only, not exported. -->
+        <activity
+            android:name="org.meumeu.wivrn.server.SettingsActivity"
+            android:exported="false" />
+
+        <service
+            android:name="org.meumeu.wivrn.server.WivrnServerService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- OpenXR runtime broker registration + Monado's own IMonado AIDL
+             bind target, on one <service>: the broker intent-filter is only
+             ever statically read (queryIntentServices(), never actually
+             bound); the other is the real bind target for openxr_wivrn.so's
+             ipc_client (loaded into a local OpenXR app's own process, built
+             from the same vendored Monado with XRT_ANDROID_PACKAGE set to
+             this app's package: see server/CMakeLists.txt). See
+             MonadoIpcService's own comment. -->
+        <service
+            android:name="org.meumeu.wivrn.server.MonadoIpcService"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <meta-data
+                android:name="org.khronos.openxr.OpenXRRuntime.SoFilename"
+                android:value="libopenxr_wivrn.so" />
+            <meta-data
+                android:name="org.khronos.openxr.OpenXRRuntime.MajorVersion"
+                android:value="1" />
+            <intent-filter>
+                <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>

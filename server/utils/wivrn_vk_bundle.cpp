@@ -20,6 +20,8 @@
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "utils/enumerate_polyfill.h"
+#include "vulkan_loader.h"
 #include "wivrn-server_shaders.h"
 #include "wivrn_config.h"
 
@@ -29,8 +31,24 @@
 
 DEBUG_GET_ONCE_NUM_OPTION(force_gpu_index, "XRT_COMPOSITOR_FORCE_GPU_INDEX", -1)
 
+// Diagnostic override for vk_bundle::multi_layer_stream_images's vendorID
+// denylist: -1 (default) = normal check; 0 = force single-layer workaround;
+// 1 = force shared-3-layer path, regardless of vendor. Reusable for A/B'ing
+// this path against a new GPU/driver. `adb shell setprop
+// debug.xrt.WIVRN_MULTI_LAYER_STREAM_IMAGES 0` (or 1).
+DEBUG_GET_ONCE_NUM_OPTION(multi_layer_stream_images_override, "WIVRN_MULTI_LAYER_STREAM_IMAGES", -1)
+
 // Default 3: left and right eye + alpha
 DEBUG_GET_ONCE_NUM_OPTION(max_vulkan_encoders, "WIVRN_MAX_VULKAN_ENCODERS", 3)
+
+// Explicitly requests VK_LAYER_KHRONOS_validation for this instance only.
+// Android's system-wide "enable GPU debug layers" setting doesn't work on
+// this device/OS build and also injects the layer into the app's own UI
+// renderer, crashing it before this instance is reached -- instead the
+// layer .so is bundled into this debug APK's own native lib dir (server-app/
+// build.gradle), one of the paths the loader searches for every app.
+// `adb shell setprop debug.xrt.WIVRN_VK_VALIDATION 1`.
+DEBUG_GET_ONCE_NUM_OPTION(vk_validation, "WIVRN_VK_VALIDATION", 0)
 
 namespace
 {
@@ -135,6 +153,14 @@ int get_queue_index(const std::vector<vk::QueueFamilyProperties> & queues, std::
 } // namespace
 
 wivrn::vk_bundle::vk_bundle() :
+#if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
+        // Desktop: vulkan-hpp's own internal DynamicLoader.
+        vk_ctx(),
+#else
+        // Android: resolved ourselves so it can be redirected to a custom
+        // driver -- see vulkan_loader.cpp.
+        vk_ctx(resolve_vk_get_instance_proc_addr()),
+#endif
         instance(nullptr),
         physical_device(nullptr),
         device(nullptr),
@@ -165,10 +191,25 @@ wivrn::vk_bundle::vk_bundle() :
 				instance_extensions.push_back(*it);
 		}
 
+		std::vector<const char *> instance_layers;
+		if (debug_get_num_option_vk_validation())
+		{
+			bool available = false;
+			for (auto & layer: vk_ctx.enumerateInstanceLayerProperties())
+				if (std::string_view(layer.layerName) == "VK_LAYER_KHRONOS_validation")
+					available = true;
+			if (available)
+				instance_layers.push_back("VK_LAYER_KHRONOS_validation");
+			else
+				U_LOG_W("WIVRN_VK_VALIDATION set but VK_LAYER_KHRONOS_validation is not available");
+		}
+
 		instance = vk::raii::Instance(
 		        vk_ctx,
 		        vk::InstanceCreateInfo{
 		                .pApplicationInfo = &app_info,
+		                .enabledLayerCount = uint32_t(instance_layers.size()),
+		                .ppEnabledLayerNames = instance_layers.data(),
 		                .enabledExtensionCount = uint32_t(instance_extensions.size()),
 		                .ppEnabledExtensionNames = instance_extensions.data(),
 		        });
@@ -245,6 +286,16 @@ wivrn::vk_bundle::vk_bundle() :
 		        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 		        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+// For a local OpenXR app importing its own AHardwareBuffer-backed swapchain
+// images into the compositor (Monado's vk_create_image_from_native) --
+// without it, that call crashes (null function pointer) the moment a real
+// local app tries to create one.
+#ifdef VK_ANDROID_external_memory_android_hardware_buffer
+		        VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+		        // Required by the spec whenever the above is enabled
+		        // (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-01387).
+		        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+#endif
 // For FFMPEG
 #ifdef VK_EXT_external_memory_dma_buf
 		        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
@@ -278,6 +329,11 @@ wivrn::vk_bundle::vk_bundle() :
 #ifdef VK_KHR_unified_image_layouts
 		        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
 #endif
+// Lets video_encoder_mediacodec.cpp read back the compositor's image
+// without a queue submission at all.
+#ifdef VK_EXT_host_image_copy
+		        VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
+#endif
 // For perfetto GPU timestamp tracing
 #ifdef VK_EXT_calibrated_timestamps
 		        VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
@@ -288,6 +344,7 @@ wivrn::vk_bundle::vk_bundle() :
 			if (auto it = opt_device_extensions.find(ext.extensionName); it != opt_device_extensions.end())
 				device_extensions.push_back(*it);
 		}
+
 
 		float prio = 1.0;
 
@@ -346,6 +403,15 @@ wivrn::vk_bundle::vk_bundle() :
 			U_LOG_D("GPU unified layout support: %d (video: %d)", enabled.unifiedImageLayouts, enabled.unifiedImageLayoutsVideo);
 		}
 #endif
+#ifdef VK_EXT_host_image_copy
+		if (has_device_ext(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME))
+		{
+			const auto available = std::get<vk::PhysicalDeviceHostImageCopyFeaturesEXT>(physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceHostImageCopyFeaturesEXT>());
+			std::get<vk::PhysicalDeviceHostImageCopyFeaturesEXT>(feat).hostImageCopy = available.hostImageCopy;
+			host_image_copy = bool(available.hostImageCopy);
+			U_LOG_D("GPU host image copy support: %d", host_image_copy);
+		}
+#endif
 
 		device = vk::raii::Device(
 		        physical_device,
@@ -385,13 +451,24 @@ wivrn::vk_bundle::vk_bundle() :
 	                  *debug != VK_NULL_HANDLE);
 
 	auto prop = physical_device.getProperties();
+
+	// PowerVR's registered Vulkan vendorID -- see multi_layer_stream_images (.h).
+	constexpr uint32_t vendor_id_powervr = 0x1010;
+	multi_layer_stream_images = (prop.vendorID != vendor_id_powervr);
+
+	if (auto override = debug_get_num_option_multi_layer_stream_images_override(); override >= 0)
+		multi_layer_stream_images = (override != 0);
+
 	U_LOG_I("Vulkan instance created:\n"
 	        "\tGPU: %s\n"
-	        "\tqueue families: %d %d %d (main, encode, transfer)\n",
+	        "\tqueue families: %d %d %d (main, encode, transfer)\n"
+	        "\tmulti_layer_stream_images: %s\n",
 	        prop.deviceName.data(),
 	        int32_t(queue.family_index),
 	        int32_t(encode_queue_family_index),
-	        int32_t(transfer_queue.family_index));
+	        int32_t(transfer_queue.family_index),
+	        multi_layer_stream_images ? "true" : "false");
+
 }
 
 uint32_t wivrn::vk_bundle::get_memory_type(uint32_t type_bits, vk::MemoryPropertyFlags memory_props)

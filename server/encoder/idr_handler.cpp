@@ -47,7 +47,8 @@ void default_idr_handler::on_feedback(const from_headset::feedback & f)
 		                   }
 	                   },
 	                   [this, &f](running r) {
-		                   if (not f.sent_to_decoder and f.frame_index >= r.first_p and not is_non_ref_frame(f.frame_index))
+		                   if (not f.sent_to_decoder and f.frame_index >= r.first_p and
+		                       not is_non_ref_frame(f.frame_index) and was_sent(f.frame_index))
 		                   {
 			                   U_LOG_I("IDR frame needed on stream %d", f.stream_index);
 			                   state = need_idr{};
@@ -63,6 +64,7 @@ void default_idr_handler::reset()
 	U_LOG_D("IDR handler reset");
 	state = need_idr{};
 	non_ref_frames.assign(512, uint64_t(-1));
+	sent_frames.assign(512, uint64_t(-1));
 }
 
 bool default_idr_handler::should_skip(uint64_t frame_id)
@@ -96,9 +98,17 @@ bool default_idr_handler::is_non_ref_frame(uint64_t frame_index)
 	return non_ref_frames[frame_index % non_ref_frames.size()] == frame_index;
 }
 
+bool default_idr_handler::was_sent(uint64_t frame_index)
+{
+	return sent_frames[frame_index % sent_frames.size()] == frame_index;
+}
+
 default_idr_handler::frame_type default_idr_handler::get_type(uint64_t frame_index)
 {
 	std::unique_lock lock(mutex);
+	// Record that this stream actually sent this frame index -- see
+	// sent_frames' declaration for why this distinction matters.
+	sent_frames[frame_index % sent_frames.size()] = frame_index;
 	return std::visit(utils::overloaded{
 	                          [this, frame_index](need_idr) {
 		                          U_LOG_D("IDR frame needed");

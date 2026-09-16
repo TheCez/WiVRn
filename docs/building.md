@@ -64,6 +64,39 @@ cmake --build build-dashboard
 
 See [Server](#server-pc) for the server compile options.
 
+# Server (Android phone)
+
+Runs the WiVRn server directly on an Android phone instead of a PC. Shares the same [build dependencies](#build-dependencies) and [Android environment](#android-environment) setup as the [client](#client-headset) below -- both build from this repository's root `CMakeLists.txt`, just with different CMake arguments (`WIVRN_BUILD_SERVER` instead of `WIVRN_BUILD_CLIENT`).
+
+Vulkan-Headers/glslangValidator/spirv-tools resolve from the same system packages listed under [build dependencies](#build-dependencies), same as the client (`CMAKE_FIND_ROOT_PATH_MODE_*=BOTH` lets CMake's `find_package`/`find_program` see host-installed packages despite the NDK cross-compile sysroot). If your system packages are too old or otherwise incompatible, `server-app/build.gradle` also supports overriding them with a pinned local copy at a `tools/` directory next to this checkout -- only used if present:
+
+```
+<parent-of-this-checkout>/
+├── wivrn/                       (this repository)
+└── tools/
+    ├── vulkan-headers/include/  (Vulkan-Headers' include/ directory)
+    ├── glslang/extracted/usr/bin/glslangValidator
+    └── spirv-tools/extracted/usr/bin/  (spirv-opt, etc.)
+```
+
+#### Server build
+From the main directory.
+```bash
+export ANDROID_HOME=~/Android
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk/
+
+./gradlew :server-app:assembleDebug
+```
+
+Outputs will be in `server-app/build/outputs/apk/debug/server-app-debug.apk`. This is a debug build (auto-signed with the default debug keystore) -- see [Apk signing](#apk-signing) below if you need a release build.
+
+#### Install and run
+Same `adb` setup as the [client](#install-apk-with-adb) below.
+```bash
+adb install server-app/build/outputs/apk/debug/server-app-debug.apk
+adb shell monkey -p org.meumeu.wivrn.server -c android.intent.category.LAUNCHER 1
+```
+
 # Client (headset)
 
 #### Build dependencies

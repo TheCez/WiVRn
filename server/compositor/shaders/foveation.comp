@@ -21,10 +21,15 @@
 // SPDX-License-Identifier: BSL-1.0
 
 #version 460
-#extension GL_KHR_shader_subgroup_basic: require
-#extension GL_KHR_shader_subgroup_shuffle_relative: require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Chroma is averaged over each 2x2 luma block via workgroup shared memory
+// indexed by gl_LocalInvocationIndex, not subgroupShuffleDown as before:
+// that relied on gl_SubgroupID*gl_SubgroupSize+gl_SubgroupInvocationID equaling
+// gl_LocalInvocationIndex, true on desktop AMD/NVIDIA but not on this device
+// (subgroupSize=128, larger than the whole 64-invocation workgroup).
+shared vec4 tile[gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z];
 
 #define MAX_DIM 4097
 #define MAX_SAMPLES 4
@@ -39,8 +44,20 @@ layout(set = 0, binding = 1, std430) buffer restrict Config
 
 layout(set = 0, binding = 2) uniform writeonly restrict image2DArray luma;
 layout(set = 0, binding = 3) uniform writeonly restrict image2DArray chroma;
+// Alpha's own dedicated destination (was array layer 2 of luma/chroma).
+// Only written when alpha_width>0; harmless to bind even when unused.
+layout(set = 0, binding = 4) uniform writeonly restrict image2DArray alpha_luma;
+layout(set = 0, binding = 5) uniform writeonly restrict image2DArray alpha_chroma;
 
 layout(constant_id = 0) const int alpha_width = 0;
+
+// Each dispatch targets one eye's own dedicated image (compute writes to
+// array layer >=1 of a multi-planar image are corrupted on this hardware --
+// see compositor.h's struct image); gl_GlobalInvocationID.z is always 0.
+layout(push_constant) uniform PushConstants
+{
+	int eye;
+} pc;
 
 const mat3 color_space = mat3(
 //         R        G        B
@@ -95,11 +112,9 @@ uint ABfiM(uint src,uint ins,uint bits){return bitfieldInsert(src,ins,0,int (bit
 
 void main()
 {
-	uint iz = gl_GlobalInvocationID.z;
+	uint iz = uint(pc.eye);
 
-	// In order to know how subgroup are mapped, we have to do the swizzling ourselves
-	// in the work group.
-	uint id = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+	uint id = gl_LocalInvocationIndex;
 	uint iy = gl_WorkGroupID.y * gl_WorkGroupSize.y + ARmpRed8x8_y(id);
 	uint ix = gl_WorkGroupID.x * gl_WorkGroupSize.x + ARmpRed8x8_x(id);
 
@@ -129,21 +144,25 @@ void main()
 	colour /= max(count, 1);
 	colour.xyz = rgb_to_ycbcr(from_linear_to_srgb(colour.rgb));
 
-	imageStore(luma, ivec3(ix, iy, iz), vec4(colour.x));
+	imageStore(luma, ivec3(ix, iy, 0), vec4(colour.x));
 
-	vec4 sum = colour + subgroupShuffleDown(colour, 1) + subgroupShuffleDown(colour, 2) + subgroupShuffleDown(colour, 3);
+	tile[id] = colour;
+	barrier();
 
 	if ((id % 4)== 0)
 	{
+		vec4 sum = tile[id] + tile[id + 1] + tile[id + 2] + tile[id + 3];
+
 		// actual chroma
-		imageStore(chroma, ivec3(ix/2, iy/2, iz), vec4(sum.y, sum.z, 0, 0) / 4);
+		imageStore(chroma, ivec3(ix/2, iy/2, 0), vec4(sum.y, sum.z, 0, 0) / 4);
 
 		if (alpha_width > 0)
 		{
-			// alpha in luma
+			// alpha in luma -- own dedicated image now, same x-offset packing
+			// as before (both eyes share it), just always layer 0.
 			int offset = alpha_width * int(iz);
-			imageStore(luma, ivec3(offset + ix/2, iy/2, 2), vec4(sum.w, 0, 0, 0) / 4);
-			imageStore(chroma, ivec3(offset + ix/2, iy/2, 2), vec4(0.5, 0.5, 0, 0));
+			imageStore(alpha_luma, ivec3(offset + ix/2, iy/2, 0), vec4(sum.w, 0, 0, 0) / 4);
+			imageStore(alpha_chroma, ivec3(offset + ix/2, iy/2, 0), vec4(0.5, 0.5, 0, 0));
 		}
 	}
 }
