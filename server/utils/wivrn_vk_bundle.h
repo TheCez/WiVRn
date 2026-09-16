@@ -141,29 +141,17 @@ struct vk_bundle
 	        vk::PhysicalDeviceVulkan13Features>
 	        feat{};
 
-	// Milestone 5 (docs/ANDROID_PORT.md's perf branch): true if
-	// VK_EXT_host_image_copy (core in Vulkan 1.4) is both present and its
-	// hostImageCopy feature enabled -- lets video_encoder_mediacodec.cpp
-	// use vkCopyImageToMemory() instead of a queue-submitted
-	// vkCmdCopyImageToBuffer(), removing the readback step from GPU
-	// queue scheduling entirely (an experiment to see whether the
-	// concurrent-stream corruption is GPU-queue-contention-related).
+	// True if VK_EXT_host_image_copy is present and enabled -- lets
+	// video_encoder_mediacodec.cpp use vkCopyImageToMemory() instead of a
+	// queue-submitted vkCmdCopyImageToBuffer().
 	bool host_image_copy = false;
 
-	// Milestone 6 (docs/ANDROID_PORT.md): re-enables the pre-Milestone-4.5
-	// shared 3-array-layer stream image (one allocation/fewer barriers
-	// instead of 3 dedicated single-layer images) on every GPU vendor
-	// EXCEPT PowerVR/Imagination Technologies (vendorID 0x1010), where a
-	// real driver bug corrupts compute-shader writes to array layer >=1
-	// of a multi-planar image -- see compositor.h's struct image comment
-	// and docs/pixel10-pro-xl-gpu-media-investigation.md section B.
-	// Confirmed clean (smooth, no corruption) on a Samsung Galaxy S22's
-	// Exynos 2200/Xclipse 920 GPU -- see docs/ANDROID_PORT.md's
-	// cross-device confirmation entry. Denylist, not allowlist: default
-	// true (fast path) for any vendor other than the one confirmed bad,
-	// since the alternative (default false / opt-in) would mean every
-	// untested device silently keeps the slower workaround forever with
-	// no way to discover it doesn't need it.
+	// Shared 3-array-layer stream image (one allocation, fewer barriers) on
+	// every GPU vendor except PowerVR (vendorID 0x1010), where a real driver
+	// bug corrupts compute-shader writes to array layer >=1 of a multi-planar
+	// image -- see compositor.h's struct image. Denylist, not allowlist: an
+	// allowlist would mean every untested device silently keeps the slower
+	// workaround forever with no way to discover it doesn't need it.
 	bool multi_layer_stream_images = true;
 
 	std::vector<const char *> instance_extensions;

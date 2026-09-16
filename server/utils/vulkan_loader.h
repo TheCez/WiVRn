@@ -26,40 +26,25 @@ namespace wivrn
 {
 
 // A custom Vulkan driver imported by the user (e.g. a Turnip build), in
-// adrenotools' own ADPKG terms: `dir` is the directory the driver's .so
-// (and any of its own dependency .so's) was extracted into, `library_name`
-// is the main driver .so's filename within that directory (ADPKG's
-// meta.json "libraryName" field). See wivrn_vk_bundle.cpp's own comment on
-// why this only exists/matters on Android.
+// adrenotools' own ADPKG terms: `dir` is the extraction directory,
+// `library_name` the main driver .so's filename within it (ADPKG's
+// meta.json "libraryName" field).
 struct custom_vulkan_driver
 {
 	std::string dir;
 	std::string library_name;
 };
 
-// Called once by the JNI entry point (wivrn_server_jni.cpp's nativeStart(),
-// before any real server/compositor/vk_bundle work begins) to record the
-// user's driver choice (persisted by the Java-side settings UI) and the
-// app's own ApplicationInfo.nativeLibraryDir -- a Java-only API adrenotools
-// requires exactly (see driver.h's own docs) and that native code has no
-// other way to obtain. `driver` unset means "use the system driver" (the
-// default, and the only option on every device this project has running
-// today except the one Adreno tablet that needs this at all).
+// Called once by the JNI entry point before any real server/vk_bundle work
+// begins, to record the user's driver choice and the app's own
+// ApplicationInfo.nativeLibraryDir (a Java-only API adrenotools requires).
+// `driver` unset means "use the system driver".
 void configure_vulkan_loader(std::string native_lib_dir, std::optional<custom_vulkan_driver> driver);
 
-// Resolves the PFN_vkGetInstanceProcAddr to bootstrap vk::raii::Context
-// from, using whatever configure_vulkan_loader() was last called with:
-// adrenotools_open_libvulkan()'s isolated, hook-injected libvulkan.so when
-// a custom driver is configured, or a plain system libvulkan.so otherwise
-// (also the fallback if configure_vulkan_loader() was never called at all,
-// e.g. on desktop, where this whole mechanism doesn't apply) -- see
-// vulkan_loader.cpp's own comment for the full mechanism and why this
-// exists at all (Turnip/adrenotools custom Vulkan driver support).
-//
-// Never returns null: falls back to the plain system libvulkan.so (logging
-// a warning) if a custom driver was configured but loading it failed for
-// any reason, so a bad custom driver selection can never prevent the
-// server from starting.
+// Resolves PFN_vkGetInstanceProcAddr per the last configure_vulkan_loader()
+// call. Never returns null: falls back to the system libvulkan.so (with a
+// warning) if a custom driver was configured but failed to load, so a bad
+// selection can never prevent the server from starting.
 PFN_vkGetInstanceProcAddr resolve_vk_get_instance_proc_addr();
 
 } // namespace wivrn

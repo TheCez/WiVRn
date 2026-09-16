@@ -28,18 +28,11 @@
 namespace wivrn
 {
 
-// Lightweight, optionally-toggleable rolling latency-stage logger for the
-// readback/encode pipeline (see docs/ANDROID_PORT.md's perf branch entry).
-// This is NOT a general profiler -- it exists specifically to A/B a
-// pipeline change over a short (10-30s) live test via plain logcat, without
-// needing Perfetto tooling (wivrn::trace, server/utils/wivrn_trace.h,
-// already exists for that and is complementary, not replaced by this).
-//
-// Off by default: enabled() does one cached bool read (a function-local
-// static, initialized once), so sample() costs a single branch when
-// disabled -- matches the WIVRN_DUMP_VIDEO env-var pattern already used
-// elsewhere in this codebase (wivrn_server_jni.cpp's nativeStart()).
-// Enable by setting WIVRN_TIMING_LOG to any non-empty value.
+// Lightweight rolling latency-stage logger for the readback/encode pipeline --
+// A/B a pipeline change over a short live test via plain logcat, without
+// Perfetto tooling (wivrn::trace is complementary, not replaced by this).
+// Off by default (a single cached branch when disabled); enable by setting
+// WIVRN_TIMING_LOG to any non-empty value.
 class frame_timing_stats
 {
 public:

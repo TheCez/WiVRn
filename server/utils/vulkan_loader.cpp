@@ -26,23 +26,13 @@
 #include <stdexcept>
 #include <utility>
 
-// Milestone (docs/ANDROID_PORT.md): a Samsung Galaxy Tab (Snapdragon 778G /
-// Adreno 642L) confirmed live that this device's Vulkan driver only reports
-// apiVersion 1.1 and does not even list VK_KHR_synchronization2 as an
-// extension -- a real, hard driver limitation (this compositor's
-// synchronization2 requirement is load-bearing, not a check that can be
-// relaxed). GameNative/Winlator-style apps solve exactly this class of
-// problem on Adreno by loading Turnip (Mesa's open Adreno Vulkan driver,
-// which does implement synchronization2) via adrenotools
-// (https://github.com/bylaws/libadrenotools), a rootless driver-swap
-// library, instead of the vendor's own driver. This is that same mechanism.
-//
-// No equivalent exists for other GPU vendors (Mali, PowerVR, AMD Xclipse)
-// today -- confirmed live before building this (see docs/ANDROID_PORT.md) --
-// so `driver` is simply unset on every device that isn't using a custom
-// Adreno driver, and this whole file reduces to a plain dlopen of the
-// system libvulkan.so, identical to what vulkan-hpp's own internal
-// DynamicLoader already did before this existed.
+// Some Adreno devices' stock driver reports apiVersion 1.1 and lacks
+// VK_KHR_synchronization2 entirely -- a hard driver limitation. Loading
+// Turnip (Mesa's open Adreno driver, which does implement it) via adrenotools
+// (https://github.com/bylaws/libadrenotools, a rootless driver-swap library)
+// works around this, the same way GameNative/Winlator-style apps do. No
+// equivalent exists for other GPU vendors, so `driver` stays unset there and
+// this file reduces to a plain dlopen of the system libvulkan.so.
 
 namespace
 {

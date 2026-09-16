@@ -31,48 +31,23 @@
 
 DEBUG_GET_ONCE_NUM_OPTION(force_gpu_index, "XRT_COMPOSITOR_FORCE_GPU_INDEX", -1)
 
-// Diagnostic override for vk_bundle::multi_layer_stream_images's own
-// vendorID-based denylist (docs/ANDROID_PORT.md's Milestone 6): -1 (default)
-// = the normal vendorID check; 0 = force the PowerVR-workaround single-layer
-// path regardless of vendor; 1 = force the shared-3-layer fast path
-// regardless of vendor. Added live while diagnosing a real stereo
-// duplication/ghosting bug seen on a Snapdragon tablet's Mesa/Turnip
-// (freedreno) driver -- the first non-PowerVR, non-AMD-Xclipse driver this
-// fast path had ever actually run on. Forcing 0 here reproduced the exact
-// same bug, ruling this path OUT as the cause (see Milestone 8's own
-// entry) -- the real cause turned out to be VRChat's own login-screen
-// rendering on this runtime, confirmed by a clean, symmetric stereo image
-// from this project's own reference Unity app on the same server/driver.
-// Left in permanently: a real, reusable diagnostic for the next time this
-// fast path needs to be A/B'd against a genuinely new GPU/driver.
-// `adb shell setprop debug.xrt.WIVRN_MULTI_LAYER_STREAM_IMAGES 0` (or 1).
+// Diagnostic override for vk_bundle::multi_layer_stream_images's vendorID
+// denylist: -1 (default) = normal check; 0 = force single-layer workaround;
+// 1 = force shared-3-layer path, regardless of vendor. Reusable for A/B'ing
+// this path against a new GPU/driver. `adb shell setprop
+// debug.xrt.WIVRN_MULTI_LAYER_STREAM_IMAGES 0` (or 1).
 DEBUG_GET_ONCE_NUM_OPTION(multi_layer_stream_images_override, "WIVRN_MULTI_LAYER_STREAM_IMAGES", -1)
 
 // Default 3: left and right eye + alpha
 DEBUG_GET_ONCE_NUM_OPTION(max_vulkan_encoders, "WIVRN_MAX_VULKAN_ENCODERS", 3)
 
-// Corruption-investigation diagnostic (docs/ANDROID_PORT.md's perf branch):
-// explicitly request VK_LAYER_KHRONOS_validation for THIS instance only,
-// rather than Android's system-wide "enable GPU debug layers" developer
-// option / adb settings (enable_gpu_debug_layers/gpu_debug_app/
-// gpu_debug_layers). That mechanism does not work at all on this device/OS
-// build -- confirmed live, the Vulkan loader's own debug trace never once
-// searches /data/local/tmp/vulkan/debug (the documented location for it)
-// regardless of those settings -- and additionally injects the layer into
-// every Vulkan instance the whole process creates when it does anything,
-// including the app's own Activity/View system (libhwui's Vulkan-backed UI
-// renderer), which crashed before this instance was ever reached.
-//
-// What actually works: the layer .so is bundled directly into this
-// (debug-only) APK's own native library directory via server-app/
-// build.gradle's debug jniLibs source set -- one of the paths the loader
-// *does* search for every app, confirmed live ("searching for layers in
-// '.../lib/arm64'" in its own trace). With that in place, this explicit
-// request is enough on its own; no adb settings or pushed files needed.
-// `adb shell setprop debug.xrt.WIVRN_VK_VALIDATION 1` (no rebuild needed
-// once the debug APK is installed). Validation output arrives through the
-// existing message_callback below (severity Warning/Error already maps to
-// U_LOG_WARN/ERROR, so it's visible even without raising XRT_LOG).
+// Explicitly requests VK_LAYER_KHRONOS_validation for this instance only.
+// Android's system-wide "enable GPU debug layers" setting doesn't work on
+// this device/OS build and also injects the layer into the app's own UI
+// renderer, crashing it before this instance is reached -- instead the
+// layer .so is bundled into this debug APK's own native lib dir (server-app/
+// build.gradle), one of the paths the loader searches for every app.
+// `adb shell setprop debug.xrt.WIVRN_VK_VALIDATION 1`.
 DEBUG_GET_ONCE_NUM_OPTION(vk_validation, "WIVRN_VK_VALIDATION", 0)
 
 namespace
@@ -179,15 +154,11 @@ int get_queue_index(const std::vector<vk::QueueFamilyProperties> & queues, std::
 
 wivrn::vk_bundle::vk_bundle() :
 #if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
-        // Desktop: unchanged from before this existed, vulkan-hpp's own
-        // internal DynamicLoader (dlopen's the system libvulkan.so itself).
+        // Desktop: vulkan-hpp's own internal DynamicLoader.
         vk_ctx(),
 #else
-        // Android: resolve vkGetInstanceProcAddr ourselves, so it can be
-        // redirected to a custom driver (Turnip/adrenotools) instead of the
-        // system one -- see vulkan_loader.cpp's own comment. Falls back to
-        // the exact same system-libvulkan.so behavior as the desktop path
-        // above when no custom driver is configured.
+        // Android: resolved ourselves so it can be redirected to a custom
+        // driver -- see vulkan_loader.cpp.
         vk_ctx(resolve_vk_get_instance_proc_addr()),
 #endif
         instance(nullptr),
@@ -315,25 +286,14 @@ wivrn::vk_bundle::vk_bundle() :
 		        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 		        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-// For Monado's Android swapchain-import path (vk_create_image_from_native,
-// XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER on Android): a local OpenXR
-// app importing its own AHardwareBuffer-backed swapchain images into the
-// compositor needs this to resolve the external-memory handle type; without
-// it, vk_create_image_from_native crashed (null function pointer, offset
-// +1180) the moment a real local app tried to create one -- nothing before
-// broker registration ever exercised this path, so WiVRn's own device
-// extension list never needed it. Also the mechanism a genuinely zero-copy
-// video_encoder_mediacodec.cpp would use (see its own comment) -- not a
-// coincidence, same underlying AHardwareBuffer<->Vulkan interop either way.
+// For a local OpenXR app importing its own AHardwareBuffer-backed swapchain
+// images into the compositor (Monado's vk_create_image_from_native) --
+// without it, that call crashes (null function pointer) the moment a real
+// local app tries to create one.
 #ifdef VK_ANDROID_external_memory_android_hardware_buffer
 		        VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
-		        // Required by the spec whenever
-		        // VK_ANDROID_external_memory_android_hardware_buffer is
-		        // enabled (queue family ownership transfers to/from a
-		        // foreign entity, e.g. the hardware encoder/decoder, for
-		        // an AHB-imported image) -- was missing here, caught live
-		        // by Vulkan validation (vkCreateDevice
-		        // VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-01387).
+		        // Required by the spec whenever the above is enabled
+		        // (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-01387).
 		        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 #endif
 // For FFMPEG
@@ -369,9 +329,8 @@ wivrn::vk_bundle::vk_bundle() :
 #ifdef VK_KHR_unified_image_layouts
 		        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
 #endif
-// Milestone 5 (docs/ANDROID_PORT.md's perf branch): host_image_copy,
-// enabled below, lets video_encoder_mediacodec.cpp read back the
-// compositor's image without a queue submission at all.
+// Lets video_encoder_mediacodec.cpp read back the compositor's image
+// without a queue submission at all.
 #ifdef VK_EXT_host_image_copy
 		        VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
 #endif
@@ -493,8 +452,7 @@ wivrn::vk_bundle::vk_bundle() :
 
 	auto prop = physical_device.getProperties();
 
-	// PowerVR/Imagination Technologies' registered Vulkan vendorID -- see
-	// multi_layer_stream_images's own comment (wivrn_vk_bundle.h).
+	// PowerVR's registered Vulkan vendorID -- see multi_layer_stream_images (.h).
 	constexpr uint32_t vendor_id_powervr = 0x1010;
 	multi_layer_stream_images = (prop.vendorID != vendor_id_powervr);
 
