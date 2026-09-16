@@ -2676,17 +2676,41 @@ generation (Adreno 642L, Snapdragon 778G, A6xx) — every available package is
 sourced from a materially newer chip family. Turnip remains the only route
 to a working `synchronization2`-capable driver on this hardware.
 
-### Milestone 10 follow-up — the seam is already present in VRChat's raw imported swapchain image, before WiVRn's own code ever touches it
+### Milestone 10 follow-up — the seam is already present in VRChat's raw imported swapchain image, before WiVRn's own code ever touches it; isolated to the Turnip driver, not WiVRn's architecture
 
-Prompted by a real architectural observation: WiVRn's compositor runs as a
-**separate OS process** from VRChat (Monado's IPC client/server split), which
-is *why* an AHardwareBuffer-backed, cross-process-shareable, 2-array-layer
-swapchain image is needed for the app at all. The historical "Cardboard
-style Monado" comparison point (`comp_window_android.c`) runs in-process with
-the app and never needs this — and is confirmed to work fine with VRChat on
-this same tablet. That difference is the whole reason to suspect the
-array-layer-1 import/read path specifically, rather than assuming the bug is
-somewhere generic in "our Monado build".
+Two wrong turns worth recording before the real isolation, since both looked
+plausible at first and were disproved by actually reading the shared Monado
+source rather than reasoning from the architecture diagram alone:
+
+1. **"In-process Monado never uses AHardwareBuffer at all"** — wrong.
+   `XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER` (`xrt_handles.h`) is gated
+   purely on `XRT_OS_ANDROID_USE_AHB` + API level, an Android-platform-wide
+   compile flag, not an IPC-vs-in-process one. Every Android Monado build
+   uses AHardwareBuffer as the swapchain image's native representation,
+   regardless of process topology.
+2. **"The client-side AHardwareBuffer import is IPC-specific"** — also
+   wrong. `client_vk_compositor_create()` / `vk_create_image_from_native()`
+   (`compositor/client/comp_vk_client.c`) is generic Monado code sitting on
+   top of *any* `xrt_compositor_native`, in-process or IPC alike. WiVRn's own
+   server code (`server/`) doesn't touch the app's swapchain usage
+   flags/format either (confirmed by grep — no `XRT_SWAPCHAIN_USAGE`
+   references anywhere in `server/`), so there's no WiVRn-specific
+   image-creation difference to point to.
+
+**The real, confirmed difference**: the comparison point on this tablet
+isn't the historical "Cardboard-style" in-process build at all — it's
+`org.freedesktop.monado.openxr_runtime.out_of_process`, Monado's own stock
+Android OpenXR runtime broker, which is *itself* out-of-process (same
+IPC/AHardwareBuffer-sharing architecture as WiVRn — the package name says so
+directly). Confirmed live: this runtime runs on the tablet's **stock/system
+Adreno Vulkan driver**. WiVRn, on the same tablet, is forced onto **Turnip**
+instead, because the stock driver is missing `VK_KHR_synchronization2`
+(Milestone 10's original blocker) — Turnip is the only currently-working
+route to a `synchronization2`-capable driver on this Adreno 642L. So with
+architecture held constant (out-of-process, IPC, AHardwareBuffer swapchain
+sharing, in both cases), **the one real variable between the working
+comparison and WiVRn is the Vulkan driver itself**, not anything about
+WiVRn's own code or process topology.
 
 **Test**: a new one-shot diagnostic, `dump_app_image_once()` in
 `server/compositor/compositor.cpp` (gated behind
@@ -2722,26 +2746,29 @@ between adjacent columns, sampled across the full 1910-row height) found:
 
 This is decisive: **the seam already exists in the raw content Monado handed
 us, before WiVRn's own foveation shader or any other WiVRn-specific
-processing ever runs.** This clears `foveation.comp` (and the fast-path
-image-view/barrier code, already suspected of being innocent since it's
-shared Monado code used by the working in-process path too) of blame. The
-corruption is being introduced at or before the point where WiVRn's
-compositor first reads array layer 1 of VRChat's externally-imported,
-cross-process AHardwareBuffer-backed swapchain image — i.e. either a real
-Adreno/Turnip driver bug specifically on reads of array layer ≥1 of a
-multi-layer imported AHardwareBuffer, or VRChat/Unity's own multiview write
-into that layer. Since the in-process (no AHardwareBuffer import) Cardboard
-path doesn't exhibit this bug, the AHardwareBuffer import/read of layer 1
-specifically remains the prime suspect over "VRChat writes it wrong
-generally" (which should then also affect the in-process path).
+processing ever runs.** This clears `foveation.comp` and the fast-path
+image-view/barrier code (already suspected innocent since it's shared
+Monado code, confirmed above to be identical regardless of driver or process
+topology) of blame.
 
-**Not yet done**: pinning down whether the seam originates on the write side
-(VRChat/Unity's own render into layer 1) or the read side (Turnip importing/
-sampling layer 1) — the next natural test would be a similar raw dump from
-inside VRChat's own process (if feasible) or testing whether a
-single-array-layer-per-eye (non-multiview) VRChat swapchain path avoids the
-seam entirely, which would squarely implicate multi-layer AHardwareBuffer
-import/export on this driver.
+Combined with the driver isolation above, this points at a **Turnip/Mesa
+driver bug**, not anything in WiVRn's code or architecture: same
+out-of-process/IPC/AHardwareBuffer-sharing design on both sides, same
+`comp_vk_client.c` import code on both sides, only the driver differs, and
+the corruption is provably already present in the bytes Turnip/Monado handed
+us before any WiVRn-specific code runs. Reading/importing array layer ≥1 of
+a multi-layer AHardwareBuffer-backed image is a genuinely narrow,
+under-exercised Vulkan/Android feature combination — exactly where a young,
+still-actively-developed open-source driver like Turnip is far more likely
+to have a real bug than the mature vendor-shipped proprietary Adreno driver.
+
+**Not yet done**: confirming this against Turnip's own issue tracker/recent
+commits (a fix or existing report may already exist upstream), and testing
+whether a single-array-layer-per-eye (non-multiview, two separate
+swapchains) VRChat path avoids the seam entirely, which would further
+confirm multi-layer AHardwareBuffer import specifically (not AHardwareBuffer
+import in general) as the trigger. Not something fixable in this repo — the
+fix, if one doesn't already exist upstream, belongs in Turnip/Mesa itself.
 
 ## Milestone 11 (new device, still open) — Galaxy S22 (Exynos 2200 / Xclipse 920): MdiEx driver test, VRChat renders nothing
 
