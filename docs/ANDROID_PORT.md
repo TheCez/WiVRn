@@ -3009,10 +3009,12 @@ not something fixable here) showing up again, described informally —
 not a new, separate mystery. Nothing new to investigate there; see
 Milestone 10/10-follow-up for the actual root cause.
 
-**The real new data point**: Galaxy Note 20 Ultra (Adreno 6xx-class,
-distinct from the SM-X810/Tab S7 FE above) runs VRChat successfully —
-rendering is correct, no seam, no crash — but performance is really laggy.
-Unlike the SM-X810's seam, this isn't yet explained by a known root cause.
+**The real new data point**: Galaxy Note 20 Ultra (Adreno 6xx family,
+same generation as the SM-X810/Tab S7 FE above but a newer chip within
+that family) runs VRChat successfully — rendering is correct, no seam, no
+crash — but performance is really laggy. Unlike the SM-X810's seam, this
+isn't yet explained by a known root cause, and the fact that the newer
+chip still lags argues against a simple "old/weak GPU" explanation.
 Since the SM-X810's own degradation turned out to have a specific,
 already-diagnosed driver-bug cause rather than a general hardware
 ceiling, the "older Adreno 6xx generation is RAM/GPU-throughput
