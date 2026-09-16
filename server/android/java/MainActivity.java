@@ -70,6 +70,24 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 		setContentView(status);
 
 		WivrnServerService.setConnectionListener(this);
+
+		// Mic-forwarding investigation (docs/ANDROID_PORT.md): AudioPolicy
+		// injector probe. It is dormant unless an explicit debug property
+		// supplies the target UID, so it never affects a normal server launch.
+		// `adb shell setprop debug.wivrn.audio_inject_test <targetUid>`
+		// before launching (get the UID via `pm list packages -U`).
+		try
+		{
+			Process p = Runtime.getRuntime().exec(new String[]{"getprop", "debug.wivrn.audio_inject_test"});
+			String value = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream())).readLine();
+			p.waitFor();
+			if (value != null && !value.isEmpty())
+				AudioInjectorProbe.run(this, Integer.parseInt(value.trim()), null);
+		}
+		catch (Exception e)
+		{
+			android.util.Log.e("WivrnAudioInjectProbe", "Setup failed: " + e);
+		}
 	}
 
 	// Speaker audio (game -> headset) needs both RECORD_AUDIO (runtime
@@ -110,6 +128,7 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 	protected void onActivityResult(int requestCode, int resultCode, Intent data)
 	{
 		super.onActivityResult(requestCode, resultCode, data);
+		android.util.Log.i("WivrnAudioInjectProbe", "onActivityResult requestCode=" + requestCode + " resultCode=" + resultCode + " data=" + data);
 		if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null)
 		{
 			// Must happen before getMediaProjection() below -- that call
@@ -120,7 +139,29 @@ public class MainActivity extends Activity implements WivrnServerService.Connect
 			// live, not obvious from the API surface alone.
 			WivrnServerService.upgradeForMediaProjection();
 			MediaProjectionManager manager = getSystemService(MediaProjectionManager.class);
-			WivrnServerService.setMediaProjection(manager.getMediaProjection(resultCode, data));
+			android.media.projection.MediaProjection projection = manager.getMediaProjection(resultCode, data);
+			WivrnServerService.setMediaProjection(projection);
+
+			// Mic-forwarding investigation retry (docs/ANDROID_PORT.md): the
+			// first attempt (from onCreate, before any MediaProjection
+			// existed) got past registerAudioPolicy() (confirmed via dumpsys
+			// media.audio_policy -- the mix genuinely registered natively)
+			// but createAudioTrackSource() returned null. AOSP source: that
+			// method's policyReadyToUse() gate requires MODIFY_AUDIO_ROUTING,
+			// CALL_AUDIO_INTERCEPTION, OR a valid MediaProjection -- retrying
+			// now that one exists.
+			try
+			{
+				Process p = Runtime.getRuntime().exec(new String[]{"getprop", "debug.wivrn.audio_inject_test"});
+				String value = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream())).readLine();
+				p.waitFor();
+				if (value != null && !value.isEmpty())
+					AudioInjectorProbe.run(this, Integer.parseInt(value.trim()), projection);
+			}
+			catch (Exception e)
+			{
+				android.util.Log.e("WivrnAudioInjectProbe", "Retry setup failed: " + e);
+			}
 		}
 		// Denied/cancelled: same as a RECORD_AUDIO denial above, streaming
 		// still works, just without speaker audio.
