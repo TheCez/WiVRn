@@ -355,12 +355,7 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 		}
 		catch (std::exception & e)
 		{
-			// Milestone 5 HEVC diagnostic: this used to be a bare
-			// catch(...) with no logging at all -- real send failures
-			// (e.g. every single shard failing all session) were
-			// completely invisible server-side. Logged once per
-			// instance so a genuinely broken connection doesn't flood
-			// logcat, but the first occurrence is never silent again.
+			// Logged once per instance so a broken connection doesn't flood logcat.
 			if (not network_error_logged)
 			{
 				U_LOG_E("stream %d: send_%s failed: %s", stream_idx, control ? "control" : "stream", e.what());

@@ -195,11 +195,9 @@ class prober
 			                .bit_depth = 8,
 			        },
 			        0);
-			// The constructor alone doesn't create the real MediaCodec
-			// (deliberately lazy -- see video_encoder_mediacodec.h). Force
-			// it now so a codec that can't actually be created on this
-			// device is caught here as "unsupported", not as a live crash
-			// the first time a real session reaches present_image().
+			// Constructor alone doesn't create the real MediaCodec (lazy --
+			// see video_encoder_mediacodec.h); force it now so an
+			// unsupported codec is caught here, not on first present_image().
 			test.probe_ensure_codec();
 			mediacodec_support[codec] = true;
 			return true;
@@ -362,14 +360,9 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
-	// video_encoder_mediacodec only ever supports 8-bit (see its constructor's
-	// own check) regardless of codec -- unlike vaapi/nvenc, where h265/av1
-	// backends can genuinely do 10-bit. Without this, selecting mediacodec
-	// with codec=h265 and no explicit bit_depth falls through to the "not
-	// h264/raw, so must be a 10-bit-capable backend" default below, and
-	// video_encoder_mediacodec's constructor throws ("only supports 8-bit
-	// encoding") before a session can even be created. Found via a live
-	// HEVC A/B test on the Pixel (docs/ANDROID_PORT.md's perf branch).
+	// video_encoder_mediacodec only ever supports 8-bit, unlike vaapi/nvenc's
+	// h265/av1 backends -- without this, an implicit bit_depth falls through
+	// to the 10-bit default below and the constructor throws.
 	if (std::ranges::contains(res, video_codec::h264, &encoder_settings::codec) or
 	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec) or
 	    std::ranges::contains(res, std::string(encoder_mediacodec), &encoder_settings::encoder_name))

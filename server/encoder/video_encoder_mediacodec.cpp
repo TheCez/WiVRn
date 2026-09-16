@@ -37,59 +37,32 @@
 #include <media/NdkMediaFormat.h>
 #include <stdexcept>
 
-// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch entry): see
-// present_image()'s own comment at the call site. `adb shell setprop
-// debug.xrt.WIVRN_FORCE_GPU_WAIT 1` on Android; WIVRN_FORCE_GPU_WAIT env
-// var on desktop.
+// Diagnostic: see present_image()'s comment at the call site.
+// `adb shell setprop debug.xrt.WIVRN_FORCE_GPU_WAIT 1` (or the env var on desktop).
 DEBUG_GET_ONCE_NUM_OPTION(force_gpu_wait, "WIVRN_FORCE_GPU_WAIT", 0)
 
-// Milestone 5 diagnostic: use vkCopyImageToMemory() (VK_EXT_host_image_copy,
-// core in Vulkan 1.4 -- confirmed present and fully supported for our
-// exact image shape on this device) instead of a queue-submitted
-// vkCmdCopyImageToBuffer() for the readback. Removes this stream's
-// readback entirely from GPU queue scheduling -- a mechanistically
-// different experiment from more/less synchronization or thread
-// staggering, testing whether the concurrent-stream corruption is
-// specifically GPU-queue-contention-related. Requires
-// vk_bundle::host_image_copy (device support, checked at runtime) in
-// addition to this toggle. `adb shell setprop
-// debug.xrt.WIVRN_HOST_IMAGE_COPY 1`.
+// Diagnostic: use vkCopyImageToMemory() (VK_EXT_host_image_copy) instead of a
+// queue-submitted vkCmdCopyImageToBuffer() for readback, to test whether
+// concurrent-stream corruption is GPU-queue-contention-related. Requires
+// vk_bundle::host_image_copy. `adb shell setprop debug.xrt.WIVRN_HOST_IMAGE_COPY 1`.
 DEBUG_GET_ONCE_NUM_OPTION(host_image_copy, "WIVRN_HOST_IMAGE_COPY", 0)
 
-// Stereo-fusion diagnostic (docs/ANDROID_PORT.md, VRChat/Adreno stereo
-// investigation): swaps which array layer each stream_idx reads its pixel
-// content from (0<->1 only, alpha stream 2 untouched), while every other
-// per-stream identity (stream_idx itself, and the pose/fov this stream's
-// shard.view_info carries) stays exactly as before. If this measurably
-// fixes/changes the headset's stereo sensation, the two eyes' encoded
-// video content is associated with the wrong stream somewhere upstream of
-// this read (compositor render target assignment); if not, the desync
-// isn't a left/right content swap at this level. Deliberately only the
-// encoder's own read-side derivation (this function) -- NOT compositor.cpp's
-// image_layer(), which also governs where the compositor renders each eye
-// TO and where its own compute/copy passes write, so touching it would
-// change rendering, not just which content is encoded on which channel.
-// `adb shell setprop debug.xrt.WIVRN_SWAP_EYE_LAYERS 1` on Android;
-// WIVRN_SWAP_EYE_LAYERS env var on desktop.
+// Diagnostic: swaps which array layer each stream_idx reads pixel content
+// from (0<->1 only), to isolate a wrong-stream content association from a
+// desync elsewhere. Only this read-side derivation, not compositor.cpp's
+// image_layer() (which also governs render targets).
+// `adb shell setprop debug.xrt.WIVRN_SWAP_EYE_LAYERS 1`.
 DEBUG_GET_ONCE_NUM_OPTION(swap_eye_layers, "WIVRN_SWAP_EYE_LAYERS", 0)
 
 namespace
 {
-// MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar (Java-side
-// constant; the NDK only exposes AMEDIAFORMAT_KEY_COLOR_FORMAT, the string
-// key, not this value) -- i.e. NV12: one full-resolution Y plane, then one
-// half-resolution interleaved UV plane. Exactly the layout
-// video_encoder_raw.cpp already extracts from the compositor's y_cbcr image
-// (same ePlane0/ePlane1 copy below), so no conversion is needed, just get
-// those same bytes into MediaCodec's own input buffer.
+// NV12: full-res Y plane then half-res interleaved UV -- the same layout
+// video_encoder_raw.cpp already extracts, so no conversion is needed.
 constexpr int32_t color_format_yuv420_semiplanar = 21;
 
-// MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME / PARAMETER_KEY_VIDEO_BITRATE:
-// runtime-only AMediaCodec_setParameters() keys, deliberately different
-// strings from the AMEDIAFORMAT_KEY_* used at configure time (e.g. bitrate
-// is "bitrate" at configure time, "video-bitrate" at runtime) -- a real,
-// documented Android API quirk, not a typo. No NDK header exposes these as
-// macros, so they're spelled out here.
+// AMediaCodec_setParameters() runtime keys, deliberately different strings
+// from the AMEDIAFORMAT_KEY_* used at configure time (a real Android API
+// quirk, not a typo) -- no NDK header exposes these as macros.
 constexpr const char * key_request_sync = "request-sync";
 constexpr const char * key_video_bitrate = "video-bitrate";
 
@@ -131,21 +104,11 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 	if (auto dump_nv12 = std::getenv("WIVRN_DUMP_NV12"))
 		nv12_dump.open(std::string(dump_nv12) + "-" + std::to_string(stream_idx) + ".nv12raw", std::ios::binary);
 
-	// Buffer is always full NV12 size regardless of stream: MediaCodec was
-	// configured (KEY_COLOR_FORMAT/KEY_STRIDE/KEY_SLICE_HEIGHT below) to
-	// expect that size on every queueInputBuffer call, for every stream --
-	// there's no per-stream color format here, unlike video_encoder_raw.cpp
-	// which can just send a shorter buffer since it isn't feeding a real
-	// codec. Streams 0/1 are the real left/right color eyes; the Vulkan
-	// copy below fills both planes for those every frame. Stream 2 is a
-	// single-channel (Y-only) matte/passthrough layer -- matching
-	// video_encoder_raw.cpp's own stream_idx < 2 special case for *which
-	// planes actually hold real data* -- so its chroma half is filled once
-	// below with a neutral 0x80 (instead of whatever plane1 of a
-	// single-channel VkImage happened to contain, which produced a
-	// corrupted third H.264 stream and showed up on-device as a strong
-	// magenta/green color wash over otherwise-correct geometry -- not a
-	// stride issue at all, despite the visual symptom looking like one).
+	// Buffer is always full NV12 size regardless of stream: MediaCodec is
+	// configured to expect that on every queueInputBuffer call. Stream 2
+	// (alpha, Y-only) gets its chroma half filled with a neutral 0x80 below --
+	// leaving it as whatever plane1 of a single-channel VkImage contained
+	// produced a corrupted third H.264 stream (magenta/green color wash).
 	vk::DeviceSize buffer_size = vk::DeviceSize(extent.width) * extent.height;
 	buffer_size += buffer_size / 2;
 
@@ -172,15 +135,10 @@ wivrn::video_encoder_mediacodec::video_encoder_mediacodec(
 
 		if (i == 0)
 		{
-			// Part D (readback pipeline investigation): VMA_MEMORY_USAGE_AUTO
-			// picks the actual memory type at allocation time -- log it once
-			// rather than assuming. This buffer is only ever written by the
-			// GPU (vkCmdCopyImageToBuffer) and read by the CPU (memcpy in
-			// encode()), never the other way, so HOST_COHERENT (no manual
-			// vkInvalidateMappedMemoryRanges needed before the CPU read) is
-			// what we want and currently rely on implicitly -- if this ever
-			// logs without eHostCoherent set, encode()'s CPU read is missing
-			// a required invalidate and may see stale data.
+			// VMA_MEMORY_USAGE_AUTO picks the actual memory type at allocation
+			// time -- log it once. encode()'s CPU read relies on HOST_COHERENT
+			// (no manual invalidate); if this ever logs without eHostCoherent,
+			// that read may see stale data.
 			auto props = in[i].buffer.properties();
 			U_LOG_I("mediacodec[%d] staging buffer memory properties: %s%s%s(raw=%#x)",
 			        stream_idx,
@@ -215,24 +173,10 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 	if (codec)
 		return;
 
-	// HEVC A/B diagnostic (docs/ANDROID_PORT.md's perf branch, "is the
-	// Milestone 5 black-block corruption AVC-specific or common to the
-	// input/VPU path"): prefer this exact hardware component name over
-	// AMediaCodec_createEncoderByType so this can never silently fall back
-	// to a software encoder on the Pixel -- see tools/foveation-pc-test's
-	// MediaCodecEnum.java probe output (c2.google.hevc.encoder is
-	// hardware=true/vendor=true; c2.android.hevc.encoder is a 512x512-max
-	// software fallback). That exact component name is vendor-specific
-	// (Google/Tensor) though -- confirmed live, hardcoding only this name
-	// with no fallback crashed the whole server process (uncaught
-	// exception in this lazily-deferred function, past the point
-	// check_mediacodec()'s probe could catch it -- see that function's own
-	// comment) the moment a different device's first real frame reached
-	// here. Fall back to createEncoderByType, but still verify the
-	// resulting component isn't a known software-only one (same
-	// name-prefix heuristic client/decoder/android/android_decoder.cpp's
-	// hardware_accelerated() already uses -- the NDK has no
-	// isHardwareAccelerated() query, see that function's own comment).
+	// Prefer this exact hardware component name (avoids a silent software
+	// fallback on Tensor); it's vendor-specific though, so fall back to
+	// createEncoderByType elsewhere and still reject a known software-only
+	// component by name prefix (the NDK has no isHardwareAccelerated() query).
 	bool hevc = codec_kind == h265;
 	const char * mime = hevc ? "video/hevc" : "video/avc";
 	if (hevc)
@@ -263,42 +207,19 @@ void wivrn::video_encoder_mediacodec::ensure_codec()
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, extent.width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, extent.height);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, color_format_yuv420_semiplanar);
-	// HEVC A/B diagnostic: pin 8-bit Main profile explicitly (numeric
-	// value matches MediaCodecInfo.CodecProfileLevel.HEVCProfileMain --
-	// the NDK has no named constant for it). c2.google.hevc.encoder also
-	// advertises Main10/HDR10/HDR10+ profiles (see MediaCodecEnum.java
-	// probe output); leaving this unset risked the codec silently picking
-	// one of those instead of the one-variable-at-a-time 8-bit comparison
-	// this test needs. Not set for AVC: that path already worked without
-	// it and this experiment changes as little as possible per stream.
+	// Pin 8-bit Main profile explicitly (no named NDK constant) -- this
+	// component also advertises Main10/HDR10/HDR10+ and could otherwise
+	// silently pick one of those instead.
 	if (hevc)
 		AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PROFILE, 0x1 /* HEVCProfileMain */);
-	// Byte-buffer input on Android is not guaranteed tightly packed by
-	// default -- some encoders (this Pixel's included, going by the
-	// symptom: green blocky corruption, the textbook sign of the chroma
-	// plane being read at the wrong offset) assume a *padded* stride/
-	// slice-height unless told otherwise, and silently misinterpret a
-	// tightly-packed buffer like the one present_image() actually builds
-	// (matching video_encoder_raw.cpp's own layout exactly: width*height
-	// Y bytes, then width*height/2 interleaved UV bytes, no row padding
-	// anywhere). Setting these explicitly to our real width/height (not a
-	// padded value) tells the codec our buffer genuinely has no padding.
+	// Byte-buffer input isn't guaranteed tightly packed by default -- some
+	// encoders assume a padded stride/slice-height and misinterpret our
+	// actually-unpadded buffer (green blocky corruption) without this.
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_STRIDE, extent.width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SLICE_HEIGHT, extent.height);
-	// Without this, Codec2 sizes the input ByteBuffer from an internal
-	// default that can be smaller than one actual NV12 frame (observed on
-	// this Pixel: 1MiB for one stream, 512KiB for another -- both well
-	// under 896*960*1.5 = ~1.23MiB) -- silently, no error anywhere. encode()
-	// below already guards against writing past whatever the codec actually
-	// gives us, but that guard existing at all means frames COULD be
-	// truncated: everything past the codec's real buffer size would stay
-	// zeroed, encoding as solid green (Y=0,U=0,V=0 -> RGB(0,135,0)) for the
-	// remainder of the frame. This is a real, confirmed-fixed bug (verified:
-	// zero "too small" truncation warnings across full sessions once this
-	// line was added) -- but it turned out NOT to be the cause of the
-	// green-corruption symptom under investigation in docs/ANDROID_PORT.md's
-	// Milestone 4.5: that corruption is byte-identical before and after this
-	// fix. Kept because it's a genuine latent bug independent of that one.
+	// Without this, Codec2 can size the input ByteBuffer smaller than one
+	// real NV12 frame, silently -- encode() guards against writing past it,
+	// but that means truncation, encoding as solid green for the remainder.
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, int32_t(extent.width) * extent.height * 3 / 2);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, int32_t(bitrate));
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BITRATE_MODE, 2 /* BITRATE_MODE_CBR */);
@@ -340,18 +261,11 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 {
 	ensure_codec();
 
-	// Milestone 5 diagnostic: vkCopyImageToMemory() path (see this file's
-	// own DEBUG_GET_ONCE_NUM_OPTION(host_image_copy, ...) comment above).
-	// Entirely synchronous from the render thread's point of view -- by
-	// the time this returns, in[slot].buffer already has the frame's
-	// bytes, so in[slot].fence is deliberately left untouched (still
-	// signaled from its creation/last real use): encode()'s existing
-	// waitForFences() on it is a harmless immediate-return in this path,
-	// not a code path split. The base class's own present_slot/
-	// encode_slot busy/idle gate (video_encoder.cpp) already guarantees
-	// no slot is reused while encode() is still reading it, independent
-	// of which copy mechanism filled it -- this path relies on exactly
-	// that existing guarantee rather than its own fence dance.
+	// vkCopyImageToMemory() diagnostic path (see host_image_copy above):
+	// entirely synchronous, so in[slot].fence is left untouched (still
+	// signaled) -- encode()'s waitForFences() on it is a harmless
+	// immediate-return here, relying on the base class's existing
+	// present_slot/encode_slot busy/idle gate instead of its own fence dance.
 	if (debug_get_num_option_host_image_copy() and vk.host_image_copy)
 	{
 		auto t_wait_begin = os_monotonic_get_ns();
@@ -391,18 +305,12 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 		return;
 	}
 
-	// Identical to video_encoder_raw.cpp's present_image(): copy the
-	// compositor's already-NV12 image out to our own host-visible buffer.
-	// See this class's own comment (video_encoder_mediacodec.h) for why
-	// that's the deliberate first-pass tradeoff here.
+	// Identical to video_encoder_raw.cpp: copy the compositor's already-NV12
+	// image to our host-visible buffer (see video_encoder_mediacodec.h).
 	//
-	// This wait is for a STALE slot: with num_slots==2, `slot` was last
-	// used two present_image() calls ago, and its GPU copy should long
-	// since have finished (encode() -- below -- already waited on this
-	// same fence before this call could even happen, via the base
-	// class's own present_slot/encode_slot busy/idle gate). Non-zero
-	// wait time here means the render thread is genuinely stalling on
-	// this encoder's own pipeline, not just the base class's slot gate.
+	// This wait is for a STALE slot (num_slots==2, so `slot` was last used
+	// two calls ago and should already be done) -- non-zero wait time here
+	// means the render thread is genuinely stalling on this encoder.
 	auto t_wait_begin = os_monotonic_get_ns();
 	auto wait_result = vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000);
 	t_present_fence_wait.sample(os_monotonic_get_ns() - t_wait_begin);
@@ -415,11 +323,7 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	// y_cbcr is this stream's own dedicated single-array-layer image on
-	// the PowerVR single-layer workaround path (image_layer() == 0
-	// there), or array layer image_layer() (== stream_idx) of one shared
-	// 3-layer image on every other GPU vendor -- see compositor.h's
-	// struct image comment and this class's image_layer() comment.
+	// See compositor.h's struct image and this class's image_layer().
 	if (need_transfer)
 	{
 		vk::ImageMemoryBarrier2 barrier{
@@ -489,16 +393,9 @@ void wivrn::video_encoder_mediacodec::present_image(vk::Image y_cbcr, vk::Semaph
 	                       },
 	                       *in[slot].fence);
 
-	// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch): the
-	// decisive brute-force synchronization test. If set, block the
-	// RENDER thread here until THIS copy is fully complete before
-	// returning from present_image() at all -- eliminating any
-	// possibility of the render thread moving on to other GPU work
-	// (the next frame's compute dispatch, the other stream's copy) while
-	// this copy is still in flight, rather than letting encode() wait on
-	// this fence later, asynchronously, on a different thread. If this
-	// eliminates the corruption, it proves a timing/synchronization gap
-	// (ours or the driver's); if it doesn't, timing is not the cause.
+	// Diagnostic: blocks the render thread here until this copy fully
+	// completes, instead of letting encode() wait on the fence later, to
+	// isolate a timing/synchronization gap from other causes.
 	// `adb shell setprop debug.xrt.WIVRN_FORCE_GPU_WAIT 1`.
 	if (debug_get_num_option_force_gpu_wait())
 		(void) vk.device.waitForFences(*in[slot].fence, true, UINT64_MAX);
@@ -508,12 +405,9 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 {
 	scoped_timing_sample total_timer(t_encode_total);
 
-	// Dynamic bitrate: real runtime AMediaCodec feature (see key_video_bitrate's
-	// own comment). Dynamic framerate isn't: unlike x264 (full param reconfig)
-	// there's no equivalently well-supported MediaCodec runtime call for it, so
-	// this drains pending_framerate (so a change request doesn't pile up stale)
-	// without acting on it -- a real gap, not forgotten, worth reconciling
-	// alongside the zero-copy upgrade mentioned in the header.
+	// Dynamic bitrate is a real runtime AMediaCodec feature (see
+	// key_video_bitrate). Dynamic framerate isn't -- no equivalent runtime
+	// call exists, so this just drains pending_framerate without acting on it.
 	pending_framerate.exchange(0);
 	if (auto bitrate = pending_bitrate.exchange(0))
 	{
@@ -534,11 +428,8 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	}
 
 	{
-		// This is the wait for THIS frame's GPU copy (present_image(),
-		// same slot) to finish -- unlike present_image()'s own fence
-		// wait (which waits on a stale slot from 2 frames ago). Real
-		// wait time here means the CPU is idle waiting on the GPU
-		// specifically for the frame this call is trying to encode.
+		// Waits for THIS frame's GPU copy (unlike present_image()'s own
+		// fence wait, which is for a stale slot from 2 frames ago).
 		scoped_timing_sample t(t_encode_fence_wait);
 		if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 		{
@@ -562,25 +453,14 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 	size_t payload_size = in[slot].buffer.info().size;
 	auto * src = (uint8_t *) in[slot].buffer.map();
 
-	// Real, confirmed finding on this device (see the HOST_COHERENT log
-	// at construction, above): this staging buffer's memory type is
-	// HOST_VISIBLE but NOT HOST_COHERENT, so the GPU's
-	// vkCmdCopyImageToBuffer write (present_image()) is not guaranteed
-	// visible to this CPU read without an explicit invalidate first --
-	// this was previously missing. No-op-cheap if the type were ever
-	// coherent instead (VMA checks internally), so this is safe to leave
-	// unconditional rather than branch on the one-time property log.
+	// This staging buffer is HOST_VISIBLE but not HOST_COHERENT on this
+	// device (see the property log at construction) -- invalidate is
+	// required before this CPU read sees the GPU's write. Cheap no-op if
+	// the memory type were ever coherent instead.
 	in[slot].buffer.invalidate();
 
-	// AMEDIAFORMAT_KEY_MAX_INPUT_SIZE (ensure_codec(), above) should make
-	// this impossible now -- keep the check anyway rather than silently
-	// std::min()-ing and truncating the frame again if it ever isn't. This
-	// was a real, independently-confirmed bug (verified: zero "too small"
-	// truncation warnings after the fix), but it turned out NOT to be the
-	// cause of the green-chroma corruption investigated in
-	// docs/ANDROID_PORT.md's Milestone 4.5 -- that was a GPU driver bug
-	// (compute writes to array layer >=1 of a multi-planar image), fixed in
-	// compositor.h/.cpp instead. Kept here as a real, separate hardening.
+	// AMEDIAFORMAT_KEY_MAX_INPUT_SIZE (ensure_codec()) should make this
+	// impossible -- keep the check anyway rather than silently truncating.
 	if (in_size < payload_size)
 	{
 		U_LOG_E("mediacodec: input buffer too small on stream %d: %zu < %zu, dropping frame",
@@ -594,11 +474,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 		memcpy(in_buf, src, payload_size);
 	}
 
-	// Milestone 5 diagnostic: capture the EXACT bytes MediaCodec is about
-	// to encode, tagged with frame_index, to answer "was the NV12 already
-	// corrupt, or did MediaCodec/hardware produce the corruption" for any
-	// visibly-corrupted encoded frame found in the WIVRN_DUMP_VIDEO
-	// capture. See video_encoder_mediacodec.h's nv12_dump comment.
+	// See nv12_dump's declaration.
 	if (nv12_dump)
 	{
 		nv12_dump.write((const char *) &frame_index, sizeof(frame_index));
@@ -643,26 +519,16 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_mediacodec::encod
 			continue; // real frame data is a separate, later output
 		}
 
-		// Copy out of MediaCodec's own output buffer *before* releasing it
-		// (the buffer is invalid/reusable the instant release happens) and
-		// hand the copy to the shared background sender thread instead of
-		// calling SendData() here directly. encoder_work() (compositor.cpp)
-		// runs one encode() per stream concurrently, but SendData() still
-		// does real, possibly-multi-shard blocking socket I/O -- pushing it
-		// onto the shared async sender (matching video_encoder_raw.cpp/
-		// video_encoder_vulkan.cpp, the only two other backends, both of
-		// which already use this) keeps that I/O off the encode-dispatch
-		// path entirely. See docs/ANDROID_PORT.md's Milestone 4.5 entry.
+		// Copy out of MediaCodec's output buffer before releasing it (invalid
+		// the instant release happens), and hand off to the shared background
+		// sender (matching video_encoder_raw.cpp/video_encoder_vulkan.cpp) so
+		// SendData()'s blocking socket I/O stays off the encode-dispatch path.
 		if (is_idr and not csd.empty())
 			push_async(csd, true);
 		auto payload_copy = std::make_shared<std::vector<uint8_t>>(payload.begin(), payload.end());
 		AMediaCodec_releaseOutputBuffer(codec.get(), out_idx, false);
-		// Milestone 5 diagnostic: pair with the nv12_dump write above --
-		// this output corresponds to the frame_index just queued in THIS
-		// call (KEY_LATENCY=1, one-in-one-out), so a corrupted encoded
-		// access unit found in the WIVRN_DUMP_VIDEO capture can be
-		// matched to its exact source NV12 frame in nv12_dump by
-		// frame_index, without guessing from file position/ordering.
+		// Pairs with the nv12_dump write above via frame_index (KEY_LATENCY=1
+		// makes this one-in-one-out).
 		if (nv12_dump)
 			U_LOG_I("mediacodec[%d] output: frame_index=%lu size=%zu flags=%u idr=%d",
 			        stream_idx, (unsigned long) frame_index, payload.size(), info.flags, is_idr);

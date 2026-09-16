@@ -106,10 +106,8 @@ bool default_idr_handler::was_sent(uint64_t frame_index)
 default_idr_handler::frame_type default_idr_handler::get_type(uint64_t frame_index)
 {
 	std::unique_lock lock(mutex);
-	// Record that this stream actually encoded and is about to send this
-	// frame index -- see this class's own header comment on sent_frames for
-	// why this distinction matters (the compositor can drop a frame under
-	// load before any encoder ever sees it).
+	// Record that this stream actually sent this frame index -- see
+	// sent_frames' declaration for why this distinction matters.
 	sent_frames[frame_index % sent_frames.size()] = frame_index;
 	return std::visit(utils::overloaded{
 	                          [this, frame_index](need_idr) {
