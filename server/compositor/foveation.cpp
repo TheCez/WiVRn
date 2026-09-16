@@ -30,19 +30,10 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 
-// Stereo-fusion diagnostic (docs/ANDROID_PORT.md, VRChat/Adreno stereo
-// investigation): forces compute_params()'s foveation CENTER to dead-ahead
-// (angle 0) for both axes of both eyes, ignoring gaze/eye-position/the
-// natural-gaze-down-10-degrees adjustment entirely, while leaving the
-// actual compression ratio/math untouched (forcing "no compression" outright
-// crashes -- fill_ubo() asserts count>0, since our encode resolution here is
-// genuinely smaller than VRChat's real render resolution, confirmed live:
-// this device hit that assertion with extent_w > foveated_size.width).
-// Tests whether an eye-position/gaze-dependent ASYMMETRY between the two
-// eyes' foveation centers (not foveation/compression itself) is the source
-// of a warped/wobbly or vertically-mismatched per-eye image.
-// `adb shell setprop debug.xrt.WIVRN_DISABLE_FOVEATION 1` on Android;
-// WIVRN_DISABLE_FOVEATION env var on desktop.
+// Diagnostic: forces the foveation center to dead-ahead for both eyes
+// (compression math untouched -- "no compression" outright crashes fill_ubo()'s
+// count>0 assert), to isolate a gaze-dependent per-eye asymmetry.
+// `adb shell setprop debug.xrt.WIVRN_DISABLE_FOVEATION 1` (or the env var on desktop).
 DEBUG_GET_ONCE_NUM_OPTION(disable_foveation, "WIVRN_DISABLE_FOVEATION", 0)
 
 // See its own call site's comment, below.
@@ -136,9 +127,7 @@ vk::raii::DescriptorSetLayout make_ds_layout(wivrn::vk_bundle & vk)
 
 vk::raii::PipelineLayout make_layout(wivrn::vk_bundle & vk, vk::DescriptorSetLayout ds_layout)
 {
-	// Which eye's ubo/source-array slot this dispatch targets -- see
-	// foveation.comp's own comment (each dispatch now writes one eye's own
-	// dedicated destination image, working around a real GPU driver bug).
+	// Which eye's ubo/source-array slot this dispatch targets -- see foveation.comp.
 	vk::PushConstantRange push_constant{
 	        .stageFlags = vk::ShaderStageFlagBits::eCompute,
 	        .offset = 0,
@@ -193,13 +182,9 @@ std::array<vk::raii::Pipeline, 2> make_pipelines(wivrn::vk_bundle & vk, vk::Pipe
 
 vk::raii::DescriptorPool make_ds_pool(wivrn::vk_bundle & vk)
 {
-	// Two full descriptor sets now (one per eye, each permanently bound to
-	// that eye's own dedicated destination images) instead of one shared
-	// set rewritten between dispatches -- descriptor set contents can't be
-	// safely rewritten between two dispatches already recorded into the
-	// same not-yet-submitted command buffer (the GPU reads the set's
-	// CURRENT contents at execution time, not at bind-record time), so
-	// each eye needs its own live set. See foveation.comp's own comment.
+	// One descriptor set per eye: a set's contents can't be safely rewritten
+	// between two dispatches already recorded into the same not-yet-submitted
+	// command buffer (the GPU reads current contents at execution time).
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
@@ -635,15 +620,8 @@ void foveation::update_ubo(
 		         extent,
 		         foveated_size.height);
 	}
-	// Stereo-fusion diagnostic (docs/ANDROID_PORT.md): logs the raw
-	// per-eye source rect (to check for a flip/sign asymmetry between
-	// eyes) and the first/last few x-index table entries actually written
-	// into the UBO the foveation.comp shader indexes with (to directly
-	// catch an unsigned underflow/huge-value bug at the edge buckets,
-	// rather than inferring one from source reading alone). Confirmed
-	// live on the Adreno/Turnip tablet: both eyes' tables are clean,
-	// monotonic, correctly bounded -- ruling out an underflow here as the
-	// cause of the right-eye seam found downstream of this point.
+	// Diagnostic: logs per-eye source rect and the UBO's first/last x-index
+	// table entries, to catch an unsigned underflow at the edge buckets.
 	// `adb shell setprop debug.xrt.WIVRN_LOG_FOVEATION_UBO 1`.
 	if (debug_get_num_option_log_foveation_ubo())
 	{
@@ -691,19 +669,10 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline[alpha]);
 
-	// Real GPU driver bug on this hardware (see compositor.h's struct image
-	// comment / foveation.comp's own comment): a compute write to array
-	// layer >=1 of a multi-planar image is corrupted. Each eye now gets its
-	// own dedicated single-array-layer destination image and its own
-	// permanently-bound descriptor set, dispatched separately with
-	// groupCountZ=1 -- gl_GlobalInvocationID.z is therefore always 0, so
-	// which eye's ubo/source-array slot to read is passed as a push
-	// constant instead. (Tested splitting the old single dispatch(...,2)
-	// into two dispatchBase(...,1) calls against the SAME 3-layer image
-	// first, per a real precedent -- SDL3 GPU issue #12906 -- and that made
-	// it WORSE, not better, confirming the array layer itself is the
-	// problem, not just how many dispatches touch it. See
-	// docs/ANDROID_PORT.md's Milestone 4.5 for the full test record.)
+	// Real GPU driver bug (see compositor.h's struct image): a compute write
+	// to array layer >=1 of a multi-planar image is corrupted, so each eye
+	// gets its own dedicated single-layer image, dispatched separately
+	// (groupCountZ=1; which eye is a push constant, not gl_GlobalInvocationID.z).
 	for (int eye = 0; eye < 2; ++eye)
 	{
 		// src (Monado's swapchain image view) genuinely changes every

@@ -70,65 +70,25 @@ static auto renderdoc()
 
 DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 
-// Milestone 5 diagnostic (docs/ANDROID_PORT.md's perf branch entry): the
-// investigation's "run one eye / one encoder only" isolation step, to
-// determine whether the NV12-input corruption (proven present before
-// MediaCodec ever sees it) is specific to concurrent per-stream
-// operation. -1 (default) = both eyes run normally; 0 or 1 = only that
-// stream_idx gets a real present_image()/encode() -- the other
-// encoder object still exists but is never fed a frame. Result so far:
-// concurrent operation is a major amplifying factor (~4-15x more
-// corruption with both streams active vs. either alone) -- see the doc.
-//
-// To set: on Android, this specific macro's DEBUG_GET_ONCE_NUM_OPTION
-// backend (u_debug.c) reads an Android system property DIRECTLY,
-// bypassing getenv()/setenv() entirely --
-//   adb shell setprop debug.xrt.WIVRN_ONLY_STREAM 0     (or 1)
-// (confirmed the hard way: an env-var-forwarding attempt via
-// wivrn_server_jni.cpp was silently inert). On desktop, the same macro
-// reads the WIVRN_ONLY_STREAM env var normally.
+// Diagnostic: -1 (default) both streams run normally; 0 or 1 restricts real
+// present_image()/encode() calls to that stream_idx only, to isolate
+// per-stream vs. concurrent-operation corruption.
+// Android: `adb shell setprop debug.xrt.WIVRN_ONLY_STREAM 0` (env var forwarding
+// doesn't reach this macro's Android backend, must use setprop).
 DEBUG_GET_ONCE_NUM_OPTION(only_stream, "WIVRN_ONLY_STREAM", -1)
 
-// Milestone 5 diagnostic, step 4 of the investigation plan: the
-// WIVRN_ONLY_STREAM isolation test (above) disables BOTH a stream's GPU
-// work (compute+copy, submitted unconditionally from the render thread
-// every frame) AND its CPU-side encode() call at once, so it can't tell
-// concurrent GPU dispatch/copy apart from concurrent encode() worker
-// threads (introduced in 89655cd4) as the actual locus of the
-// corruption. This toggle leaves GPU work for BOTH streams completely
-// unchanged (still submitted together, every frame) and only serializes
-// encode()'s std::jthread workers back to sequential calls on
-// encoder_work()'s own thread, exactly as they ran before 89655cd4. 0
-// (default) = current concurrent behavior; 1 = serialized. Same
-// property mechanism as WIVRN_ONLY_STREAM on Android: `adb shell setprop
-// debug.xrt.WIVRN_SERIALIZE_ENCODE 1`.
+// Diagnostic: forces encode() calls back to sequential (pre-concurrent-encode
+// behavior) without changing GPU submission concurrency, to isolate CPU-thread
+// races from GPU/VPU contention. `adb shell setprop debug.xrt.WIVRN_SERIALIZE_ENCODE 1`.
 DEBUG_GET_ONCE_NUM_OPTION(serialize_encode, "WIVRN_SERIALIZE_ENCODE", 0)
 
-// Milestone 5 diagnostic, next step after ruling out both CPU-thread
-// concurrency and plain synchronization gaps as the cause (neither
-// serializing encode() nor forcing maximal GPU-copy synchronization
-// reduced the corruption -- see docs/ANDROID_PORT.md): the leading
-// hypothesis is now genuine GPU/VPU resource contention between the two
-// streams' back-to-back GPU work and hardware-encoder submissions, not
-// a closeable race. This staggers (rather than serializes or
-// desynchronizes) the second stream's present_image() call and its
-// encode() worker-thread start by this many microseconds relative to
-// the first -- spreading the two streams' real GPU/VPU work apart in
-// time within the same frame period, instead of launching both at
-// once, while still updating both eyes every frame (no visual eye-lag
-// from skipping frames). 0 (default) = no change. `adb shell setprop
-// debug.xrt.WIVRN_STAGGER_US <microseconds>`.
+// Diagnostic: delays the second stream's present_image()/encode() start by this
+// many microseconds relative to the first, to spread GPU/VPU work apart in time
+// without dropping frames. `adb shell setprop debug.xrt.WIVRN_STAGGER_US <us>`.
 DEBUG_GET_ONCE_NUM_OPTION(stagger_us, "WIVRN_STAGGER_US", 0)
 
-// Milestone 8 diagnostic (docs/ANDROID_PORT.md's VRChat stereo-fusion
-// investigation): per-view pose/array_index/image_index for the fast
-// (single XRT_LAYER_PROJECTION layer) path, every frame -- confirmed live
-// that both views get correct, symmetric pose data (only X differs, by a
-// fixed IPD offset) and consistent array_index/image_index assignment,
-// ruling out our own view-extraction code as the source of the eventual
-// right-eye stereo-fusion bug traced to the Adreno/Turnip path instead.
-// Off by default (unconditional would spam every frame in production).
-// `adb shell setprop debug.xrt.WIVRN_LOG_VIEW_POSE 1`.
+// Diagnostic: logs per-view pose/array_index/image_index every frame on the fast
+// path, to check for view-extraction bugs. `adb shell setprop debug.xrt.WIVRN_LOG_VIEW_POSE 1`.
 DEBUG_GET_ONCE_NUM_OPTION(log_view_pose, "WIVRN_LOG_VIEW_POSE", 0)
 
 namespace details
@@ -154,22 +114,12 @@ const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t 
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
-// Right-eye seam diagnostic (docs/ANDROID_PORT.md's stereo-fusion
-// investigation): same methodology as Milestone 4.5's since-removed
-// debug_dump_app_image (dump the APP'S OWN swapchain image -- the one
-// Monado handed us, before our own foveation shader ever touches it --
-// straight to a raw RGBA file via vkCmdCopyImageToBuffer). Answers: is the
-// x~=143 right-eye seam already present in what VRChat/Monado gave us (an
-// import/read issue with array layer 1 specifically), or does our own
-// foveation.comp shader introduce it? One-shot per view (a `dumped` guard,
-// not gated on frame count) -- this stalls the queue with a blocking wait,
-// fine for a single manual capture, not something to leave running.
-// `adb shell setprop debug.xrt.WIVRN_DUMP_APP_IMAGE 1`. Deliberately NOT
-// DEBUG_GET_ONCE_NUM_OPTION -- that macro latches the property's value on
-// its first read for the rest of the process lifetime (see its own
-// definition), which would make this unusable as a live toggle: flipping
-// the property after VRChat has moved past its (black) loading screen is
-// the whole point, so this re-reads the property every call instead.
+// Diagnostic: dumps the app's own swapchain image (before our foveation
+// shader touches it) to a raw RGBA file, one-shot per view, to check whether
+// corruption is already present in what Monado handed us.
+// `adb shell setprop debug.xrt.WIVRN_DUMP_APP_IMAGE 1`. Not DEBUG_GET_ONCE_NUM_OPTION:
+// that macro latches its value for the process lifetime, so it wouldn't work
+// as a live toggle flipped mid-session.
 void dump_app_image_once(wivrn::vk_bundle & vk, vk::raii::CommandPool & cmd_pool, const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index, uint32_t array_index, int view)
 {
 	static std::array<bool, 2> dumped{false, false};
@@ -252,13 +202,8 @@ void dump_app_image_once(wivrn::vk_bundle & vk, vk::raii::CommandPool & cmd_pool
 	U_LOG_E("dump_app_image_once: wrote %s (%ux%u, array_layer=%u)", path.c_str(), extent.width, extent.height, array_index);
 }
 
-// Which array layer stream `stream_idx` (0=left, 1=right, 2=alpha) lives at:
-// always 0 on the PowerVR single-layer workaround path (each stream has its
-// own dedicated image there), or stream_idx itself when sharing one 3-layer
-// image on every other GPU vendor -- see compositor.h's struct image
-// comment and vk_bundle::multi_layer_stream_images. video_encoder_mediacodec.cpp's
-// present_image() derives the same layer the same way, independently, since
-// it only has vk_bundle + its own stream_idx to go on.
+// Array layer for stream_idx (0=left, 1=right, 2=alpha): 0 on the PowerVR
+// single-layer workaround, else stream_idx -- see compositor.h's struct image.
 uint32_t image_layer(const wivrn::vk_bundle & vk, uint8_t stream_idx)
 {
 	return vk.multi_layer_stream_images ? stream_idx : 0;
@@ -284,11 +229,8 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
-// Builds the OWNING allocation backing one or more stream images: a single
-// dedicated image (array_layers=1) per stream on the PowerVR single-layer
-// workaround path, or one shared image (array_layers=3, covering left+
-// right+alpha) on every other GPU vendor -- see compositor.h's struct image
-// comment and vk_bundle::multi_layer_stream_images.
+// Backing allocation for one or more stream images: array_layers=1 (PowerVR
+// workaround, one call per stream) or =3 (shared left+right+alpha elsewhere).
 image_allocation make_stream_storage(
         wivrn::vk_bundle & vk,
         std::span<const vk::Format, 3> formats,
@@ -298,14 +240,8 @@ image_allocation make_stream_storage(
         uint32_t array_layers,
         const char * name)
 {
-	// Milestone 5 (docs/ANDROID_PORT.md's perf branch): add HOST_TRANSFER
-	// usage when the device supports VK_EXT_host_image_copy, so
-	// video_encoder_mediacodec.cpp can optionally read this image back
-	// via vkCopyImageToMemory() (no queue submission) instead of
-	// vkCmdCopyImageToBuffer() -- gated at the READ site by
-	// WIVRN_HOST_IMAGE_COPY, but the image itself needs this usage flag
-	// set at creation time regardless of whether that path is active
-	// this run.
+	// Needed at creation time so video_encoder_mediacodec.cpp can optionally
+	// read back via vkCopyImageToMemory() instead of vkCmdCopyImageToBuffer().
 	vk::ImageUsageFlags host_transfer_usage = vk.host_image_copy ? vk::ImageUsageFlagBits::eHostTransfer : vk::ImageUsageFlags{};
 
 	vk::StructureChain image_info{
@@ -333,10 +269,8 @@ image_allocation make_stream_storage(
 	};
 }
 
-// Builds one stream's Y/CbCr views into array layer `array_layer` of
-// `vk_image` (always 0 on the PowerVR single-layer workaround path, since
-// each stream has its own dedicated image there; 0/1/2 for left/right/alpha
-// when sharing one 3-layer image on every other vendor).
+// Y/CbCr views into array_layer of vk_image (0, or 0/1/2 for left/right/alpha
+// depending on the PowerVR workaround -- see make_stream_storage above).
 wivrn::compositor::stream_image make_stream_view(
         wivrn::vk_bundle & vk,
         vk::Image vk_image,
@@ -578,14 +512,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<xrt_rect, 2> src_rect;
 	std::array<xrt_fov, 2> src_fov;
 
-	// Capacity 5: worst case is 1 (squasher path's own barrier) + 3 (one
-	// pre-dispatch UNDEFINED->GENERAL barrier per stream image -- left,
-	// right, alpha -- now that each has its own dedicated image instead of
-	// sharing array layers of one, see compositor.h's struct image
-	// comment), with a small margin. This exact overflow (a fixed capacity
-	// of 3, once one shared barrier became three) crashed with std::bad_alloc
-	// the first time this restructure was tested live -- inplace_vector
-	// doesn't grow, it throws when full.
+	// Capacity 5 = 1 squasher barrier + 3 per-stream barriers + margin.
+	// inplace_vector doesn't grow -- it throws when full, not silently reallocates.
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 5> image_barriers;
 
 	// Check if we can pass a layer directly to foveation
@@ -659,10 +587,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        });
 	}
 
-	// One barrier per stream image/layer: 3 separate VkImages (PowerVR
-	// single-layer workaround) or 3 layers of 1 shared VkImage (every
-	// other GPU vendor) -- see compositor.h's struct image comment and
-	// image_layer's own comment.
+	// One barrier per stream image/layer -- see compositor.h's struct image.
 	struct
 	{
 		vk::Image image;
@@ -716,10 +641,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        src_fov,
 	        view_info.alpha);
 
-	// Each stream (0=left, 1=right, 2=alpha) either has its OWN dedicated
-	// image (PowerVR single-layer workaround) or is one array layer of a
-	// shared 3-layer image (every other GPU vendor) -- see compositor.h's
-	// struct image comment and image_layer's own comment.
+	// See compositor.h's struct image for the dedicated-image-vs-shared-layer split.
 	auto stream_vk_image = [&](uint8_t stream_idx) -> vk::Image {
 		return stream_idx < 2 ? vk::Image(images[i].content[stream_idx].image) : vk::Image(images[i].alpha.image);
 	};
@@ -943,19 +865,11 @@ void compositor::encoder_work(std::stop_token tok)
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
-		// Encode each stream concurrently rather than sequentially on this
-		// one thread. This mattered little on desktop backends (NVENC,
-		// VAAPI, x264), where per-call overhead is negligible -- but
-		// Android's AMediaCodec has real per-call JNI/Binder overhead, so
-		// calling it sequentially for stream 0 then stream 1 on one thread
-		// meant stream 0's dequeue/queue calls always fully completed
-		// before stream 1's even started, every single frame,
-		// deterministically starving whichever stream comes later in this
-		// loop. See docs/ANDROID_PORT.md's Milestone 4.5 entry.
-		// wivrn_connection::send_control/send_stream (server/driver/
-		// wivrn_connection.h) gained a mutex alongside this change, since
-		// concurrent encode() calls can now genuinely race on the same
-		// underlying socket where they never could before.
+		// Concurrent per-stream encode: AMediaCodec's per-call JNI/Binder
+		// overhead means sequential calls starve whichever stream goes second,
+		// every frame. wivrn_connection::send_control/send_stream gained a
+		// mutex for this since concurrent encode() calls can now race on the
+		// same socket.
 		{
 			auto do_encode = [&](video_encoder * e) {
 				try

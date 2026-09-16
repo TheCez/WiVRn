@@ -59,15 +59,9 @@ class foveation
 	vk::raii::DescriptorPool descriptor_pool;
 	std::array<vk::DescriptorSet, 2> descriptor_sets; // one per eye -- see foveation.cpp's make_ds_pool comment
 
-	// The compositor double-buffers 2 image slots and calls foveate() with
-	// whichever slot is active this frame, so the (y,cbcr,alpha_y,alpha_cbcr)
-	// view handles only actually change every OTHER frame (when the slot
-	// flips) -- but every one of foveation's own 2 descriptor sets used to
-	// get rewritten every single frame regardless. That's real, measurable
-	// per-frame CPU cost (vkUpdateDescriptorSets, twice, every frame) that
-	// didn't exist before splitting into 2 eye-dispatches/descriptor sets,
-	// and shows up as added latency. Skip the write when nothing actually
-	// changed since the last call.
+	// The compositor's 2 image slots alternate every other frame, so these
+	// view handles only change every other call -- skip the
+	// vkUpdateDescriptorSets write when nothing actually changed.
 	struct bound_views
 	{
 		vk::ImageView y, cbcr, alpha_y, alpha_cbcr;

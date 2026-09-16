@@ -24,29 +24,11 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// Chroma is averaged over each 2x2 luma block by gathering the 4 relevant
-// invocations' already-computed colour through workgroup shared memory,
-// indexed by gl_LocalInvocationIndex (spec-guaranteed portable: exactly
-// LocalInvocationID.z*sizeY*sizeX + LocalInvocationID.y*sizeX +
-// LocalInvocationID.x, no subgroup involvement at all). This used to be
-// done with subgroupShuffleDown, using
-// `id = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID` for the
-// coordinate remap too, which silently assumes that value equals
-// gl_LocalInvocationIndex -- true on desktop AMD/NVIDIA (subgroup size
-// 32/64 divides the 8x8=64 workgroup evenly, in raster order) but NOT on
-// this device: measured live, VkPhysicalDeviceSubgroupProperties reports
-// subgroupSize=128, larger than the entire 64-invocation workgroup, so
-// the "reconstruct LocalInvocationIndex from subgroup IDs" trick has no
-// guarantee of producing 0..63 in the expected order at all. This is
-// consistent with every piece of evidence gathered chasing the
-// green/corrupted-chroma bug (see docs/ANDROID_PORT.md's Milestone 4.5):
-// large regions of the chroma (and even luma, on the stream with the
-// most affected eye) plane captured directly from the pre-MediaCodec
-// host buffer were never written at all (literal zero bytes), at a
-// deterministic, identical-every-frame cutoff -- exactly what a broken
-// id->(ix,iy) mapping produces (some destination pixels never receive a
-// valid id at all), not what a data race or driver timing bug would look
-// like.
+// Chroma is averaged over each 2x2 luma block via workgroup shared memory
+// indexed by gl_LocalInvocationIndex, not subgroupShuffleDown as before:
+// that relied on gl_SubgroupID*gl_SubgroupSize+gl_SubgroupInvocationID equaling
+// gl_LocalInvocationIndex, true on desktop AMD/NVIDIA but not on this device
+// (subgroupSize=128, larger than the whole 64-invocation workgroup).
 shared vec4 tile[gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z];
 
 #define MAX_DIM 4097
@@ -62,21 +44,16 @@ layout(set = 0, binding = 1, std430) buffer restrict Config
 
 layout(set = 0, binding = 2) uniform writeonly restrict image2DArray luma;
 layout(set = 0, binding = 3) uniform writeonly restrict image2DArray chroma;
-// Alpha's own dedicated destination (previously array layer 2 of the same
-// image as luma/chroma; now its own single-layer image, still shared
-// between both eyes via the same x-offset packing as before). Only written
-// when alpha_width>0; harmless to bind even when unused.
+// Alpha's own dedicated destination (was array layer 2 of luma/chroma).
+// Only written when alpha_width>0; harmless to bind even when unused.
 layout(set = 0, binding = 4) uniform writeonly restrict image2DArray alpha_luma;
 layout(set = 0, binding = 5) uniform writeonly restrict image2DArray alpha_chroma;
 
 layout(constant_id = 0) const int alpha_width = 0;
 
-// Each dispatch now targets ONE eye's own dedicated single-array-layer
-// destination image (see compositor.h's struct image comment for why:
-// a real GPU driver bug on this hardware corrupts compute writes to array
-// layer >=1 of a multi-planar image). gl_GlobalInvocationID.z is therefore
-// always 0 -- which eye's ubo/source-array slot to read now comes from this
-// push constant instead.
+// Each dispatch targets one eye's own dedicated image (compute writes to
+// array layer >=1 of a multi-planar image are corrupted on this hardware --
+// see compositor.h's struct image); gl_GlobalInvocationID.z is always 0.
 layout(push_constant) uniform PushConstants
 {
 	int eye;

@@ -47,33 +47,17 @@ class video_encoder;
 class compositor : public comp_base
 {
 public:
-	// On PowerVR (Imagination Technologies) GPUs specifically, each stream
-	// gets its OWN dedicated single-array-layer multi-planar image instead
-	// of sharing array layers of one 3-array-layer image. Real GPU driver
-	// bug, confirmed via a minimal standalone reproduction outside this
-	// codebase (see docs/ANDROID_PORT.md's Milestone 4.5): on this
-	// hardware (PowerVR DXT-48-1536 / Tensor G5), a compute shader write
-	// to array layer >=1 of a VK_FORMAT_G8_B8R8_2PLANE_420_UNORM image is
-	// corrupted -- neither a multi-planar image alone (1 layer) nor a
-	// non-multi-planar array image triggers it, only the combination.
-	// Confirmed clean on two independent desktop Vulkan implementations
-	// (NVIDIA, Mesa llvmpipe) with the exact same shader and data, and
-	// confirmed corrupted ONLY with arrayLayers>=2 when run directly on
-	// this device -- so single-layer images sidestep it entirely. Full
-	// writeup incl. exact repro and upstream-bug-report material:
-	// docs/pixel10-pro-xl-gpu-media-investigation.md, section B. DO NOT
-	// widen multi_layer_stream_images's denylist away from PowerVR-only
-	// without re-running that document's reproduction harness first.
+	// PowerVR (Imagination Technologies) GPUs: real driver bug -- a compute
+	// shader write to array layer >=1 of a multi-planar 2-plane-420 image is
+	// corrupted (confirmed clean on NVIDIA/Mesa llvmpipe with identical
+	// shader/data; confirmed corrupted only with arrayLayers>=2 on-device).
+	// DO NOT widen multi_layer_stream_images's denylist away from
+	// PowerVR-only without re-verifying this. Every other vendor shares one
+	// 3-array-layer image instead (fewer allocations/barriers/dispatches) --
+	// see vk_bundle::multi_layer_stream_images.
 	//
-	// Every other GPU vendor (confirmed on a Samsung Galaxy S22's Exynos
-	// 2200/Xclipse 920 -- see docs/ANDROID_PORT.md's cross-device
-	// confirmation entry) uses one shared 3-array-layer image instead:
-	// fewer allocations, fewer barriers/dispatches. See
-	// vk_bundle::multi_layer_stream_images.
-	//
-	// Either way, `content`/`alpha` below are non-owning views: the
-	// backing memory they point into is owned by `image::storage` (either
-	// 3 separate single-layer allocations, or 1 shared 3-layer one).
+	// `content`/`alpha` are non-owning views; the backing memory is owned by
+	// `image::storage` (3 single-layer allocations, or 1 shared 3-layer one).
 	struct stream_image
 	{
 		vk::Image image;
@@ -114,13 +98,9 @@ private:
 	timings squasher_times;
 	timings foveation_times;
 
-	// Part B (readback pipeline investigation): same GPU query-pool
-	// timestamps squasher_times/foveation_times above already collect
-	// (Monado's own u_var debug-UI system, not reachable via logcat on
-	// this Android build -- no SDL2 GUI here), fed into the same
-	// logcat-based rolling-stats mechanism the mediacodec backend uses
-	// (frame_timing_stats.h) so both ends of the pipeline show up in one
-	// unified WIVRN_TIMING_LOG capture.
+	// Same GPU timestamps as squasher_times/foveation_times, but logged via
+	// frame_timing_stats (logcat) since Monado's u_var debug UI isn't
+	// reachable on this Android build (no SDL2 GUI).
 	frame_timing_stats squasher_gpu_time_log{"compositor squasher GPU time"};
 	frame_timing_stats foveation_gpu_time_log{"compositor foveation GPU time"};
 	wivrn_session & session;
