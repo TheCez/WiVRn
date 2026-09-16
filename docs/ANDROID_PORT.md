@@ -3046,6 +3046,113 @@ The desktop server's only audio backend is PipeWire (`server/audio/audio_pipewir
 
 **Not done yet**: microphone forwarding (headset mic → local OpenXR app's input). Unlike speaker capture, Android has no unprivileged equivalent to PipeWire's virtual-source trick — there's no public API for a normal app to register a system-wide virtual recording device that another app's `AudioRecord` would pick up; the privileged `AudioPolicy`/`MODIFY_AUDIO_ROUTING` mechanism (signature-level permission) is what real virtual-mic apps rely on, and isn't available to a normal installed app without root or system-app status. Being investigated as a follow-up, including whether the headset could instead pair as a real Bluetooth (LE Audio) peripheral to the phone, which would make both directions (speaker *and* mic) "just work" through the OS's own normal Bluetooth audio routing instead of needing either of these custom capture/injection mechanisms.
 
+## Milestone 19 (open) — microphone forwarding (headset mic → local OpenXR app): Shizuku unlocks the injector API, but it doesn't reach an unmodified app's plain MIC recording
+
+Follow-up to Milestone 18's "not done yet": WiVRn already receives headset mic
+audio server-side; the goal was getting a local OpenXR app (VRChat) to see it
+as if it were the phone's own microphone, the way PipeWire's virtual source
+does this on desktop. Android has no unprivileged equivalent — this milestone
+is the investigation of exactly how far the privileged path (`AudioPolicy` +
+`AudioMix` with `MIX_ROLE_INJECTOR`) can be pushed without root.
+
+**Confirmed: the injector API itself requires `MODIFY_AUDIO_ROUTING`, and
+that's real, not assumed.** A normal, unprivileged app's
+`AudioManager.registerAudioPolicy()` call actually succeeds and the mix
+genuinely registers at the native `AudioPolicyManager` level (confirmed via
+`dumpsys media.audio_policy` showing the real registered mix, `mix type:
+MIX_TYPE_RECORDERS`, `RULE_MATCH_UID` correctly set) — but
+`AudioPolicy.createAudioTrackSource()` (the call that actually hands back a
+usable injector `AudioTrack`) returns null. AOSP source
+(`AudioPolicy.java`'s `policyReadyToUse()`) shows why: it requires
+`MODIFY_AUDIO_ROUTING`, `CALL_AUDIO_INTERCEPTION`, or a MediaProjection
+*specifically on a loopback-**render** mix* — and `ROUTE_FLAG_RENDER` is
+flatly rejected by the framework on an injector (input-direction) mix
+(`IllegalArgumentException: Input device is not supported with
+ROUTE_FLAG_RENDER`, thrown live). So the MediaProjection exemption our
+speaker feature already uses is structurally inapplicable to injection —
+confirmed by the framework itself, not inferred.
+
+**Shizuku (no root) genuinely unlocks this.** `com.android.shell` (the
+identity shell/Shizuku code runs as) has `MODIFY_AUDIO_ROUTING` granted
+(`dumpsys package com.android.shell`) even though shell's own
+`<assign-permission>` entry in `/system/etc/permissions/platform.xml` is
+`INTERNET` only — the two are different mechanisms, easy to conflate. This
+device (Tab S7 FE, Android 16) has no root and no system-image access
+(`su: inaccessible or not found`, `ro.build.type=user`), so Shizuku's
+ADB-pairing-based start (no root needed) is the right mechanism, and it
+works: started live via the exact command from Shizuku's own "View
+command" button (`adb shell <path-to-app>/lib/arm64/libshizuku.so`,
+confirming this Shizuku version replaced the older external `start.sh`
+script with a bundled native binary, presumably to sidestep scoped-storage
+restrictions on writing to another app's external data dir).
+
+Running the same `AudioPolicy`/`AudioMix` construction via
+`adb shell app_process` (which runs as the same `shell` UID a Shizuku
+user-service would) confirmed live: `registerAudioPolicy()` returns 0 *and*
+`createAudioTrackSource()` returns a real, non-null `AudioTrack` — the
+exact call that fails for a normal app. Writing PCM into it works with no
+exception.
+
+**But the tone doesn't reach a separate app's plain `MIC` recording.**
+Tested with a genuinely separate app (a small standalone diagnostic,
+`micdemo`, its own UID, not sharing any code with the injector) running a
+completely ordinary `AudioRecord(MediaRecorder.AudioSource.MIC)`, both
+while backgrounded (RMS flatlined at 0 — a `App op ... missing, silencing
+record` log revealed this was just Android's normal background-mic-privacy
+restriction, unrelated to injection) and in the foreground (RMS/Goertzel-440Hz
+readings fluctuated in proportion to each other in ways consistent with
+ordinary room noise, not a discrete, stable injected tone).
+`AudioSource.REMOTE_SUBMIX` opened directly by that same normal app failed
+to initialize outright (`AudioRecord.getState() == STATE_UNINITIALIZED`),
+even while the injector's mix was actively registered and targeting that
+exact UID.
+
+**Root cause, confirmed from AOSP source, not assumed**:
+`AudioPolicyMixCollection::getInputMixForAttr()`
+(`services/audiopolicy/common/managerdefinitions/src/AudioPolicyMix.cpp`) —
+the function consulted during input-device selection before falling back to
+normal device selection — matches purely by **extracting an address tag
+from the recording app's own `audio_attributes_t` and comparing it to the
+mix's registered device address string**, plus checking `mMixType ==
+MIX_TYPE_RECORDERS`. It does not evaluate `RULE_MATCH_UID` (or any
+mix-registration criteria) at all in this function, and does not require or
+check the `audio_source_t` either. `RULE_MATCH_UID` is a *mix-registration*
+criterion; it does not cause an unrelated, untagged recording call from
+that UID to be automatically intercepted. In other words: a recording app
+has to *opt in* by tagging its own request with the exact remote-submix
+address our mix registered under — something only a cooperating (or
+modified) app would ever do. VRChat calling plain `AudioSource.MIC` never
+does this, and there is no UID-based override path in this specific
+function for us to exploit.
+
+**Practical implication**: no permission level — not `MODIFY_AUDIO_ROUTING`,
+not root — changes this, because it isn't a permission gap. It's that the
+selection function this project would need to hijack has no UID-based
+branch at all for the input direction. `RULE_MATCH_UID` genuinely works,
+just not for this: it's understood to govern which app's *playback* gets
+pulled into a mix on the render/capture (`MIX_ROLE_PLAYERS`) side (the same
+mechanism `AudioPlaybackCaptureConfiguration` already uses for this
+project's own working speaker-capture feature), not automatic interception
+of an arbitrary app's independent recording call.
+
+**Bluetooth LE Audio, investigated and ruled out as an alternative**: Quest
+added LE Audio in a 2025 update, but only as a Bluetooth **central**
+(pairs *to* headphone-type peripherals), the same role a phone plays.
+Nothing found suggests Quest can expose itself as a connectable Bluetooth
+audio *peripheral* that a phone could pair with and treat as "a headset" —
+Quest's OS reportedly even blocks standard A2DP output as of firmware v63.
+Two centrals don't have a way to treat each other as host/peripheral in the
+normal Bluetooth audio profile model. Not pursued further without a source
+suggesting otherwise.
+
+**Status**: an ultimate, fully-controlled experiment (fresh recorder app
+launched only after mix registration is verified via `dumpsys`, wrong-UID
+and no-injector control runs, WAV capture for offline verification, both
+`MIC` and `VOICE_COMMUNICATION` tested) was in progress to either confirm
+this conclusion beyond doubt or reveal a narrower working path, before this
+milestone was written up. See the next session's continuation for the
+result.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
