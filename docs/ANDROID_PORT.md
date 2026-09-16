@@ -2997,26 +2997,29 @@ configuration, or codec negotiation — the same general area as the earlier
 hardcoded-codec-name crash, Milestone 7). Needs a logcat capture with HEVC
 forced on to make progress.
 
-## Milestone 17 (open) — Galaxy Tab S7 FE and Galaxy S20 Ultra (Adreno 6xx-class GPUs): both run, but degraded — likely a horsepower ceiling, not a software bug
+## Milestone 17 (open) — Galaxy Note 20 Ultra (Adreno 6xx-class): runs VRChat, but really laggy
 
-Two more Adreno devices, both from the same older Adreno 6xx GPU generation:
+**Correction first**: "Galaxy Tab S7 FE" in earlier notes on this was the
+same physical device already covered in Milestones 8-13 as "the SM-X810
+tablet" — one device, not two. Its consumer name is Galaxy Tab S7 FE
+(SM-X810, Snapdragon 778G / Adreno 642L). So its "VRChat runs but is
+visibly glitchy" symptom is almost certainly just Milestone 10's
+already-diagnosed right-eye stereo-fusion seam (a Turnip/Mesa driver bug,
+not something fixable here) showing up again, described informally —
+not a new, separate mystery. Nothing new to investigate there; see
+Milestone 10/10-follow-up for the actual root cause.
 
-- **Galaxy Tab S7 FE**: requires Turnip (same class of gap as the SM-X810
-  tablet, Milestones 8-12 — stock driver missing something Turnip supplies).
-  The reference app and Somar run properly. VRChat runs but is visibly
-  glitchy.
-- **Galaxy S20 Ultra**: runs VRChat successfully (unlike every device in
-  Milestones 11/14) — rendering works, but performance is really laggy.
-
-Both devices share the same GPU generation (Adreno 6xx series) — the
-working hypothesis is that this generation is RAM- and/or GPU-throughput
-constrained for what VRChat + this streaming pipeline demands, rather than
-a driver or code bug like Milestones 10-14. Consistent with VRChat (the
-heaviest app tested) being the one that struggles while the lighter
-reference app and Somar run cleanly on the same hardware. Not yet confirmed
-with profiling data — next step if pursued would be checking actual
-memory pressure/GPU frame time on-device during a VRChat session on either
-device.
+**The real new data point**: Galaxy Note 20 Ultra (Adreno 6xx-class,
+distinct from the SM-X810/Tab S7 FE above) runs VRChat successfully —
+rendering is correct, no seam, no crash — but performance is really laggy.
+Unlike the SM-X810's seam, this isn't yet explained by a known root cause.
+Since the SM-X810's own degradation turned out to have a specific,
+already-diagnosed driver-bug cause rather than a general hardware
+ceiling, the "older Adreno 6xx generation is RAM/GPU-throughput
+constrained" theory floated earlier is weaker than it looked — the two
+devices' symptoms likely have different causes, not one shared one. Still
+open: not yet profiled, no memory-pressure/GPU-frame-time data captured on
+the Note 20 Ultra.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
