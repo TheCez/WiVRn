@@ -2920,6 +2920,47 @@ blocked upstream in Mesa. **This branch does not fix the tablet** — Turnip
 (`feat/adrenotools-turnip`, live with the known right-eye seam) remains the
 only working path on this hardware for now.
 
+## Milestone 13 (new device, confirms the isolation) — Samsung Galaxy Z Fold 7 (Snapdragon 8 Elite / Adreno 830): stream works perfectly, no seam, no crash
+
+Tested the same server build (this branch,
+`experiment/vulkan-sync2-compat-layer`) on a Galaxy Z Fold 7 instead of the
+Adreno 642L tablet. Result: streaming works cleanly — no right-eye seam
+(Milestone 10/10-follow-up), no `vkQueueSubmit` segfault (Milestone 12). This
+device's stock Adreno 830 driver supports `VK_KHR_synchronization2` natively,
+so it never needs Turnip or the sync2 compat layer in the first place —
+removing both suspected fault paths at once.
+
+This is the confirmation Milestone 10's follow-up predicted: the right-eye
+seam and the sync2-crash are properties of the Adreno 642L tablet's
+particular driver stack (forced onto Turnip for the seam bug; stock driver
+segfaults on translated `VkTimelineSemaphoreSubmitInfo` submits for the crash
+bug), not of WiVRn's architecture, this project's Android port, or Adreno
+GPUs in general. A newer SoC/driver with native synchronization2 support
+sidesteps both issues entirely. **Not a fix** — the SM-X810 tablet remains
+blocked upstream in Turnip/Mesa (seam) and the stock driver (segfault) — but
+it confirms nothing else in this codebase needs to change for that hardware
+class; the ceiling is the vendor driver, not this repo.
+
+## Milestone 14 (new device, open) — Samsung Galaxy S26 Ultra: client connects, nothing streams once the OpenXR app launches
+
+Reported, not yet investigated — no device/logs captured this session (only
+the Quest 1 client was connected, no server-side phone). Symptom: the client
+successfully connects to the server (handshake/control channel over
+TCP/9757 completes), but once the target OpenXR app is launched, no video
+ever arrives — distinct from Milestone 10-13's corruption/crash symptoms,
+this is a *silent* failure with no frame at all.
+
+**Next steps when the device is available**: `logcat -c` before launch, then
+`logcat -d` after, on both the phone (server) and headset (client) — check
+for encoder creation failure (`video_encoder_mediacodec.cpp`, same class of
+bug as the earlier HEVC hardcoded-codec crash, Milestone 7 area), whether
+`xrCreateSwapchain`/`xrBeginFrame` are even reached, and whether any frames
+leave the server at all (`WIVRN_DUMP_VIDEO`, see this doc's capture section
+above). Silent-no-stream (vs. a crash or visible corruption) suggests the
+failure is earlier in the pipeline than Milestones 10-13 — likely encoder
+init/codec negotiation given this is a new Snapdragon generation, not yet
+confirmed.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 
