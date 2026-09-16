@@ -64,6 +64,41 @@ cmake --build build-dashboard
 
 See [Server](#server-pc) for the server compile options.
 
+# Server (Android phone)
+
+Runs the WiVRn server directly on an Android phone instead of a PC. Shares the same [build dependencies](#build-dependencies) and [Android environment](#android-environment) setup as the [client](#client-headset) below -- both build from this repository's root `CMakeLists.txt`, just with different CMake arguments (`WIVRN_BUILD_SERVER` instead of `WIVRN_BUILD_CLIENT`).
+
+**Known limitation, not yet fixed:** unlike the client, `server-app/build.gradle` does not currently resolve Vulkan-Headers/glslangValidator/spirv-tools from the system packages listed under [build dependencies](#build-dependencies) -- it hardcodes CMake `-D` overrides pointing at a `tools/` directory expected as a sibling of this checkout (`vulkan-headers/include`, `glslang/extracted/usr/bin/glslangValidator`, `spirv-tools/extracted/usr/bin`). You need to populate that layout yourself before `assembleDebug` will get past CMake configure:
+
+```
+<parent-of-this-checkout>/
+├── wivrn/                       (this repository)
+└── tools/
+    ├── vulkan-headers/include/  (Vulkan-Headers' include/ directory)
+    ├── glslang/extracted/usr/bin/glslangValidator
+    └── spirv-tools/extracted/usr/bin/  (spirv-opt, etc.)
+```
+
+A real fix (making `build.gradle` fall back to the system packages the way the client does) is intentionally left for a follow-up rather than bundled into this PR.
+
+#### Server build
+From the main directory.
+```bash
+export ANDROID_HOME=~/Android
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk/
+
+./gradlew :server-app:assembleDebug
+```
+
+Outputs will be in `server-app/build/outputs/apk/debug/server-app-debug.apk`. This is a debug build (auto-signed with the default debug keystore) -- see [Apk signing](#apk-signing) below if you need a release build.
+
+#### Install and run
+Same `adb` setup as the [client](#install-apk-with-adb) below.
+```bash
+adb install server-app/build/outputs/apk/debug/server-app-debug.apk
+adb shell monkey -p org.meumeu.wivrn.server -c android.intent.category.LAUNCHER 1
+```
+
 # Client (headset)
 
 #### Build dependencies

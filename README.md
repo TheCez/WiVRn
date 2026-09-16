@@ -132,7 +132,7 @@ The same overrides should work for other VR applications distributed as Flatpaks
 
 # Building
 
-See [building](docs/building.md) for building the [dashboard](docs/building.md#dashboard), [server (PC)](docs/building.md#server-pc), and [client (headset)](docs/building.md#client-headset)
+See [building](docs/building.md) for building the [dashboard](docs/building.md#dashboard), [server (PC)](docs/building.md#server-pc), [client (headset)](docs/building.md#client-headset), and [server (Android phone)](docs/building.md#server-android-phone)
 
 
 # Configuration
