@@ -48,10 +48,8 @@ set(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3   ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS    ON)
-# Steam Frame's OpenXR interaction profile -- see docs/ANDROID_PORT.md's
-# controller-support milestone. VRChat's Android build only ever suggests
-# bindings for this profile and never falls back to plain Oculus Touch, so
-# without it VRChat's controllers are entirely unbound.
+# VRChat's Android build only suggests bindings for Steam Frame's profile
+# (never falls back to Oculus Touch), so without this its controllers are unbound.
 set(XRT_FEATURE_OPENXR_INTERACTION_VALVE_FRAME_CONTROLLER ON)
 set(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS    ON)
 set(XRT_FEATURE_OPENXR_LAYER_DEPTH              OFF)
@@ -95,9 +93,7 @@ set(XRT_OXR_RUNTIME_SUFFIX        "wivrn"          CACHE STRING "OpenXR client l
 
 FetchContent_MakeAvailable(monado)
 
-# Rootless custom Vulkan driver loading (adrenotools/Turnip) -- Android
-# only, irrelevant on desktop (see top-level CMakeLists.txt's own comment
-# on this FetchContent_Declare).
+# Rootless custom Vulkan driver loading (adrenotools/Turnip) -- Android only.
 if (ANDROID)
 	FetchContent_MakeAvailable(adrenotools)
 endif()
@@ -149,32 +145,18 @@ if (WIVRN_BUILD_SERVER)
 			utils/frame_timing_stats.cpp
 		)
 
-	# ANDROID: build wivrn-server as a plain executable by default (matches
-	# every fix/verification so far -- push it with adb and run it directly).
-	# Set WIVRN_ANDROID_JNI=ON to build it as a shared library instead, for
-	# loading via System.loadLibrary() from the Android Service wrapper (see
-	# android/wivrn_server_jni.cpp) -- JNI can only load a .so, not an
-	# executable. Both variants share the exact same _wivrn_server_sources;
-	# only the target type and the entry-point file (stub main vs JNI) differ.
+	# WIVRN_ANDROID_JNI builds a shared library instead of an executable, for
+	# System.loadLibrary() from the Service wrapper (android/wivrn_server_jni.cpp).
 	if(ANDROID AND WIVRN_ANDROID_JNI)
 		add_library(wivrn-server SHARED ${_wivrn_server_sources})
 	else()
 		add_executable(wivrn-server ${_wivrn_server_sources})
 	endif()
 
-	# main.cpp is the desktop entry point: it drives the D-Bus dashboard IPC
-	# (GDBus/glib/libnotify) directly, and start_systemd_unit.cpp,
-	# avahi_publisher.cpp and sleep_inhibitor.cpp exist solely to support it
-	# (each of the three has no includer anywhere else in this tree). None of
-	# that has an Android equivalent, so the whole cluster is swapped for a
-	# placeholder entry point (or the real JNI entry point, with
-	# WIVRN_ANDROID_JNI=ON) on Android rather than #ifdef'd piecemeal.
-	# start_application.cpp (fork+exec of a desktop app, glib-based) is only
-	# used by main.cpp and start_systemd_unit.cpp, so it goes in the same
-	# bucket. wivrn_uinput.cpp opens /dev/uinput directly, which an
-	# unprivileged Android app cannot do, so it gets its own no-op
-	# implementation -- unlike the others, wivrn_session.h holds a real
-	# std::optional<wivrn_uinput> member, so it can't simply be dropped.
+	# main.cpp and its desktop-only support files (D-Bus dashboard IPC,
+	# avahi, sleep_inhibitor, start_application/systemd_unit) have no Android
+	# equivalent. wivrn_uinput.cpp opens /dev/uinput directly, which an
+	# unprivileged Android app can't do, so it gets a no-op implementation instead.
 	if(ANDROID)
 		target_sources(wivrn-server PRIVATE
 				driver/wivrn_uinput_android.cpp
@@ -186,42 +168,22 @@ if (WIVRN_BUILD_SERVER)
 		else()
 			target_sources(wivrn-server PRIVATE android/wivrn_server_android_stub_main.cpp)
 		endif()
-		# std::jthread/std::stop_token are used unconditionally throughout
-		# this codebase. The Android NDK's libc++ implements them, but only
-		# behind -fexperimental-library (checked against NDK r28b/Clang 19).
-		# std::chrono::zoned_time and std::ranges::enumerate_view are used
-		# behind their own feature-test guards/polyfill (see
-		# driver/configuration.cpp and utils/enumerate_polyfill.h) since
-		# zoned_time needs an IANA timezone database this libc++ wasn't
-		# built with, and enumerate_view isn't implemented at all yet.
+		# NDK libc++ only has std::jthread/stop_token behind this flag
+		# (checked against NDK r28b/Clang 19). zoned_time/enumerate_view
+		# aren't available at all -- see driver/configuration.cpp and
+		# utils/enumerate_polyfill.h.
 		target_compile_options(wivrn-server PRIVATE -fexperimental-library)
-		# Without this, vulkan_core.h never declares the Android-platform
-		# Vulkan extensions/structs at all (VK_ANDROID_external_memory_
-		# android_hardware_buffer's own extension-name macro included) --
-		# matches client/CMakeLists.txt's own existing
-		# -DVK_USE_PLATFORM_ANDROID_KHR exactly (client already needed
-		# this; wivrn-server never had a reason to until a local OpenXR
-		# app tried to import an AHardwareBuffer-backed swapchain image,
-		# which crashed instead -- vkGetAndroidHardwareBufferPropertiesANDROID
-		# resolved to a real symbol name either way (Monado declares its
-		# own PFN typedef regardless of this macro) but the *extension*
-		# was never actually requested at device creation, so the driver
-		# never populated that function pointer -- null pointer call, not
-		# a missing symbol at link time, which is why it wasn't caught
-		# earlier).
+		# Without this, vulkan_core.h doesn't declare the Android platform
+		# Vulkan extensions/structs at all; the AHardwareBuffer import
+		# extension then silently never gets requested at device creation,
+		# so the driver never populates its function pointer -- a null-pointer
+		# call at the callsite, not a link error, which is why this was missed.
 		target_compile_definitions(wivrn-server PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
 
-		# Rootless custom Vulkan driver loading (adrenotools/Turnip): see
-		# server/utils/vulkan_loader.cpp's own comment for the mechanism.
-		# VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0 is required to unlock
-		# vk::raii::Context's PFN_vkGetInstanceProcAddr-taking constructor
-		# (the default, =1, only exposes a parameterless constructor that
-		# uses vulkan-hpp's own internal system-libvulkan.so loader, which
-		# can't be redirected to a custom driver) -- this makes the
-		# default (no custom driver configured) path explicit instead of
-		# implicit, but is not a behavior change for it: vulkan_loader.cpp's
-		# own default path does exactly what vulkan-hpp's internal loader
-		# already did (dlopen "libvulkan.so", dlsym "vkGetInstanceProcAddr").
+		# Required to unlock vk::raii::Context's PFN_vkGetInstanceProcAddr
+		# constructor -- the default only exposes vulkan-hpp's own internal
+		# loader, which can't be redirected to a custom driver (adrenotools/Turnip,
+		# see utils/vulkan_loader.cpp).
 		target_compile_definitions(wivrn-server PRIVATE VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
 		target_link_libraries(wivrn-server PRIVATE adrenotools)
 	else()

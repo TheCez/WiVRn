@@ -1,27 +1,12 @@
-// Android-phone-as-server app module. Packages libwivrn-server.so
-// (server/android/wivrn_server_jni.cpp) and its Service wrapper
-// (server/android/java/WivrnServerService.java) into an installable APK.
-// See docs/ANDROID_PORT.md for the full story -- this is a companion to
-// the root project (the existing WiVRn Quest client), not a replacement
-// for it; both build from the same top-level CMakeLists.txt with
-// different -D arguments (WIVRN_BUILD_CLIENT vs WIVRN_BUILD_SERVER).
-//
-// apply plugin (not `plugins {}`) matches the root build.gradle's style,
-// reusing its buildscript { classpath 'com.android.tools.build:gradle' }
-// and allprojects { repositories ... } -- both declared once, build-wide,
-// at the root, so they don't need repeating here.
+// Android-phone-as-server app module: packages libwivrn-server.so and its
+// Service wrapper into an installable APK. Companion to the root project
+// (the existing Quest client), not a replacement -- both build from the
+// same top-level CMakeLists.txt with different -D arguments.
 apply plugin: 'com.android.application'
 
-// Toolchain notes (see docs/ANDROID_PORT.md for the full rationale):
-// - ndkVersion here matches the root project's exactly (29.0.14206865),
-//   so both modules resolve the same real, SDK-managed NDK via
-//   local.properties' sdk.dir -- no custom NDK path needed in Gradle
-//   arguments, unlike the raw `cmake` invocations used earlier in this
-//   project's history (those predate this SDK being bootstrapped).
-// - Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11 are still
-//   not resolvable on this host through any Gradle/AGP mechanism, so the
-//   same -D overrides from the manual CMake commands are passed through
-//   here as externalNativeBuild.cmake.arguments below.
+// Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11 aren't
+// resolvable via Gradle/AGP on this toolchain, so they're passed as
+// explicit CMake -D overrides below instead.
 def toolsDir = "${rootDir}/../tools"
 
 android {
@@ -30,15 +15,9 @@ android {
 
     defaultConfig {
         applicationId "org.meumeu.wivrn.server"
-        // Was 30 (matching pthread_cond_clockwait's bionic floor for
-        // std::jthread/std::stop_token). Raised to 33: that's the first
-        // NDK API level whose libvulkan.so stub statically exports the
-        // Vulkan 1.3 core symbols VMA now needs (vkGetDeviceBufferMemoryRequirements
-        // / vkGetDeviceImageMemoryRequirements, required once VMA_VULKAN_VERSION
-        // was bumped to 1003000 -- see common/CMakeLists.txt) -- confirmed via
-        // `nm -D` across the NDK's per-API-level stubs, absent through API 32,
-        // present from 33. No realistic phone-as-VR-server target runs anything
-        // this old anyway.
+        // 33 is the first NDK API level whose libvulkan.so stub exports the
+        // Vulkan 1.3 symbols VMA needs (vkGetDevice{Buffer,Image}MemoryRequirements) --
+        // confirmed via `nm -D`, absent through 32.
         minSdkVersion 33
         compileSdkVersion 34
         targetSdkVersion 34
@@ -76,60 +55,21 @@ android {
                     '-DWIVRN_USE_PIPEWIRE=OFF',
                     '-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF',
                     '-DWIVRN_FEATURE_SOLARXR=OFF',
-                    // Re-enabled: spirv-opt ships in the NDK's shader-tools dir
-                    // (CMAKE_PROGRAM_PATH below) -- OFF was likely just a
-                    // leftover from Milestone 1 when no path override existed
-                    // for it yet (only glslangValidator was overridden then).
+                    // spirv-opt ships in the NDK's shader-tools dir (CMAKE_PROGRAM_PATH below).
                     '-DWIVRN_OPTIMIZE_SHADERS=ON',
                     '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin',
-                    // Reuse an already-populated FetchContent deps cache --
-                    // this sandbox has no outbound network, and any change
-                    // to these cmake arguments makes AGP hash a brand new,
-                    // empty .cxx build dir that would otherwise try (and
-                    // fail) to re-download boost/monado/openssl from scratch.
-                    // NOTE: pinned to this specific hash's _deps on purpose --
-                    // a copy at tools/wivrn-fetchcontent-cache was tried as a
-                    // stable alternative, but FetchContent's own subbuild
-                    // stamp files bake in absolute paths, so copying it
-                    // elsewhere makes CMake think it needs to re-populate.
-                    // Leave this pointed at a real, previously-built .cxx
-                    // hash dir.
+                    // FIXME: pinned to a specific already-populated local build-cache
+                    // path for this offline dev sandbox. Remove/parameterize before
+                    // building anywhere else -- it will not resolve on another machine or CI.
                     '-DFETCHCONTENT_BASE_DIR=' + "${projectDir}/.cxx/Debug/3k1y4v6y/arm64-v8a/_deps",
-                    // Makes the vendored Monado's own targets/openxr build
-                    // (openxr_wivrn, below) bind its loader .so to *this*
-                    // app's package instead of Monado's own default
-                    // (org.freedesktop.monado.openxr_runtime.out_of_process)
-                    // -- see Client.java's own javadoc ("There's a define in
-                    // xrt_config_android.h to use for this") and
-                    // MonadoIpcService/docs/ANDROID_PORT.md for the rest of
-                    // the OpenXR runtime broker story. Already-set
-                    // XRT_FEATURE_SERVICE=ON (server/CMakeLists.txt) makes
-                    // Monado build this target as a thin ipc_client
-                    // (XRT_FEATURE_IPC_CLIENT auto-computed ON) rather than a
-                    // second full standalone runtime -- exactly what's
-                    // needed, for free, not something added here.
+                    // Binds Monado's targets/openxr build (openxr_wivrn) to this
+                    // app's package instead of Monado's default out-of-process
+                    // runtime package (see Client.java).
                     '-DXRT_ANDROID_PACKAGE=org.meumeu.wivrn.server',
                 ]
-                // openxr_wivrn: Monado's own targets/openxr, always defined
-                // by FetchContent_MakeAvailable(monado) (server/CMakeLists.txt
-                // sets XRT_OXR_RUNTIME_SUFFIX="wivrn", giving this exact
-                // target name) but never built before now since nothing
-                // asked ninja for it -- CMake configures every defined
-                // target regardless of this list, only *building* is scoped
-                // to what's named here.
-                //
-                // hook_impl/main_hook/file_redirect_hook/gsl_alloc_hook:
-                // adrenotools' (Turnip custom Vulkan driver loading, see
-                // server/utils/vulkan_loader.cpp) own shared libraries --
-                // it dlopen()s these by exact filename
-                // ("libmain_hook.so" etc.) from this app's own
-                // nativeLibraryDir at runtime, so they need to actually be
-                // packaged into the APK the same way libwivrn-server.so
-                // and libopenxr_wivrn.so already are (this `targets` list
-                // is what makes AGP do that for a CMake SHARED target --
-                // adrenotools' own default-linkage `adrenotools` library
-                // is STATIC, so it's just a link dependency of
-                // wivrn-server and doesn't need to be listed here).
+                // hook_impl/main_hook/file_redirect_hook/gsl_alloc_hook: adrenotools'
+                // shared libraries, dlopen()'d by filename from this app's own
+                // nativeLibraryDir at runtime, so they must be packaged into the APK.
                 targets 'wivrn-server', 'openxr_wivrn', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook'
                 abiFilters 'arm64-v8a'
             }
@@ -151,30 +91,18 @@ android {
             aidl.srcDirs = ['../server/android/aidl']
             manifest.srcFile '../server/android/AndroidManifest.xml'
         }
-        // Debug-only: bundles the Khronos Vulkan validation layer into the
-        // APK's own native lib dir (<abi>/libVkLayer_khronos_validation.so),
-        // one of the paths the Android Vulkan loader already searches for
-        // every app (confirmed live via `adb shell setprop debug.xrt.vulkan
-        // 1`-style loader tracing: "searching for layers in
-        // '.../lib/arm64'"). This is what actually makes
-        // WIVRN_VK_VALIDATION (wivrn_vk_bundle.cpp) work -- Android's
-        // system-wide "Enable GPU debug layers" developer option / adb
-        // settings (enable_gpu_debug_layers/gpu_debug_app/gpu_debug_layers)
-        // do NOT work on this device/OS build: the loader's own debug trace
-        // never once searches /data/local/tmp/vulkan/debug, confirmed live,
-        // and enabling that mechanism process-wide also crashes the app's
-        // own hardware-accelerated UI renderer (libhwui) before the
-        // compositor's Vulkan instance is ever reached. Silently
-        // contributes nothing if the directory is absent (not fetched by
-        // this checkout) -- see docs/ANDROID_PORT.md.
+        // Debug-only: bundles the Khronos Vulkan validation layer into the APK's
+        // own native lib dir, one of the paths the Android Vulkan loader searches
+        // for every app -- what makes WIVRN_VK_VALIDATION (wivrn_vk_bundle.cpp)
+        // work. Android's system-wide GPU debug layer setting doesn't work on
+        // this device/OS build. No-op if the directory is absent.
         debug {
             jniLibs.srcDirs += ["${toolsDir}/vulkan-validation/android-binaries-1.4.357.0"]
         }
     }
 
     buildFeatures {
-        // Off by default since AGP 8 -- needed for IMonado.aidl (see
-        // MonadoIpcService/docs/ANDROID_PORT.md).
+        // Off by default since AGP 8 -- needed for IMonado.aidl.
         aidl true
     }
 
@@ -201,9 +129,7 @@ android {
 }
 
 dependencies {
-    // Needed by the vendored-verbatim Monado Java helper classes under
-    // server/android/java/org/freedesktop/monado/{ipc,auxiliary} (@Keep,
-    // @NonNull, @RequiresApi, etc.) -- see docs/ANDROID_PORT.md's OpenXR
-    // runtime broker section for why those exist in this module at all.
+    // Needed by the vendored Monado Java helper classes under
+    // server/android/java/org/freedesktop/monado/{ipc,auxiliary} (@Keep, @NonNull, etc.)
     implementation 'androidx.annotation:annotation:1.7.1'
 }

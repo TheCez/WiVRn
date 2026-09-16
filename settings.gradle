@@ -1,12 +1,6 @@
 rootProject.name = 'WiVRn'
 
-// The root project itself is the existing WiVRn Quest client app (its
-// build.gradle applies com.android.application directly at the root --
-// unchanged, not touched by this module addition).
-//
-// server-app is the new Android-phone-as-server module: packages
-// libwivrn-server.so (server/android/wivrn_server_jni.cpp, built via
-// -DWIVRN_ANDROID_JNI=ON) and the Service wrapper
-// (server/android/java/WivrnServerService.java) into its own installable
-// APK. See docs/ANDROID_PORT.md.
+// Root project is the existing Quest client app, unchanged. server-app is
+// the new Android-phone-as-server module (libwivrn-server.so + a Service
+// wrapper) packaged as its own installable APK.
 include ':server-app'

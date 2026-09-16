@@ -59,11 +59,7 @@ option(WIVRN_USE_NVENC "Enable nvenc (Nvidia) hardware encoder" ON)
 option(WIVRN_USE_VAAPI "Enable vaapi (AMD/Intel) hardware encoder" ON)
 option(WIVRN_USE_VULKAN_ENCODE "Enable vulkan video encoder" ON)
 option(WIVRN_USE_X264 "Enable x264 software encoder" ON)
-# Android's own hardware video encoder (AMediaCodec/NdkMediaCodec), server-side
-# only -- the other four backends above are all desktop-only APIs (NVENC,
-# VAAPI/libav, Vulkan video, x264 the CPU fallback), none usable on Android;
-# see docs/ANDROID_PORT.md for why. Default ON for Android, OFF elsewhere --
-# there's no such library to link against off-Android.
+# Android's hardware encoder; the other four backends above are desktop-only APIs.
 option(WIVRN_USE_MEDIACODEC "Enable Android MediaCodec hardware encoder" ${ANDROID})
 
 option(WIVRN_USE_PERFETTO "Enable Perfetto tracing via the Perfetto SDK (server only)" OFF)
@@ -136,10 +132,7 @@ if (WIVRN_BUILD_SERVER)
         message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
     endif()
 
-    # On Android, none of NVENC/VAAPI/X264/Vulkan-encode are wired up yet
-    # (no Vulkan Video encode support confirmed on the reference device, and
-    # the others are desktop-only APIs) -- encoder_settings.cpp already
-    # falls back to the always-built "raw" encoder in that case.
+    # Android has none of these; encoder_settings.cpp falls back to MediaCodec there.
     if (NOT ANDROID AND NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
         message(FATAL_ERROR "No encoder selected, use at least one of WIVRN_USE_NVENC, WIVRN_USE_VAAPI, WIVRN_USE_VULKAN_ENCODE or WIVRN_USE_X264")
     endif()
@@ -161,9 +154,7 @@ if (WIVRN_BUILD_SERVER)
     find_package(nlohmann_json REQUIRED)
     find_package(CLI11 REQUIRED)
 
-    # Avahi (mDNS publish) and the D-Bus dashboard IPC (glib2, libnotify) are
-    # desktop-only; server/CMakeLists.txt excludes their only callers
-    # (avahi_publisher.cpp, main.cpp) from the Android build.
+    # Avahi (mDNS publish) and the D-Bus dashboard IPC are desktop-only.
     if (NOT ANDROID)
         pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client avahi-glib)
         pkg_check_modules(glib2 REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2.0)
@@ -225,10 +216,7 @@ if (WIVRN_BUILD_CLIENT AND NOT ANDROID)
     endif()
 endif()
 
-# native_app_glue is only needed by the client (a NativeActivity app) --
-# server/CMakeLists.txt's wivrn-server is a plain executable and doesn't
-# link against it. AndroidNdkModules.cmake no longer ships with CMake, so
-# only pull it in when it's actually needed.
+# native_app_glue is only needed by the client (a NativeActivity app), not the server.
 if(ANDROID AND WIVRN_BUILD_CLIENT)
     set(ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
     set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK_ROOT})
@@ -298,13 +286,8 @@ FetchContent_Declare(monado
     EXCLUDE_FROM_ALL
 )
 
-# Android-only (server/CMakeLists.txt only calls FetchContent_MakeAvailable
-# on this if(ANDROID)): rootless custom Vulkan driver loading (Turnip on
-# Adreno), see docs/ANDROID_PORT.md's adrenotools/Turnip milestone. Declared
-# unconditionally here (matches monado's own declare above -- registering a
-# dependency is free, only FetchContent_MakeAvailable actually fetches/builds
-# it), gated at the actual fetch site instead since desktop builds don't need
-# this at all.
+# Rootless custom Vulkan driver loading (Turnip on Adreno), Android-only --
+# fetched only if(ANDROID) in server/CMakeLists.txt; declaring it here is free.
 file(GLOB ADRENOTOOLS_PATCHES CONFIGURE_DEPENDS patches/adrenotools/*)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS adrenotools-rev)
 file(STRINGS adrenotools-rev ADRENOTOOLS_REV)
