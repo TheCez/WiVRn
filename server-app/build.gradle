@@ -130,7 +130,14 @@ android {
                 // adrenotools' own default-linkage `adrenotools` library
                 // is STATIC, so it's just a link dependency of
                 // wivrn-server and doesn't need to be listed here).
-                targets 'wivrn-server', 'openxr_wivrn', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook'
+                // VkLayer_khronos_synchronization2 is the same story but for
+                // Android's own Vulkan loader instead of adrenotools: a
+                // non-debuggable app's Vulkan layers must live in its own
+                // native library directory (libVkLayer_*.so), discovered by
+                // name and enabled explicitly via vkCreateInstance's
+                // ppEnabledLayerNames (see wivrn_vk_bundle.cpp) -- no root,
+                // no system layer install needed.
+                targets 'wivrn-server', 'openxr_wivrn', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook', 'VkLayer_khronos_synchronization2'
                 abiFilters 'arm64-v8a'
             }
         }

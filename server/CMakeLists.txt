@@ -102,6 +102,16 @@ if (ANDROID)
 	FetchContent_MakeAvailable(adrenotools)
 endif()
 
+# VK_LAYER_KHRONOS_synchronization2 -- Android only (see top-level
+# CMakeLists.txt's own comment). BUILD_TESTS off for all three (we only
+# need the layer's own shared library, not its or its dependencies' test
+# suites); WSI options are irrelevant on Android already (Vulkan-ExtensionLayer's
+# own CMakeLists.txt excludes them there).
+if (ANDROID)
+	set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+	FetchContent_MakeAvailable(vulkan_extensionlayer)
+endif()
+
 if (WIVRN_BUILD_SERVER)
 	# Shared between both target types below.
 	set(_wivrn_server_sources

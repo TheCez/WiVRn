@@ -2819,6 +2819,107 @@ session. This looks like a VRChat/Unity-on-Xclipse compatibility problem
 specific to VRChat's own rendering, not something fixable by changing our
 Vulkan driver — no proprietary or open driver swap changed the outcome.
 
+## Milestone 12 (Adreno tablet, blocked upstream) — VK_LAYER_KHRONOS_synchronization2 gets past the original blocker, then hits a second, separate stock-driver bug
+
+Prompted by Milestone 10's conclusion that the right-eye seam is a Turnip/Mesa
+bug, not ours: since Turnip is *only* needed on this tablet because the stock
+Adreno driver lacks `VK_KHR_synchronization2` (the original Milestone 10
+blocker, `GPU does not support Vulkan synchronization2 feature`), running on
+the stock driver instead (mature, no known AHardwareBuffer-array-layer bug)
+would sidestep Turnip entirely — *if* the missing extension can be supplied
+some other way.
+
+**The fix attempted**: `VK_LAYER_KHRONOS_synchronization2`
+(KhronosGroup/Vulkan-ExtensionLayer) is a real, official, portable
+implementation of `VK_KHR_synchronization2` for drivers that lack it
+natively — pure API-ergonomics translation (submit2/barrier2/etc. down to
+the classic Vulkan 1.0/1.1 primitives), no new hardware capability required.
+Android has a real, no-root mechanism for exactly this: a non-debuggable app
+can bundle a layer's `.so` directly in its own native library directory
+(`libVkLayer_*.so` naming) and enable it explicitly via `vkCreateInstance`'s
+`ppEnabledLayerNames` — confirmed via Android's own NDK docs, no system
+install or rooting needed.
+
+**Implementation** (this work lives on `experiment/vulkan-sync2-compat-layer`,
+branched from `feat/adrenotools-turnip`, not merged into it — it's a
+sibling alternative to Turnip loading, and ultimately blocked, see below):
+- Vendored `Vulkan-Headers` + `Vulkan-Utility-Libraries` + `Vulkan-ExtensionLayer`
+  (top-level `CMakeLists.txt`, Android-only fetch site in `server/CMakeLists.txt`,
+  all three pinned to `vulkan-sdk-1.4.328.1` — matching the Vulkan header
+  version already vendored at `tools/vulkan-headers` (`VK_HEADER_VERSION 328`),
+  not the newest available tag. This matters: `Vulkan-Headers`' own
+  `add_library(Vulkan::Headers ALIAS ...)` collides with a target of the same
+  name CMake's own bundled `FindVulkan.cmake` module already creates
+  elsewhere in this build (both guard with `if (NOT TARGET Vulkan::Headers)`
+  as of CMake 3.24+, so whichever runs first silently wins) — a version
+  mismatch between the two would then silently compile
+  `Vulkan-Utility-Libraries` (pinned to the newer tag) against the *other*,
+  older header set, which really did happen once during this work
+  (`unknown type name 'VkPhysicalDeviceShaderAbortFeaturesKHR'`) before the
+  tags were aligned. `patches/vulkan-headers/0001-...patch` adds that guard
+  (upstream doesn't have it) to fix the actual collision, once versions were
+  already aligned.
+- `server-app/build.gradle`: added `VkLayer_khronos_synchronization2` to the
+  CMake `targets` list, same mechanism as adrenotools' hook libraries.
+- `server/utils/wivrn_vk_bundle.cpp`: requests the layer at instance creation
+  (mirrors the existing `VK_LAYER_KHRONOS_validation` pattern exactly — query
+  `enumerateInstanceLayerProperties()`, push the name if present, no-op
+  elsewhere since the layer isn't bundled on desktop). Requesting it
+  unconditionally is safe: without `VK_SYNCHRONIZATION2_FORCE_ENABLE` set (not
+  set here), the layer is a no-op passthrough on any driver that already has
+  native synchronization2 (Pixel, S22).
+- `server/utils/wivrn_vk_bundle.{h,cpp}`: the synchronization2 *feature*
+  query/enable needed a real fix, not just the extension: the existing code
+  unconditionally chained `vk::PhysicalDeviceVulkan13Features` (the Vulkan
+  1.3 core aggregate struct) to check/enable `synchronization2` — invalid on
+  a device reporting apiVersion 1.1 (this tablet's stock driver), which never
+  populates that struct regardless of what layers are active. Added
+  `vk::PhysicalDeviceSynchronization2FeaturesKHR` (the original, discrete
+  per-extension struct, which the layer *does* correctly answer) as a
+  fallback query when the 1.3 struct comes back false, with
+  `vk::StructureChain::unlink<T>()` used to keep only one of the two structs
+  in the actual `vkCreateDevice` pNext chain (chaining both, even
+  harmlessly, violates `VUID-VkDeviceCreateInfo-pNext-06532`).
+
+**Result, live on the tablet**: real progress, then a real, different wall.
+With no custom driver configured (stock Adreno driver) the server no longer
+hard-fails at the synchronization2 check — logcat confirms
+`added global layer 'VK_LAYER_KHRONOS_synchronization2' ... Loaded layer
+VK_LAYER_KHRONOS_synchronization2`, encoders get created, the server reaches
+its normal idle state. VRChat, connected through it, gets all the way to
+`xrCreateSwapchain` (further than the original blocker ever allowed). Then
+the **server itself segfaults** — `SIGSEGV`/`SEGV_MAPERR`, fault addr
+`0x28`, inside `qglinternal::vkQueueSubmit` in the stock driver
+(`/vendor/lib64/hw/vulkan.adreno.so`), reached via the layer's translation
+of `wivrn::compositor::layer_commit()`'s per-frame `vkQueueSubmit2` call
+(`compositor.cpp`'s frame-submit site, which signals a real timeline
+semaphore — `vk::SemaphoreSubmitInfo{.value = ++sem_value, ...}`) down to a
+classic `vkQueueSubmit` with a chained `VkTimelineSemaphoreSubmitInfo`.
+
+A first hypothesis — that the layer unconditionally chains
+`VkTimelineSemaphoreSubmitInfo`/`VkDeviceGroupSubmitInfo` onto *every*
+translated submit whenever those device *features* are enabled at all,
+regardless of whether that specific submit actually uses them — turned out
+to be real (confirmed by reading `Vulkan-ExtensionLayer`'s own
+`synchronization2.cpp`) and worth fixing regardless
+(`patches/vulkan-extensionlayer/0001-...patch`, only chain when the struct
+actually has non-zero wait/signal counts), but **did not fix this specific
+crash** — this submission legitimately uses a timeline semaphore signal, so
+the struct was already correctly being chained either way. Retested with the
+patch applied: identical crash, same fault address, same stack.
+
+**Conclusion**: this is a second, separate stock-driver bug from the
+original missing-extension gap — the stock Adreno driver's own classic
+`vkQueueSubmit`, when handed a `VkTimelineSemaphoreSubmitInfo`-chained
+submission (exactly what any synchronization2-emulation layer *must*
+produce, since the driver has no native `vkQueueSubmit2` to call directly),
+crashes. Not something patchable in the compat layer — the translated input
+is spec-correct; the driver's handling of it is broken. Blocked upstream
+(Qualcomm's proprietary driver), same as the Turnip AHardwareBuffer bug is
+blocked upstream in Mesa. **This branch does not fix the tablet** — Turnip
+(`feat/adrenotools-turnip`, live with the known right-eye seam) remains the
+only working path on this hardware for now.
+
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
 

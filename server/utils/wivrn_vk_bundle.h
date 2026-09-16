@@ -137,6 +137,17 @@ struct vk_bundle
 #ifdef VK_EXT_host_image_copy
 	        vk::PhysicalDeviceHostImageCopyFeaturesEXT,
 #endif
+#ifdef VK_KHR_synchronization2
+	        // Separate from PhysicalDeviceVulkan13Features below: that
+	        // struct only makes sense (and is only populated by the
+	        // driver/any layer) on a device reporting apiVersion >= 1.3.
+	        // A device below 1.3 that only has the KHR extension (e.g. via
+	        // VK_LAYER_KHRONOS_synchronization2's compatibility shim on a
+	        // driver that lacks synchronization2 natively -- see
+	        // docs/ANDROID_PORT.md's Milestone 10 follow-up) is queried and
+	        // enabled through this struct instead.
+	        vk::PhysicalDeviceSynchronization2FeaturesKHR,
+#endif
 	        vk::PhysicalDeviceVulkan12Features,
 	        vk::PhysicalDeviceVulkan13Features>
 	        feat{};

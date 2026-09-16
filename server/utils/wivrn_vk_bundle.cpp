@@ -233,6 +233,25 @@ wivrn::vk_bundle::vk_bundle() :
 				U_LOG_W("WIVRN_VK_VALIDATION set but VK_LAYER_KHRONOS_validation is not available");
 		}
 
+		// Always try this one (not gated behind a debug option like
+		// validation above): Khronos' own portable synchronization2
+		// implementation, bundled on Android alongside adrenotools (see
+		// server-app/build.gradle). On a driver that already has native
+		// synchronization2 (Pixel, S22) the layer is a no-op passthrough
+		// by default (it only actively emulates when the driver lacks the
+		// extension, or when VK_SYNCHRONIZATION2_FORCE_ENABLE is set,
+		// which we don't set) -- safe to always request. See
+		// docs/ANDROID_PORT.md's Milestone 10 follow-up for why this
+		// matters on the Adreno tablet specifically.
+		{
+			bool available = false;
+			for (auto & layer: vk_ctx.enumerateInstanceLayerProperties())
+				if (std::string_view(layer.layerName) == "VK_LAYER_KHRONOS_synchronization2")
+					available = true;
+			if (available)
+				instance_layers.push_back("VK_LAYER_KHRONOS_synchronization2");
+		}
+
 		instance = vk::raii::Instance(
 		        vk_ctx,
 		        vk::InstanceCreateInfo{
@@ -423,9 +442,38 @@ wivrn::vk_bundle::vk_bundle() :
 
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).descriptorBindingPartiallyBound = phys_feat12.descriptorBindingPartiallyBound;
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).timelineSemaphore = phys_feat12.timelineSemaphore;
-		std::get<vk::PhysicalDeviceVulkan13Features>(feat).synchronization2 = phys_feat13.synchronization2;
 
-		if (not phys_feat13.synchronization2)
+		bool synchronization2 = phys_feat13.synchronization2;
+		std::get<vk::PhysicalDeviceVulkan13Features>(feat).synchronization2 = synchronization2;
+
+#ifdef VK_KHR_synchronization2
+		// A device below apiVersion 1.3 (like this Adreno tablet's stock
+		// driver, which reports 1.1) never populates
+		// PhysicalDeviceVulkan13Features at all -- if it (or a layer such
+		// as VK_LAYER_KHRONOS_synchronization2, see above) only offers the
+		// discrete VK_KHR_synchronization2 extension, it has to be queried
+		// through its own struct instead. Queried separately, not chained
+		// together with PhysicalDeviceVulkan13Features above: having both
+		// describe the same feature in one pNext chain is invalid
+		// (VUID-VkPhysicalDeviceFeatures2-pNext-06532 and its
+		// vkCreateDevice equivalent).
+		if (not synchronization2)
+		{
+			synchronization2 = std::get<vk::PhysicalDeviceSynchronization2FeaturesKHR>(physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceSynchronization2FeaturesKHR>()).synchronization2;
+			std::get<vk::PhysicalDeviceSynchronization2FeaturesKHR>(feat).synchronization2 = synchronization2;
+			// Only one of the two structs may be present in the
+			// vkCreateDevice pNext chain -- keep whichever we actually
+			// need linked (Vulkan13Features carries nothing else this
+			// file reads, see wivrn_vk_bundle.h's comment).
+			feat.unlink<vk::PhysicalDeviceVulkan13Features>();
+		}
+		else
+		{
+			feat.unlink<vk::PhysicalDeviceSynchronization2FeaturesKHR>();
+		}
+#endif
+
+		if (not synchronization2)
 			throw std::runtime_error("GPU does not support Vulkan synchronization2 feature");
 		if (not phys_feat12.timelineSemaphore)
 			throw std::runtime_error("GPU does not support Vulkan timeline semaphores");

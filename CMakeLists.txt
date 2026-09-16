@@ -316,6 +316,45 @@ FetchContent_Declare(adrenotools
     EXCLUDE_FROM_ALL
 )
 
+# Android-only (same gating as adrenotools above): VK_LAYER_KHRONOS_synchronization2,
+# Khronos' own portable/driver-independent implementation of
+# VK_KHR_synchronization2 -- see docs/ANDROID_PORT.md's Milestone 10
+# follow-up. Lets the Adreno tablet run on its stock/mature Vulkan driver
+# (which lacks native synchronization2) instead of being forced onto
+# Turnip, whose AHardwareBuffer array-layer-1 import bug is what's
+# corrupting VRChat's right eye. VulkanHeaders/VulkanUtilityLibraries are
+# Vulkan-ExtensionLayer's own build-time dependencies (it calls
+# find_package(... CONFIG) for both) -- declared with OVERRIDE_FIND_PACKAGE
+# so CMake transparently redirects those find_package() calls to these
+# FetchContent'd copies instead of requiring a system install. All three
+# pinned to the same Vulkan SDK release tag (they're released together,
+# guaranteed compatible at matching tags).
+# Matches the Vulkan header version already vendored at tools/vulkan-headers
+# (VK_HEADER_VERSION 328, i.e. this same 1.4.328.1 SDK release) -- not the
+# newest available tag. Vulkan-Utility-Libraries/Vulkan-ExtensionLayer only
+# get their own separate FetchContent'd VulkanHeaders copy if nothing has
+# already defined Vulkan::Headers (see the patch below); a newer tag here
+# would then compile against a genuinely older vulkan_core.h if that older
+# target wins the race, referencing struct types the older header doesn't
+# have. Keeping both on the same version sidesteps that entirely.
+set(WIVRN_VULKAN_SDK_TAG "vulkan-sdk-1.4.328.1")
+file(GLOB VULKAN_HEADERS_PATCHES CONFIGURE_DEPENDS patches/vulkan-headers/*)
+FetchContent_Declare(VulkanHeaders EXCLUDE_FROM_ALL SYSTEM OVERRIDE_FIND_PACKAGE
+    URL      https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/${WIVRN_VULKAN_SDK_TAG}.tar.gz
+    URL_HASH SHA256=c465aa56757e7746ac707f582b6e2d51546569a4a2488c1172fb543aa5fdfc2c
+    PATCH_COMMAND ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${VULKAN_HEADERS_PATCHES}
+)
+FetchContent_Declare(VulkanUtilityLibraries EXCLUDE_FROM_ALL SYSTEM OVERRIDE_FIND_PACKAGE
+    URL      https://github.com/KhronosGroup/Vulkan-Utility-Libraries/archive/refs/tags/${WIVRN_VULKAN_SDK_TAG}.tar.gz
+    URL_HASH SHA256=953ef4c2547b1611f90102f531f362bcfd6c76751eba2ae8c0f23b38947ef48d
+)
+file(GLOB VULKAN_EXTENSIONLAYER_PATCHES CONFIGURE_DEPENDS patches/vulkan-extensionlayer/*)
+FetchContent_Declare(vulkan_extensionlayer EXCLUDE_FROM_ALL SYSTEM
+    URL      https://github.com/KhronosGroup/Vulkan-ExtensionLayer/archive/refs/tags/${WIVRN_VULKAN_SDK_TAG}.tar.gz
+    URL_HASH SHA256=cf460018911ded2e5e8a63328b3d344e015e046767e258e953f7167b0d5d295c
+    PATCH_COMMAND ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh ${VULKAN_EXTENSIONLAYER_PATCHES}
+)
+
 add_custom_target(wivrn-version ALL
     COMMAND ${CMAKE_COMMAND}
         -D GIT_EXECUTABLE=${GIT_EXECUTABLE}
