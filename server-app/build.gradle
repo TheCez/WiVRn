@@ -58,10 +58,6 @@ android {
                     // spirv-opt ships in the NDK's shader-tools dir (CMAKE_PROGRAM_PATH below).
                     '-DWIVRN_OPTIMIZE_SHADERS=ON',
                     '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin',
-                    // FIXME: pinned to a specific already-populated local build-cache
-                    // path for this offline dev sandbox. Remove/parameterize before
-                    // building anywhere else -- it will not resolve on another machine or CI.
-                    '-DFETCHCONTENT_BASE_DIR=' + "${projectDir}/.cxx/Debug/3k1y4v6y/arm64-v8a/_deps",
                     // Binds Monado's targets/openxr build (openxr_wivrn) to this
                     // app's package instead of Monado's default out-of-process
                     // runtime package (see Client.java).
