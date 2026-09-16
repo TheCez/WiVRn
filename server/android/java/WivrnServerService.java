@@ -23,12 +23,15 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -37,6 +40,7 @@ import android.util.Log;
 
 import java.util.HashSet;
 import java.util.Set;
+import java.util.UUID;
 
 // Foreground Service wrapper around wivrn-server's JNI entry point
 // (server/android/wivrn_server_jni.cpp, built when WIVRN_ANDROID_JNI=ON).
@@ -65,6 +69,10 @@ public class WivrnServerService extends Service
 {
 	private static final String CHANNEL_ID = "wivrn_server";
 	private static final int NOTIFICATION_ID = 1;
+	private static final String DISCOVERY_SERVICE_TYPE = "_wivrn._tcp.";
+	private static final int DISCOVERY_PORT = 9757;
+	private static final String DISCOVERY_COOKIE_PREFERENCES = "wivrn_discovery";
+	private static final String DISCOVERY_COOKIE_KEY = "server_cookie";
 
 	static
 	{
@@ -100,6 +108,11 @@ public class WivrnServerService extends Service
 	private native void nativeStart(String nativeLibDir, String customDriverDir, String customDriverLibraryName, boolean sysmemCompat);
 
 	private native void nativeStop();
+
+	// The client rejects a discovered server before connection unless this is
+	// exactly its own protocol hash. Keep it native so the mDNS TXT record and
+	// the actual server always come from the same build.
+	private static native String nativeProtocolVersion();
 
 	// Called from MonadoIpcService (a different Service, see its own
 	// comment) when a local OpenXR app hands off a new IPC client fd.
@@ -272,6 +285,9 @@ public class WivrnServerService extends Service
 	}
 
 	private boolean started = false;
+	private boolean discoveryRegistered = false;
+	private boolean discoveryRegistrationRequested = false;
+	private NsdManager.RegistrationListener discoveryRegistrationListener;
 
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private final Set<Integer> connectedClients = new HashSet<>();
@@ -342,6 +358,107 @@ public class WivrnServerService extends Service
 	{
 		super.onCreate();
 		instance = this;
+		discoveryRegistrationListener = new NsdManager.RegistrationListener()
+		{
+			@Override
+			public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode)
+			{
+				discoveryRegistered = false;
+				discoveryRegistrationRequested = false;
+				Log.e("WivrnDiscovery", "mDNS registration failed: " + errorCode);
+			}
+
+			@Override
+			public void onUnregistrationFailed(NsdServiceInfo serviceInfo, int errorCode)
+			{
+				Log.w("WivrnDiscovery", "mDNS unregistration failed: " + errorCode);
+			}
+
+			@Override
+			public void onServiceRegistered(NsdServiceInfo serviceInfo)
+			{
+				discoveryRegistered = true;
+				Log.i("WivrnDiscovery", "Advertising " + serviceInfo.getServiceName());
+			}
+
+			@Override
+			public void onServiceUnregistered(NsdServiceInfo serviceInfo)
+			{
+				discoveryRegistered = false;
+				discoveryRegistrationRequested = false;
+			}
+		};
+	}
+
+	private String discoveryCookie()
+	{
+		SharedPreferences preferences = getSharedPreferences(DISCOVERY_COOKIE_PREFERENCES, MODE_PRIVATE);
+		String cookie = preferences.getString(DISCOVERY_COOKIE_KEY, null);
+		if (cookie == null)
+		{
+			cookie = UUID.randomUUID().toString().replace("-", "");
+			preferences.edit().putString(DISCOVERY_COOKIE_KEY, cookie).apply();
+		}
+		return cookie;
+	}
+
+	private String discoveryServiceName()
+	{
+		String model = Build.MODEL == null || Build.MODEL.isEmpty() ? "Android" : Build.MODEL;
+		String name = model + " WiVRn";
+		// DNS-SD instance labels are limited to 63 octets. Keep the stable,
+		// user-visible suffix when a vendor supplies an unusually long model.
+		return name.length() <= 63 ? name : name.substring(0, 57) + " WiVRn";
+	}
+
+	private void registerDiscovery()
+	{
+		if (discoveryRegistrationRequested)
+			return;
+
+		String protocol = nativeProtocolVersion();
+		if (protocol == null || protocol.isEmpty())
+		{
+			Log.e("WivrnDiscovery", "Cannot advertise without a protocol version");
+			return;
+		}
+
+		NsdServiceInfo serviceInfo = new NsdServiceInfo();
+		// Android resolves conflicts by changing the registered name and reports
+		// the final name in onServiceRegistered(), exactly like Avahi does.
+		serviceInfo.setServiceName(discoveryServiceName());
+		serviceInfo.setServiceType(DISCOVERY_SERVICE_TYPE);
+		serviceInfo.setPort(DISCOVERY_PORT);
+		serviceInfo.setAttribute("protocol", protocol);
+		serviceInfo.setAttribute("version", BuildConfig.VERSION_NAME);
+		serviceInfo.setAttribute("cookie", discoveryCookie());
+
+		try
+		{
+			discoveryRegistrationRequested = true;
+			getSystemService(NsdManager.class).registerService(
+			        serviceInfo, NsdManager.PROTOCOL_DNS_SD, discoveryRegistrationListener);
+		}
+		catch (RuntimeException e)
+		{
+			discoveryRegistrationRequested = false;
+			// Discovery must never stop a manually-addressed headset connection.
+			Log.e("WivrnDiscovery", "Could not register mDNS service", e);
+		}
+	}
+
+	private void unregisterDiscovery()
+	{
+		if (!discoveryRegistrationRequested)
+			return;
+		try
+		{
+			getSystemService(NsdManager.class).unregisterService(discoveryRegistrationListener);
+		}
+		catch (RuntimeException e)
+		{
+			Log.w("WivrnDiscovery", "Could not unregister mDNS service", e);
+		}
 	}
 
 	@Override
@@ -363,6 +480,7 @@ public class WivrnServerService extends Service
 			DriverSettings driver = DriverSettings.load(this);
 			nativeStart(getApplicationInfo().nativeLibraryDir, driver.dir, driver.libraryName, driver.sysmemCompat);
 			started = true;
+			registerDiscovery();
 		}
 
 		// If Android kills this process to reclaim memory, don't
@@ -374,6 +492,7 @@ public class WivrnServerService extends Service
 	@Override
 	public void onDestroy()
 	{
+		unregisterDiscovery();
 		if (started)
 		{
 			nativeStop();

@@ -57,10 +57,13 @@
 #include "target_instance_wivrn.h"
 #include "util/u_logging.h"
 #include "utils/vulkan_loader.h"
+#include "protocol_version.h"
 #include "wivrn_ipc.h"
 #include "wivrn_sockets.h"
 
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <unistd.h>
@@ -599,6 +602,17 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv * env, jobject
 		g_service = nullptr;
 	}
 	g_vm = nullptr;
+}
+
+// Matches server/main.cpp's Avahi TXT record exactly. The client treats the
+// protocol field as a compatibility gate before it offers Connect, so Java
+// must not duplicate or guess the compile-time serialization hash.
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeProtocolVersion(JNIEnv * env, jclass)
+{
+	char protocol[17];
+	std::snprintf(protocol, sizeof(protocol), "%016" PRIx64, wivrn::protocol_version);
+	return env->NewStringUTF(protocol);
 }
 
 // Called from MonadoIpcService.connect() (a *different* Java Service, bound

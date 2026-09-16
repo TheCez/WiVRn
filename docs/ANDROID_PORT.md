@@ -383,9 +383,9 @@ direction: this is enough for now, don't invent detail that isn't real.
   actual pairing UX (dashboard "add new device" flow, PIN entry,
   `encryption_state::pairing`) isn't represented at all yet; traffic between
   phone and headset is unencrypted until it is.
-- **No Avahi-equivalent discovery.** The headset still needs the phone's
-  IP entered manually (or however WiVRn's client already supports manual
-  connection) — no `NsdManager`-based advertising written yet.
+- **No PIN/pairing security flow.** The headset can now discover the phone
+  automatically, but the Android server still deliberately runs with
+  encryption disabled until the desktop pairing UX has an Android equivalent.
 - **One connection at a time, sequentially, forever**, matching desktop's
   actual one-session-at-a-time model, but without desktop's stop/backoff
   refinements (`delay_next_try` exponential backoff on repeated failures
@@ -505,7 +505,6 @@ it, not mutually exclusive:
   `raw` for debugging. Not investigated further, not our problem to fix
   right now.
 - PIN/pairing security flow (see Milestone 2's simplifications above).
-- Android `NsdManager`-based discovery to replace Avahi.
 - An audio backend (`WIVRN_USE_PIPEWIRE=OFF`, no Android audio path written;
   `audio/audio_setup.cpp` already degrades gracefully to "no audio backend"
   so this compiles fine as-is, just doesn't do anything).
@@ -3152,6 +3151,38 @@ and no-injector control runs, WAV capture for offline verification, both
 this conclusion beyond doubt or reveal a narrower working path, before this
 milestone was written up. See the next session's continuation for the
 result.
+
+## Milestone 20 — mDNS discovery and Steam Frame face-button bridge
+
+**Automatic discovery is now implemented.** `WivrnServerService` advertises
+`_wivrn._tcp` using Android's `NsdManager` after the native server has started,
+with the same `protocol`, `version`, and persistent `cookie` TXT fields used by
+the desktop Avahi advertisement. The protocol hash comes from native code, not
+a Java duplicate, so a client cannot discover a server that it would later
+reject as incompatible. Registration failure remains non-fatal: manually
+configured servers continue to work. Live validation on the Galaxy Tab S7 FE
+(SM-X810) confirmed Android's mDNS service advertised `SM-X810 WiVRn` on port
+9757 while the Quest 1 client issued `_wivrn._tcp.local` PTR queries.
+
+**Steam Frame / VRChat face buttons are bridged according to Valve's profile
+contract.** Valve exposes A, B, X, and Y on the *right* Steam Frame controller,
+while Quest Touch physically splits them across right (A/B) and left (X/Y).
+The WiVRn right controller now owns four dedicated Frame X/Y inputs and mirrors
+the left Touch X/Y packets into those inputs; A/B remain direct right-controller
+bindings. This preserves the public Steam Frame paths instead of incorrectly
+relabelling the left controller as a Frame controller. Trigger, squeeze,
+thumbstick, menu/view, system, poses, and haptics retain their existing
+profile-specific bindings.
+
+**Live session validation:** a fresh debug build was installed through ADB on
+the Tab S7 FE; the Quest 1 connected; and the VRChat Steam Frame APK reported
+`XR_VALVE_frame_controller_interaction` before entering
+`XR_SESSION_STATE_FOCUSED`. The server includes an opt-in trace for physical
+face-button packets (`adb shell setprop
+debug.xrt.WIVRN_CONTROLLER_INPUT_TRACE 1` before starting it), keeping future
+A/B/X/Y delivery tests observable without continuously logging controller
+traffic. The profile and session were validated in this run; a logged
+press/release capture remains the acceptance check for physical button delivery.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
