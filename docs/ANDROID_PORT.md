@@ -2941,14 +2941,17 @@ blocked upstream in Turnip/Mesa (seam) and the stock driver (segfault) — but
 it confirms nothing else in this codebase needs to change for that hardware
 class; the ceiling is the vendor driver, not this repo.
 
-## Milestone 14 (new device, open) — Samsung Galaxy S26 Ultra: client connects, nothing streams once the OpenXR app launches
+## Milestone 14 (new device, open) — Samsung Galaxy S26 Ultra (Snapdragon 8 Elite Gen 5 / Adreno): client connects, nothing streams once the OpenXR app launches
 
-Reported, not yet investigated — no device/logs captured this session (only
-the Quest 1 client was connected, no server-side phone). Symptom: the client
-successfully connects to the server (handshake/control channel over
-TCP/9757 completes), but once the target OpenXR app is launched, no video
-ever arrives — distinct from Milestone 10-13's corruption/crash symptoms,
-this is a *silent* failure with no frame at all.
+Confirmed, not yet root-caused: the client successfully connects to the
+server (handshake/control channel over TCP/9757 completes), the target
+OpenXR app launches, but no video ever arrives. Confirmed **app-agnostic** —
+every app tried (not just VRChat) fails the same way on this device. This is
+the key difference from Milestone 11's Xclipse S22 case, where only VRChat
+fails and the reference app/Somar work fine — the S26 Ultra failure is a
+different, more fundamental break, not a VRChat-specific compatibility
+problem. No logs captured yet (no server-side device connected this
+session).
 
 **Next steps when the device is available**: `logcat -c` before launch, then
 `logcat -d` after, on both the phone (server) and headset (client) — check
@@ -2956,10 +2959,64 @@ for encoder creation failure (`video_encoder_mediacodec.cpp`, same class of
 bug as the earlier HEVC hardcoded-codec crash, Milestone 7 area), whether
 `xrCreateSwapchain`/`xrBeginFrame` are even reached, and whether any frames
 leave the server at all (`WIVRN_DUMP_VIDEO`, see this doc's capture section
-above). Silent-no-stream (vs. a crash or visible corruption) suggests the
-failure is earlier in the pipeline than Milestones 10-13 — likely encoder
-init/codec negotiation given this is a new Snapdragon generation, not yet
-confirmed.
+above). Silent-no-stream, app-agnostic, suggests the failure is earlier in
+the pipeline than Milestones 10-13 — likely encoder init/codec negotiation
+given this is a new Snapdragon generation, not yet confirmed.
+
+## Milestone 15 (third-party test, open) — sync2 compat layer confirmed necessary and non-crashing on another device; audio streams, no video
+
+A friend tested `experiment/vulkan-sync2-compat-layer` on a different phone
+(not this project's own devices, not connected here — model/SoC not yet
+recorded). Two things confirmed:
+- That device's stock driver genuinely lacks native `VK_KHR_synchronization2`
+  too (same class of gap as the SM-X810 tablet, Milestone 12) — the sync2
+  compat layer was necessary for the server to run at all there, not just a
+  tablet-specific workaround.
+- Unlike the SM-X810 tablet, the stock driver here does **not** segfault on
+  the layer's translated `VkTimelineSemaphoreSubmitInfo`-chained submits —
+  the server runs normally. This confirms Milestone 12's `vkQueueSubmit`
+  crash is specific to that tablet's driver, not an inherent property of the
+  sync2 compat layer approach itself.
+
+New symptom, not yet investigated: audio streams to the Quest 1 correctly,
+but no video ever displays. Since audio and video are independent pipelines
+server-side, this points at the video encode/send path specifically (encoder
+creation, frame production, or transport), not a session/connection-level
+failure. No logs captured — different setup, no device connected to this
+machine.
+
+## Milestone 16 (open) — HEVC (H265) encoder path: app starts, stuck on lobby, no frames reach the Quest 1
+
+Distinct from the per-device streaming failures above — this is a codec-path
+bug, reproduced with the HEVC MediaCodec encoder selected instead of H264.
+The app starts normally and the client reaches the lobby, but never
+progresses past it: no frames ever arrive at the Quest 1. Not yet
+root-caused; H264 on the same hardware does not show this, so the fault is
+somewhere in the HEVC-specific path (`video_encoder_mediacodec.cpp`'s HEVC
+configuration, or codec negotiation — the same general area as the earlier
+hardcoded-codec-name crash, Milestone 7). Needs a logcat capture with HEVC
+forced on to make progress.
+
+## Milestone 17 (open) — Galaxy Tab S7 FE and Galaxy S20 Ultra (Adreno 6xx-class GPUs): both run, but degraded — likely a horsepower ceiling, not a software bug
+
+Two more Adreno devices, both from the same older Adreno 6xx GPU generation:
+
+- **Galaxy Tab S7 FE**: requires Turnip (same class of gap as the SM-X810
+  tablet, Milestones 8-12 — stock driver missing something Turnip supplies).
+  The reference app and Somar run properly. VRChat runs but is visibly
+  glitchy.
+- **Galaxy S20 Ultra**: runs VRChat successfully (unlike every device in
+  Milestones 11/14) — rendering works, but performance is really laggy.
+
+Both devices share the same GPU generation (Adreno 6xx series) — the
+working hypothesis is that this generation is RAM- and/or GPU-throughput
+constrained for what VRChat + this streaming pipeline demands, rather than
+a driver or code bug like Milestones 10-14. Consistent with VRChat (the
+heaviest app tested) being the one that struggles while the lighter
+reference app and Somar run cleanly on the same hardware. Not yet confirmed
+with profiling data — next step if pursued would be checking actual
+memory pressure/GPU frame time on-device during a VRChat session on either
+device.
 
 ## Key architecture facts worth remembering (established by reading real
 source and by running the real thing on-device, not assumed)
