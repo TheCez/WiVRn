@@ -68,7 +68,7 @@ See [Server](#server-pc) for the server compile options.
 
 Runs the WiVRn server directly on an Android phone instead of a PC. Shares the same [build dependencies](#build-dependencies) and [Android environment](#android-environment) setup as the [client](#client-headset) below -- both build from this repository's root `CMakeLists.txt`, just with different CMake arguments (`WIVRN_BUILD_SERVER` instead of `WIVRN_BUILD_CLIENT`).
 
-**Known limitation, not yet fixed:** unlike the client, `server-app/build.gradle` does not currently resolve Vulkan-Headers/glslangValidator/spirv-tools from the system packages listed under [build dependencies](#build-dependencies) -- it hardcodes CMake `-D` overrides pointing at a `tools/` directory expected as a sibling of this checkout (`vulkan-headers/include`, `glslang/extracted/usr/bin/glslangValidator`, `spirv-tools/extracted/usr/bin`). You need to populate that layout yourself before `assembleDebug` will get past CMake configure:
+Vulkan-Headers/glslangValidator/spirv-tools resolve from the same system packages listed under [build dependencies](#build-dependencies), same as the client (`CMAKE_FIND_ROOT_PATH_MODE_*=BOTH` lets CMake's `find_package`/`find_program` see host-installed packages despite the NDK cross-compile sysroot). If your system packages are too old or otherwise incompatible, `server-app/build.gradle` also supports overriding them with a pinned local copy at a `tools/` directory next to this checkout -- only used if present:
 
 ```
 <parent-of-this-checkout>/
@@ -78,8 +78,6 @@ Runs the WiVRn server directly on an Android phone instead of a PC. Shares the s
     ├── glslang/extracted/usr/bin/glslangValidator
     └── spirv-tools/extracted/usr/bin/  (spirv-opt, etc.)
 ```
-
-A real fix (making `build.gradle` fall back to the system packages the way the client does) is intentionally left for a follow-up rather than bundled into this PR.
 
 #### Server build
 From the main directory.
