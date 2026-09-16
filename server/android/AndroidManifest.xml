@@ -33,6 +33,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Speaker audio (game -> headset, see WivrnServerService's
+         AudioPlaybackCaptureConfiguration-based capture): RECORD_AUDIO is
+         the runtime permission it needs, FOREGROUND_SERVICE_MEDIA_PROJECTION
+         is what API 34+ requires to declare a foregroundServiceType of
+         "mediaProjection" below (MissingForegroundServiceTypeException
+         otherwise, confirmed against current Android developer docs before
+         adding this, not guessed). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
     <!-- extractNativeLibs=true: forces AGP to extract libopenxr_wivrn.so
          to a real file (/data/app/.../lib/arm64/libopenxr_wivrn.so)
          instead of the modern default of leaving it uncompressed inside
@@ -72,7 +82,7 @@
         <service
             android:name="org.meumeu.wivrn.server.WivrnServerService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|mediaProjection" />
 
         <!-- OpenXR runtime broker registration + Monado's own IMonado AIDL
              bind target, on one <service>: the broker intent-filter is only

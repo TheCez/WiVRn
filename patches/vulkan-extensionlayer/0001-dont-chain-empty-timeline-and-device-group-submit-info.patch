@@ -1,0 +1,27 @@
+--- a/layers/synchronization2.cpp
++++ b/layers/synchronization2.cpp
+@@ -1160,11 +1160,22 @@
+         protect.pNext = tail;
+         tail = &protect;
+     }
+-    if (features.timelineSemaphore) {
++    // WiVRn: only chain these when the submit actually uses them, not just
++    // because the device FEATURE is enabled (the original unconditional
++    // `if (features.timelineSemaphore)` chained an all-zero-count
++    // VkTimelineSemaphoreSubmitInfo onto every single plain binary-semaphore
++    // submit whenever the device had the feature enabled at all -- which
++    // segfaulted inside the Adreno stock driver's own vkQueueSubmit on a
++    // Snapdragon 778G tablet, a narrow combination that's presumably far
++    // less exercised than a real timeline-semaphore submit).
++    if (features.timelineSemaphore &&
++        (timeline_sem.info.waitSemaphoreValueCount > 0 || timeline_sem.info.signalSemaphoreValueCount > 0)) {
+         timeline_sem.info.pNext = tail;
+         tail = &timeline_sem.info;
+     }
+-    if (features.deviceGroup) {
++    if (features.deviceGroup &&
++        (device_group.info.waitSemaphoreCount > 0 || device_group.info.commandBufferCount > 0 ||
++         device_group.info.signalSemaphoreCount > 0)) {
+         device_group.info.pNext = tail;
+         tail = &device_group.info;
+     }

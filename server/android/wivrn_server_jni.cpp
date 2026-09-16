@@ -46,17 +46,24 @@
 #include "android/android_globals.h"
 #include "utils/method.h"
 
+#include "audio/audio_setup.h"
 #include "driver/configuration.h"
 #include "driver/wivrn_connection.h"
+#include "driver/wivrn_session.h"
+#include "os/os_time.h"
 #include "server/ipc_server.h"
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_mainloop_android.h"
 #include "target_instance_wivrn.h"
+#include "util/u_logging.h"
 #include "utils/vulkan_loader.h"
+#include "protocol_version.h"
 #include "wivrn_ipc.h"
 #include "wivrn_sockets.h"
 
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <unistd.h>
@@ -259,6 +266,106 @@ void android_ipc_server_cb::client_disconnected(ipc_server *, uint32_t client_id
 	call_service_method_int("onClientDisconnected", client_id);
 }
 
+// Mirrors call_service_method_int above, two int args instead of one --
+// used below to hand the speaker's sample rate/channel count to Java's
+// onAudioStreamStart(int, int).
+void call_service_method_2int(const char * name, jint a, jint b)
+{
+	if (!g_vm || !g_service)
+		return;
+
+	JNIEnv * env = nullptr;
+	bool attached = false;
+	if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK)
+	{
+		if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+			return;
+		attached = true;
+	}
+
+	jclass cls = env->GetObjectClass(g_service);
+	jmethodID mid = env->GetMethodID(cls, name, "(II)V");
+	if (mid)
+		env->CallVoidMethod(g_service, mid, a, b);
+	env->DeleteLocalRef(cls);
+
+	if (attached)
+		g_vm->DetachCurrentThread();
+}
+
+// Speaker-only audio backend (no microphone forwarding yet): the desktop
+// PipeWire backend (audio_pipewire.cpp) captures a virtual sink the game
+// writes to; Android has no PipeWire, so the equivalent capture
+// (AudioPlaybackCaptureConfiguration) has to happen in Java -- see
+// WivrnServerService's onAudioStreamStart/nativeAudioData. This class is
+// just the audio_device side of that bridge: on_audio_data() below is
+// what nativeAudioData ultimately calls into.
+class android_audio_device : public wivrn::audio_device
+{
+	wivrn::to_headset::audio_stream_description desc;
+	wivrn::wivrn_session & session;
+
+public:
+	static std::atomic<android_audio_device *> instance;
+
+	android_audio_device(const wivrn::from_headset::headset_info_packet & info, wivrn::wivrn_session & session) :
+	        session(session)
+	{
+		if (info.speaker)
+		{
+			desc.speaker = {
+			        .num_channels = info.speaker->num_channels,
+			        .sample_rate = info.speaker->sample_rate,
+			};
+			instance.store(this, std::memory_order_release);
+			call_service_method_2int("onAudioStreamStart", jint(info.speaker->sample_rate), jint(info.speaker->num_channels));
+		}
+	}
+
+	~android_audio_device() override
+	{
+		if (desc.speaker)
+		{
+			instance.store(nullptr, std::memory_order_release);
+			call_service_method_void("onAudioStreamStop");
+		}
+	}
+
+	// Called from nativeAudioData (Java's AudioRecord read loop, a
+	// different thread than the one that constructed this object).
+	void on_audio_data(const uint8_t * data, size_t size)
+	{
+		try
+		{
+			session.send_control(wivrn::audio_data{
+			        .timestamp = session.get_offset().to_headset(os_monotonic_get_ns()),
+			        .payload = std::span(const_cast<uint8_t *>(data), size),
+			});
+		}
+		catch (std::exception & e)
+		{
+			U_LOG_D("Failed to send audio data: %s", e.what());
+		}
+	}
+
+	// No virtual mic source implemented yet -- headset mic packets are
+	// simply dropped for now.
+	void process_mic_data(wivrn::audio_data &&) override
+	{}
+
+	void pause() override
+	{}
+
+	void resume() override
+	{
+		if (desc.speaker or desc.microphone)
+			session.send_control(wivrn::to_headset::audio_stream_description{desc});
+		session.send_control(wivrn::to_headset::feature_control{wivrn::to_headset::feature_control::microphone, false});
+	}
+};
+
+std::atomic<android_audio_device *> android_audio_device::instance = nullptr;
+
 // wivrn::instance::create_system() (target_instance_wivrn.cpp) does
 // std::move(connection) on the extern global declared in wivrn_ipc.h --
 // populated on desktop by main.cpp's headset_connected(), *before*
@@ -355,6 +462,16 @@ void run_server(std::stop_token stop)
 
 } // namespace
 
+// Declared in audio/audio_setup.cpp, called from audio_device::create()
+// (driver/wivrn_session.cpp's constructor) once a headset's info packet is
+// known. See android_audio_device's own comment for the overall design.
+std::unique_ptr<wivrn::audio_device> wivrn::create_android_audio_handle(
+        const wivrn::from_headset::headset_info_packet & info,
+        wivrn::wivrn_session & session)
+{
+	return std::make_unique<android_audio_device>(info, session);
+}
+
 // Turns a nullable jstring into a std::string (empty for null) without the
 // caller needing to juggle GetStringUTFChars/ReleaseStringUTFChars itself.
 std::string jstring_to_string(JNIEnv * env, jstring s)
@@ -448,6 +565,17 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv * env, jobject
 	g_vm = nullptr;
 }
 
+// Matches server/main.cpp's Avahi TXT record exactly. The client treats the
+// protocol field as a compatibility gate before it offers Connect, so Java
+// must not duplicate or guess the compile-time serialization hash.
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeProtocolVersion(JNIEnv * env, jclass)
+{
+	char protocol[17];
+	std::snprintf(protocol, sizeof(protocol), "%016" PRIx64, wivrn::protocol_version);
+	return env->NewStringUTF(protocol);
+}
+
 // Called from MonadoIpcService.connect() (a *different* Java Service, bound
 // via Monado's own IMonado AIDL interface by a local OpenXR app's loader --
 // see that file's own comment) whenever a local OpenXR app connects. Mirrors Monado's own
@@ -481,4 +609,24 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeAddIpcClient(JNIEnv *, jcl
 	}
 	int native_fd = dup(fd);
 	return ipc_server_mainloop_add_fd(server, &server->ml, native_fd);
+}
+
+// Called from WivrnServerService's AudioRecord read loop (a background
+// thread it owns, not the server thread) once per captured buffer. No-op if
+// no headset session is active (android_audio_device::instance null) --
+// AudioRecord's loop keeps running independently of session lifetime and
+// just gets ignored until the next onAudioStreamStart.
+extern "C" JNIEXPORT void JNICALL
+Java_org_meumeu_wivrn_server_WivrnServerService_nativeAudioData(JNIEnv * env, jobject, jbyteArray data, jint size)
+{
+	android_audio_device * dev = android_audio_device::instance.load(std::memory_order_acquire);
+	if (!dev)
+		return;
+
+	jbyte * bytes = env->GetByteArrayElements(data, nullptr);
+	if (bytes)
+	{
+		dev->on_audio_data(reinterpret_cast<const uint8_t *>(bytes), size_t(size));
+		env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+	}
 }

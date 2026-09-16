@@ -27,6 +27,7 @@
 
 #include "math/m_api.h"
 #include "os/os_time.h"
+#include "util/u_debug.h"
 #include "util/u_device_id.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_defines.h"
@@ -40,6 +41,12 @@
 
 namespace wivrn
 {
+
+// Opt-in device-side validation for the Steam Frame face-button bridge.
+// Enable with `adb shell setprop debug.xrt.WIVRN_CONTROLLER_INPUT_TRACE 1`
+// before starting the server.  Restrict this to edge-bearing face-button
+// packets so a live trace remains readable while a session is streaming.
+DEBUG_GET_ONCE_NUM_OPTION(controller_input_trace, "WIVRN_CONTROLLER_INPUT_TRACE", 0)
 
 namespace
 {
@@ -63,6 +70,17 @@ enum wivrn_controller_input_index
 	WIVRN_CONTROLLER_X_TOUCH = WIVRN_CONTROLLER_A_TOUCH, // /user/hand/left/input/x/touch
 	WIVRN_CONTROLLER_Y_CLICK = WIVRN_CONTROLLER_B_CLICK, // /user/hand/left/input/y/click
 	WIVRN_CONTROLLER_Y_TOUCH = WIVRN_CONTROLLER_B_TOUCH, // /user/hand/left/input/y/touch
+
+	// Steam Frame exposes its A/B/X/Y diamond on its right controller. The
+	// physical Touch controllers used by WiVRn instead split that diamond:
+	// A/B are right and X/Y are left. Keep dedicated right-controller inputs
+	// for the latter pair so the Frame profile can expose all four of its
+	// specified right-hand paths without claiming that X/Y live on the wrong
+	// OpenXR subaction path.
+	WIVRN_CONTROLLER_FRAME_X_CLICK,
+	WIVRN_CONTROLLER_FRAME_X_TOUCH,
+	WIVRN_CONTROLLER_FRAME_Y_CLICK,
+	WIVRN_CONTROLLER_FRAME_Y_TOUCH,
 	WIVRN_CONTROLLER_SQUEEZE_CLICK,                      // /user/hand/XXXX/input/squeeze/click
 	WIVRN_CONTROLLER_SQUEEZE_FORCE,                      // /user/hand/XXXX/input/squeeze/force
 	WIVRN_CONTROLLER_SQUEEZE_VALUE,                      // /user/hand/XXXX/input/squeeze/value
@@ -452,19 +470,16 @@ xrt_binding_output_pair touch_plus_output_binding[] = {
         {XRT_OUTPUT_NAME_TOUCH_PLUS_HAPTIC, XRT_OUTPUT_NAME_TOUCH_HAPTIC},
 };
 
-// XR_VALVE_frame_controller_interaction (Steam Frame). Real physical Quest
-// Touch controllers have no bumper, view/menu-on-both-hands, dpad or system
-// button, and no discrete trigger/squeeze click (analog value only) -- those
-// components are left unbound below, same as any other profile mapped onto
-// a device that doesn't have every input it defines. menu (right hand, per
-// the profile) and view (left hand) both map to our one real menu button,
-// which only ever exists on the left hand instance -- the right-hand
-// binding is inert there, matching how touch_pro/touch_plus's own
-// menu/system split already behaves per hand.
+// XR_VALVE_frame_controller_interaction (Steam Frame). Valve specifies
+// A/B/X/Y on the right-hand Frame subaction path. Touch has A/B on the right
+// but X/Y on the left, so X/Y use the dedicated mirrored inputs populated in
+// set_inputs() below. This preserves Valve's public path contract while
+// making every physical Touch face button usable by VRChat and other Frame
+// profile applications.
 xrt_binding_input_pair frame_controller_input_binding[] = {
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_TOUCH, XRT_INPUT_TOUCH_TRIGGER_TOUCH},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_SQUEEZE_VALUE, XRT_INPUT_TOUCH_SQUEEZE_VALUE},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_TRIGGER_TOUCH, XRT_INPUT_TOUCH_TRIGGER_TOUCH},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_SQUEEZE_VALUE, XRT_INPUT_TOUCH_SQUEEZE_VALUE},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK_CLICK, XRT_INPUT_TOUCH_THUMBSTICK_CLICK},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK_TOUCH, XRT_INPUT_TOUCH_THUMBSTICK_TOUCH},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_THUMBSTICK, XRT_INPUT_TOUCH_THUMBSTICK},
@@ -473,12 +488,12 @@ xrt_binding_input_pair frame_controller_input_binding[] = {
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_SYSTEM_CLICK, XRT_INPUT_TOUCH_SYSTEM_CLICK},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_A_CLICK, XRT_INPUT_TOUCH_A_CLICK},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_A_TOUCH, XRT_INPUT_TOUCH_A_TOUCH},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_B_CLICK, XRT_INPUT_TOUCH_B_CLICK},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_B_TOUCH, XRT_INPUT_TOUCH_B_TOUCH},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_X_CLICK, XRT_INPUT_TOUCH_X_CLICK},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_X_TOUCH, XRT_INPUT_TOUCH_X_TOUCH},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_CLICK, XRT_INPUT_TOUCH_Y_CLICK},
-        {XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_TOUCH, XRT_INPUT_TOUCH_Y_TOUCH},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_B_CLICK, XRT_INPUT_TOUCH_B_CLICK},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_B_TOUCH, XRT_INPUT_TOUCH_B_TOUCH},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_X_CLICK, XRT_INPUT_VALVE_FRAME_CONTROLLER_X_CLICK},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_X_TOUCH, XRT_INPUT_VALVE_FRAME_CONTROLLER_X_TOUCH},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_CLICK, XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_CLICK},
+		{XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_TOUCH, XRT_INPUT_VALVE_FRAME_CONTROLLER_Y_TOUCH},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_GRIP_POSE, XRT_INPUT_TOUCH_GRIP_POSE},
         {XRT_INPUT_VALVE_FRAME_CONTROLLER_AIM_POSE, XRT_INPUT_TOUCH_AIM_POSE},
 };
@@ -715,6 +730,10 @@ wivrn_controller::wivrn_controller(xrt_device_name name,
 			SET_INPUT(TOUCH, B_CLICK);
 			SET_INPUT(TOUCH, A_TOUCH);
 			SET_INPUT(TOUCH, B_TOUCH);
+			SET_INPUT(VALVE_FRAME_CONTROLLER, X_CLICK);
+			SET_INPUT(VALVE_FRAME_CONTROLLER, X_TOUCH);
+			SET_INPUT(VALVE_FRAME_CONTROLLER, Y_CLICK);
+			SET_INPUT(VALVE_FRAME_CONTROLLER, Y_TOUCH);
 		}
 		SET_INPUT(VIVE_FOCUS3, SQUEEZE_CLICK);
 		SET_INPUT(INDEX, SQUEEZE_FORCE);
@@ -807,8 +826,44 @@ void wivrn_controller::set_inputs(const from_headset::inputs & inputs, const clo
 		int64_t last_change_time = input.last_change_time ? clock_offset.from_headset(input.last_change_time) : 0;
 		auto [index, type, device] = map_input(input.id);
 		if (device != device_type)
-			continue;
+		{
+			// The Frame interaction profile puts all four face buttons on its
+			// right controller. Mirror Touch's physical left-hand X/Y inputs
+			// into the right controller's dedicated Frame sources; all other
+			// inputs remain strictly hand-local.
+			if (device_type != XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER)
+				continue;
+
+			switch (input.id)
+			{
+				case device_id::X_CLICK:
+					index = WIVRN_CONTROLLER_FRAME_X_CLICK;
+					break;
+				case device_id::X_TOUCH:
+					index = WIVRN_CONTROLLER_FRAME_X_TOUCH;
+					break;
+				case device_id::Y_CLICK:
+					index = WIVRN_CONTROLLER_FRAME_Y_CLICK;
+					break;
+				case device_id::Y_TOUCH:
+					index = WIVRN_CONTROLLER_FRAME_Y_TOUCH;
+					break;
+				default:
+					continue;
+			}
+			type = wivrn_input_type::BOOL;
+		}
 		assert(index > 0 and index < input_count);
+		if (debug_get_num_option_controller_input_trace() and input.last_change_time and
+		    (input.id == device_id::A_CLICK or input.id == device_id::B_CLICK or
+		     input.id == device_id::X_CLICK or input.id == device_id::Y_CLICK))
+		{
+			U_LOG_I("Controller trace: id=%d value=%g routes to %d on %s controller",
+			        int(input.id),
+			        input.value,
+			        int(inputs_staging[index].name),
+			        device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "left" : "right");
+		}
 		inputs_staging[index].timestamp = last_change_time;
 		inputs_staging[index].active = true;
 		switch (type)
