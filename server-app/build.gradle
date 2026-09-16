@@ -4,10 +4,19 @@
 // same top-level CMakeLists.txt with different -D arguments.
 apply plugin: 'com.android.application'
 
-// Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11 aren't
-// resolvable via Gradle/AGP on this toolchain, so they're passed as
-// explicit CMake -D overrides below instead.
+// Vulkan-Headers/glslangValidator/Eigen3+nlohmann_json+CLI11: normally
+// resolved from system packages (CMAKE_FIND_ROOT_PATH_MODE_*=BOTH below
+// lets find_package/find_program see host-installed packages despite the
+// Android NDK cross-compile sysroot, same as the client build). Only
+// overridden with this pinned local copy when the system packages are too
+// old/incompatible for this codebase's requirements -- populate
+// `../tools` (sibling of this checkout) with the layout documented in
+// docs/building.md#server-android-phone if you hit that.
 def toolsDir = "${rootDir}/../tools"
+def hasLocalVulkanHeaders = new File(toolsDir, 'vulkan-headers/include').exists()
+def localGlslangValidator = new File(toolsDir, 'glslang/extracted/usr/bin/glslangValidator')
+def hasLocalPrefix = new File(toolsDir, 'prefix').exists()
+def hasLocalSpirvTools = new File(toolsDir, 'spirv-tools/extracted/usr/bin').isDirectory()
 
 android {
     namespace 'org.meumeu.wivrn.server'
@@ -27,15 +36,21 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments = [
+                def args = [
                     '-DANDROID_TOOLCHAIN=clang',
                     '-DANDROID_STL=c++_static',
                     '-DCMAKE_ANDROID_NDK_VERSION=' + ndkVersion,
                     '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-                    '-DVulkan_INCLUDE_DIR=' + toolsDir + '/vulkan-headers/include',
-                    '-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=' + toolsDir + '/glslang/extracted/usr/bin/glslangValidator',
-                    '-DGLSLANGVALIDATOR_COMMAND=' + toolsDir + '/glslang/extracted/usr/bin/glslangValidator',
-                    '-DCMAKE_PREFIX_PATH=' + toolsDir + '/prefix',
+                ]
+                if (hasLocalVulkanHeaders)
+                    args += '-DVulkan_INCLUDE_DIR=' + toolsDir + '/vulkan-headers/include'
+                if (localGlslangValidator.exists()) {
+                    args += '-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=' + localGlslangValidator.path
+                    args += '-DGLSLANGVALIDATOR_COMMAND=' + localGlslangValidator.path
+                }
+                if (hasLocalPrefix)
+                    args += '-DCMAKE_PREFIX_PATH=' + toolsDir + '/prefix'
+                args += [
                     '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH',
                     '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH',
                     '-DWIVRN_ANDROID_JNI=ON',
@@ -55,14 +70,17 @@ android {
                     '-DWIVRN_USE_PIPEWIRE=OFF',
                     '-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=OFF',
                     '-DWIVRN_FEATURE_SOLARXR=OFF',
-                    // spirv-opt ships in the NDK's shader-tools dir (CMAKE_PROGRAM_PATH below).
+                    // spirv-opt ships in the NDK's shader-tools dir; the local
+                    // copy below (if present) is only an extra search location.
                     '-DWIVRN_OPTIMIZE_SHADERS=ON',
-                    '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin',
                     // Binds Monado's targets/openxr build (openxr_wivrn) to this
                     // app's package instead of Monado's default out-of-process
                     // runtime package (see Client.java).
                     '-DXRT_ANDROID_PACKAGE=org.meumeu.wivrn.server',
                 ]
+                if (hasLocalSpirvTools)
+                    args += '-DCMAKE_PROGRAM_PATH=' + toolsDir + '/spirv-tools/extracted/usr/bin'
+                arguments = args
                 // hook_impl/main_hook/file_redirect_hook/gsl_alloc_hook: adrenotools'
                 // shared libraries, dlopen()'d by filename from this app's own
                 // nativeLibraryDir at runtime, so they must be packaged into the APK.
