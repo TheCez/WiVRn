@@ -30,24 +30,16 @@ import org.freedesktop.monado.ipc.IMonado;
 
 import java.io.IOException;
 
-// The Android half of the OpenXR runtime broker story (see
-// docs/ANDROID_PORT.md): a bound Service exposing Monado's own IMonado AIDL
-// interface (org.freedesktop.monado.ipc, vendored verbatim -- see that
-// aidl file's own comment), bound by Client.java -- the exact same class
-// every OpenXR app on this device already loads from its own copy of
-// vendored Monado (Client.java's bind() takes the target package name as a
-// parameter, read from XRT_ANDROID_PACKAGE at the app's own build time; see
-// server/CMakeLists.txt) -- to hand this app's already-running wivrn-server
-// (WivrnServerService, already started independently) a new local OpenXR
-// client connection.
+// A bound Service exposing Monado's IMonado AIDL interface, bound by
+// Client.java -- the same class every OpenXR app on this device loads from
+// its own copy of vendored Monado (XRT_ANDROID_PACKAGE) -- to hand this
+// app's already-running wivrn-server a new local OpenXR client connection.
 //
-// Deliberately NOT the same Service as WivrnServerService: that one is a
-// long-lived foreground Service tied to the streaming session's lifecycle;
-// this one only needs to exist long enough to hand off one fd per connecting
-// app, matching Monado's own Client.java/MonadoImpl.java split (which this
-// mirrors, not copies -- no Hilt/watchdog/surface-passing machinery, none of
-// which WiVRn's compositor needs, since it never renders to a local Surface
-// at all -- see canDrawOverOtherApps() below).
+// Deliberately NOT the same Service as WivrnServerService (long-lived,
+// tied to the streaming session): this one only needs to exist long enough
+// to hand off one fd per connecting app, mirroring (not copying) Monado's
+// own Client.java/MonadoImpl.java split -- no Hilt/watchdog/surface-passing
+// machinery, since the compositor never renders to a local Surface.
 public class MonadoIpcService extends Service
 {
 	private static final String TAG = "MonadoIpcService";
@@ -84,8 +76,7 @@ public class MonadoIpcService extends Service
 		public void passAppSurface(Surface surface)
 		{
 			// Unused: WiVRn's compositor renders into the video encoder's
-			// input, never a local on-screen Surface (see
-			// docs/ANDROID_PORT.md's architecture notes) -- this only gets
+			// input, never a local on-screen Surface -- this only gets
 			// called at all if canDrawOverOtherApps() below returns false.
 		}
 

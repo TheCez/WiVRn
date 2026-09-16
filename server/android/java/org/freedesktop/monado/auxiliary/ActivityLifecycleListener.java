@@ -14,7 +14,7 @@
 // support, part of libopenxr_wivrn.so) tries to load from this app's own
 // APK via loadClassFromApk() -- its absence is what caused
 // XR_ERROR_RUNTIME_UNAVAILABLE the first time a real OpenXR app tried to use
-// this runtime. See docs/ANDROID_PORT.md's OpenXR runtime broker section.
+// this runtime.
 
 package org.freedesktop.monado.auxiliary;
 

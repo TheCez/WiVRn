@@ -81,7 +81,7 @@
              ipc_client (loaded into a local OpenXR app's own process, built
              from the same vendored Monado with XRT_ANDROID_PACKAGE set to
              this app's package: see server/CMakeLists.txt). See
-             MonadoIpcService's own comment and docs/ANDROID_PORT.md. -->
+             MonadoIpcService's own comment. -->
         <service
             android:name="org.meumeu.wivrn.server.MonadoIpcService"
             android:exported="true"

@@ -66,32 +66,15 @@
 namespace
 {
 
-// Milestone 5 diagnostic toggle (docs/ANDROID_PORT.md's perf branch entry,
-// the encoder/readback investigation): Android apps don't inherit shell
-// env vars, so WIVRN_DUMP_VIDEO/WIVRN_DUMP_NV12/WIVRN_TIMING_LOG (all
-// checked via plain getenv() deeper in the server) need an explicit
-// setenv() somewhere on this side -- but unlike the one-off temporary
-// setenv() calls used for earlier investigations (e.g. the since-removed
-// version in commit 89655cd4), this reads a real Android system property
-// so the diagnostics can be toggled per-run without rebuilding/reinstalling:
-//   adb shell setprop debug.wivrn.dump 1
-// before starting the server app enables the dump/timing trio; unset
-// (the default) costs nothing beyond one __system_property_get() call at
-// startup. Left in permanently -- this corruption investigation is still
-// open, unlike past ones that got fully closed out.
+// Android apps don't inherit shell env vars, so WIVRN_DUMP_VIDEO/
+// WIVRN_DUMP_NV12/WIVRN_TIMING_LOG need an explicit setenv() here, gated on
+// a real Android system property so they're toggleable per-run without
+// rebuilding: `adb shell setprop debug.wivrn.dump 1` before starting the server.
 //
-// NOTE, confirmed the hard way: WIVRN_ONLY_STREAM (compositor.cpp's
-// stream-isolation toggle) deliberately does NOT get a setenv() here.
-// It's read via Monado's own DEBUG_GET_ONCE_NUM_OPTION, whose Android
-// backend (u_debug.c's get_option_raw()) reads an Android system
-// property DIRECTLY -- "debug.xrt.<NAME>" -- and never calls getenv()
-// at all on this platform, unlike desktop's build of the same macro. An
-// earlier version of this function forwarded a debug.wivrn.only_stream
-// property to a WIVRN_ONLY_STREAM env var here, which was silently inert
-// (confirmed live: the "disabled" stream kept producing output). To
-// actually toggle it on Android: `adb shell setprop
-// debug.xrt.WIVRN_ONLY_STREAM 0` (or 1), no code path through this file
-// at all.
+// NOTE: WIVRN_ONLY_STREAM does NOT get a setenv() here -- Monado's Android
+// DEBUG_GET_ONCE_NUM_OPTION backend reads "debug.xrt.<NAME>" directly and
+// never calls getenv() on this platform, so forwarding it here is a no-op.
+// Toggle it with `adb shell setprop debug.xrt.WIVRN_ONLY_STREAM 0` (or 1) instead.
 void apply_debug_dump_property()
 {
 	char value[PROP_VALUE_MAX] = {};
@@ -103,19 +86,12 @@ void apply_debug_dump_property()
 	setenv("WIVRN_TIMING_LOG", "1", 1);
 }
 
-// Turnip/adrenotools custom Vulkan driver (server/utils/vulkan_loader.cpp,
-// docs/ANDROID_PORT.md's Milestone 8): TU_DEBUG is Mesa's own real Turnip
-// debug env var, read via plain getenv() by the driver itself once loaded
-// -- setenv() here (before configure_vulkan_loader()/any real vk_bundle
-// construction) reaches it fine despite adrenotools loading Turnip into an
-// isolated linker namespace, since environment variables are process-wide,
-// not namespace-scoped. Turnip's own release notes call out
-// "TU_DEBUG=sysmem" specifically for "glitchy" rendering on some chips --
-// used live to test whether a real stereo duplication/ghosting bug seen on
-// a Snapdragon tablet (traced to something other than this project's own
-// compositor code, see Milestone 8) is this same class of issue.
-// `adb shell setprop debug.wivrn.tu_debug sysmem` (any TU_DEBUG value Mesa
-// accepts) before starting the server app.
+// TU_DEBUG is Mesa Turnip's real debug env var (server/utils/vulkan_loader.cpp),
+// read via plain getenv() by the driver once loaded -- setenv() here reaches
+// it fine despite Turnip loading into an isolated linker namespace, since env
+// vars are process-wide. Mesa's own release notes call out "TU_DEBUG=sysmem"
+// for "glitchy" rendering on some chips.
+// `adb shell setprop debug.wivrn.tu_debug sysmem` (any TU_DEBUG value) before starting.
 void apply_tu_debug_property()
 {
 	char value[PROP_VALUE_MAX] = {};
@@ -302,7 +278,7 @@ void android_ipc_server_cb::client_disconnected(ipc_server *, uint32_t client_id
 // ever puts the server into `pairing` state to learn one. Using
 // encryption_state::disabled unconditionally instead, same as desktop's
 // explicit `--no-encrypt` flag (main.cpp). Revisit alongside NsdManager-based
-// discovery and a real pairing UI (see docs/ANDROID_PORT.md).
+// discovery and a real pairing UI.
 //
 // Known gap: listener.accept() is a blocking call not interruptible by
 // std::stop_token; if nativeStop() is called while still waiting for a
@@ -432,31 +408,16 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStart(
 	// OpenXR client connect at all.
 	android_globals_store_vm_and_context(g_vm, g_service);
 
-	// HEVC A/B diagnostic (docs/ANDROID_PORT.md's perf branch): the desktop
-	// build's --config CLI flag (main.cpp) is how configuration::set_config_file()
-	// normally gets called; nothing on Android ever called it, so
-	// configuration::read_configuration() fell back to its no-config-file
-	// path, merging xdg_config_home()/wivrn/config.json -- but xdg_config_home()
-	// returns "." when neither XDG_CONFIG_HOME nor HOME is set (neither is,
-	// here), and this process's real cwd is "/" (confirmed live via
-	// /proc/<pid>/cwd), which this app cannot write to. Net effect: the
-	// documented per-encoder "codec" config key (docs/configuration.md) was
-	// silently unusable on Android -- there was no writable path the config
-	// loader would ever actually read. Pointing it at this app's own private
-	// data dir's files/ subdir (writable via run-as, unlike the app data
-	// dir's own root -- confirmed live; the dump/timing diagnostics above
-	// use the root only because the app's own process writes those, not
-	// adb/run-as) so `adb shell run-as org.meumeu.wivrn.server sh -c
-	// 'echo {...} > files/config.json'` actually takes effect, e.g. for
-	// forcing {"encoder":{"encoder":"mediacodec","codec":"h265"}} to A/B
-	// against the default (unset -- best of the client's preferred list).
+	// Nothing on Android calls the desktop --config CLI flag, and the
+	// no-config-file fallback path (xdg_config_home()) resolves to "/",
+	// which this app can't write to -- the config file was silently
+	// unusable without this. files/ is writable via run-as.
+	// `adb shell run-as org.meumeu.wivrn.server sh -c 'echo {...} > files/config.json'`
 	wivrn::configuration::set_config_file("/data/data/org.meumeu.wivrn.server/files/config.json");
 
 	apply_debug_dump_property();
-	// DriverSettings.java's own "Compatibility mode" checkbox (see its
-	// comment): a real, user-facing on/off for the same TU_DEBUG=sysmem
-	// workaround apply_tu_debug_property() also exposes via adb property
-	// -- both set the same env var, so either can turn it on.
+	// DriverSettings.java's "Compatibility mode" checkbox is a user-facing
+	// on/off for the same TU_DEBUG=sysmem workaround -- both set the same env var.
 	if (sysmem_compat)
 		setenv("TU_DEBUG", "sysmem", 1);
 	apply_tu_debug_property();
@@ -489,8 +450,7 @@ Java_org_meumeu_wivrn_server_WivrnServerService_nativeStop(JNIEnv * env, jobject
 
 // Called from MonadoIpcService.connect() (a *different* Java Service, bound
 // via Monado's own IMonado AIDL interface by a local OpenXR app's loader --
-// see that file's own comment and docs/ANDROID_PORT.md's OpenXR runtime
-// broker section) whenever a local OpenXR app connects. Mirrors Monado's own
+// see that file's own comment) whenever a local OpenXR app connects. Mirrors Monado's own
 // service_target.cpp's Java_org_freedesktop_monado_ipc_MonadoImpl_nativeAddClient
 // exactly, dup() included -- MonadoIpcService.connect() closes its
 // ParcelFileDescriptor right after this call returns (correct, matching

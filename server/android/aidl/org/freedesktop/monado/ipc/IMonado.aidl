@@ -6,12 +6,9 @@
  * @author Rylie Pavlik <rylie.pavlik@collabora.com>
  * @ingroup ipc_android
  */
-// Verbatim copy from Monado (src/xrt/ipc/android/src/main/aidl/...) -- not our
-// own contribution, kept identical (including its own license header) so the
-// AIDL-generated stub stays wire-compatible with Client.java, which every
-// OpenXR app's loader (built from the same vendored Monado, see
-// XRT_ANDROID_PACKAGE in server/CMakeLists.txt) already loads unmodified.
-// See docs/ANDROID_PORT.md's OpenXR runtime broker section for the full story.
+// Verbatim copy from Monado (src/xrt/ipc/android/src/main/aidl/...) -- kept
+// identical so the AIDL-generated stub stays wire-compatible with
+// Client.java, which every OpenXR app's loader already loads unmodified.
 
 package org.freedesktop.monado.ipc;
 

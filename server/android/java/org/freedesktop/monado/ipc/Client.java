@@ -14,7 +14,7 @@
 // resolve to *that* module's generated class, not one carrying this field --
 // same value either way ("org.freedesktop.monado.ipc.CONNECT", the action
 // MonadoIpcService's manifest entry declares), just spelled out instead of
-// generated. See docs/ANDROID_PORT.md's OpenXR runtime broker section.
+// generated.
 
 package org.freedesktop.monado.ipc;
 

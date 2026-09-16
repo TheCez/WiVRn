@@ -10,8 +10,8 @@
 // file, same behavior) -- see ActivityLifecycleListener.java's own comment
 // for why (avoids adding a Kotlin toolchain to this module for two small
 // files). Client.java (the AIDL-bootstrap class every OpenXR app on this
-// device loads from this app's own APK, verbatim from upstream Monado --
-// see docs/ANDROID_PORT.md) imports this directly.
+// device loads from this app's own APK, verbatim from upstream Monado)
+// imports this directly.
 
 package org.freedesktop.monado.auxiliary;
 
