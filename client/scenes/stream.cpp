@@ -56,14 +56,9 @@ using namespace beman::inplace_vector;
 
 namespace
 {
-// Diagnostic only (docs/ANDROID_PORT.md's stereo-desync investigation):
-// swaps which decoded eye texture/pose/fov/foveation feeds which final
-// projection view, at the last possible point before defoveation/
-// composition-layer submission -- i.e. after every other stage (server
-// render, encode, network, decode, common_frame() pairing) has already
-// run identically to the non-debug path. If this measurably changes/
-// fixes the stereo sensation, the eyes are swapped somewhere upstream of
-// this point; if not, the desync isn't a left/right swap at all.
+// Diagnostic: swaps which decoded eye texture/pose/fov/foveation feeds which
+// final projection view, at the last point before composition-layer
+// submission, to isolate a left/right swap from other desync causes.
 // `adb shell setprop debug.wivrn.swap_eyes 1` before starting the client.
 bool debug_swap_eyes()
 {
@@ -998,10 +993,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	// Diagnostic only, see debug_swap_eyes()'s own comment: swaps the
-	// whole per-view bundle (texture, pose, fov, foveation) together, so
-	// a left/right swap test doesn't itself introduce a pose/texture
-	// mismatch that wouldn't exist in a real swapped-eyes bug.
+	// Swaps the whole per-view bundle together, so this test doesn't itself
+	// introduce a pose/texture mismatch -- see debug_swap_eyes().
 	if (view_count == 2 and debug_swap_eyes())
 	{
 		std::swap(images[0], images[1]);

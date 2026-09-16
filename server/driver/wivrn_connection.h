@@ -58,15 +58,9 @@ private:
 
 	from_headset::headset_info_packet info_packet;
 
-	// Guards actual socket writes in send_control/send_stream. Historically
-	// unneeded -- every existing encoder backend's encoder_work() loop
-	// (server/compositor/compositor.cpp) calls encode() for each stream
-	// sequentially on one thread -- but that per-stream sequential dispatch
-	// is itself the bottleneck the Android mediacodec backend needs fixed
-	// (JNI/Binder overhead per AMediaCodec call is real in a way NVENC/VAAPI
-	// polling isn't; see docs/ANDROID_PORT.md's Milestone 4.5 entry), so
-	// streams are now encoded concurrently -- which means their sends can
-	// now genuinely race on the same socket without this.
+	// Guards socket writes in send_control/send_stream: streams now encode
+	// concurrently (compositor.cpp's encoder_work()), so their sends can
+	// genuinely race on the same socket without this.
 	std::mutex send_mutex;
 
 	void init(std::stop_token stop_token, std::function<void()> tick = []() {});
